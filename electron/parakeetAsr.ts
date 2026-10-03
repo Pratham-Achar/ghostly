@@ -17,6 +17,10 @@ import {
   startParakeetDiagnostics,
   type ParakeetDiagnosticsHandle,
 } from "./parakeetDiagnostics";
+import {
+  ParakeetModelManager,
+  type ParakeetModelStatus as ParakeetModelFileStatus,
+} from "./parakeetModel";
 
 /**
  * Parakeet comparison host — MAIN PROCESS ONLY.
@@ -134,9 +138,27 @@ export function resolveWorkerPath(
   dir: string = __dirname,
   exists: (p: string) => boolean = (p) => fs.existsSync(p),
 ): string {
-  const packaged = path.join(dir, "..", "app.asar.unpacked", "out", "main", "parakeetWorker.cjs");
-  if (exists(packaged)) return packaged;
-  return path.join(dir, "parakeetWorker.cjs");
+  const local = path.join(dir, "parakeetWorker.cjs");
+
+  // Inside a packaged app, `__dirname` is
+  //   <resources>/app.asar/out/main
+  // and the unpacked copy of the SAME tree is
+  //   <resources>/app.asar.unpacked/out/main
+  // so the only thing that changes is the archive directory itself. Rewriting
+  // that one segment is exact, whereas walking a fixed number of `..` steps is
+  // a guess about the layout that silently produces a path OUTSIDE resources
+  // the moment the depth changes.
+  const marker = `${path.sep}app.asar${path.sep}`;
+  if (dir.includes(marker)) {
+    const unpackedDir = dir.replace(
+      marker,
+      `${path.sep}app.asar.unpacked${path.sep}`,
+    );
+    const candidate = path.join(unpackedDir, "parakeetWorker.cjs");
+    if (exists(candidate)) return candidate;
+  }
+
+  return local;
 }
 
 /**
@@ -171,6 +193,15 @@ let host: ParakeetHost | null = null;
 let diagnostics: ParakeetDiagnosticsHandle | null = null;
 
 /**
+ * The model manager, created lazily against whatever directory this install uses.
+ *
+ * `baseDir` is the PARENT of the versioned model folder (normally
+ * `userData/models`), derived from the resolved model dir so there is exactly
+ * one place that decides where models live.
+ */
+let modelManager: ParakeetModelManager | null = null;
+
+/**
  * Register the dev-only Parakeet IPC surface.
  *
  * Every handler is wrapped so a failure becomes a value. Nothing in here may
@@ -196,6 +227,15 @@ export function registerParakeetHandlers(options: {
   };
   const mode = (): ParakeetHostMode =>
     options.isPrimary?.() ? "primary" : "comparison";
+
+  const getModelManager = (): ParakeetModelManager => {
+    if (!modelManager) {
+      modelManager = new ParakeetModelManager({
+        baseDir: path.dirname(options.modelDir),
+      });
+    }
+    return modelManager;
+  };
 
   // Cheap, safe status probe for the settings UI. Never loads anything.
   ipcMain.handle(
@@ -302,6 +342,79 @@ export function registerParakeetHandlers(options: {
       }
     },
   );
+
+  // ── Model management (Settings) ─────────────────────────────────────────
+  //
+  // The download runs in the MAIN process for two reasons: the renderer has no
+  // filesystem access and no way to stream 460 MB to disk, and the bytes must
+  // not pass through the renderer's memory at all.
+  //
+  // `parakeet:modelStatus` is safe to poll — it stats four files and returns a
+  // small object. `parakeet:modelDownload` is idempotent while a download is
+  // running: a second click joins the in-flight one instead of starting a
+  // competing 460 MB transfer.
+  ipcMain.handle("parakeet:modelStatus", () => {
+    try {
+      return getModelManager().refresh();
+    } catch (err) {
+      return {
+        status: "error" as ParakeetModelFileStatus,
+        progress: null,
+        bytesDownloaded: 0,
+        bytesTotal: 0,
+        message: err instanceof Error ? err.message : String(err),
+        dir: options.modelDir,
+      };
+    }
+  });
+
+  ipcMain.handle("parakeet:modelDownload", async () => {
+    try {
+      return await getModelManager().download();
+    } catch (err) {
+      // `download()` already converts failures into state, so reaching here
+      // means something outside it broke. Still return a value, never throw.
+      return {
+        status: "error" as ParakeetModelFileStatus,
+        progress: null,
+        bytesDownloaded: 0,
+        bytesTotal: 0,
+        message: err instanceof Error ? err.message : String(err),
+        dir: options.modelDir,
+      };
+    }
+  });
+
+  ipcMain.handle("parakeet:modelCancel", () => {
+    try {
+      getModelManager().cancel();
+      return { ok: true };
+    } catch {
+      return { ok: false };
+    }
+  });
+
+  ipcMain.handle("parakeet:modelRemove", () => {
+    try {
+      // Releasing the model first is not optional: deleting the files under a
+      // loaded recognizer would leave a live process holding handles to
+      // unlinked files, and the next decode would fail in a way that looks
+      // unrelated to the removal.
+      diagnostics?.stop();
+      diagnostics = null;
+      host?.unload();
+      return getModelManager().remove();
+    } catch (err) {
+      return {
+        status: "error" as ParakeetModelFileStatus,
+        progress: null,
+        bytesDownloaded: 0,
+        bytesTotal: 0,
+        message: err instanceof Error ? err.message : String(err),
+        dir: options.modelDir,
+      };
+    }
+  });
 
   // Dev diagnostics for the log / settings panel. Counts and timings only —
   // never audio, never model contents.

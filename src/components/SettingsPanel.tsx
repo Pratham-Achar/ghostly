@@ -8,9 +8,21 @@ import {
 } from "../lib/interviewShortcuts";
 import { normalizePrimaryAsr, type PrimaryAsr } from "../lib/primaryAsr";
 import {
-  getParakeetStatus,
-  type ParakeetStatus,
-} from "../lib/parakeetClient";
+  MODEL_INTEGRITY_NOTE,
+  canRetryDownload,
+  cancelParakeetModelDownload,
+  describeModelState,
+  downloadParakeetModel,
+  formatBytes,
+  getParakeetModelStatus,
+  isTransferInProgress,
+  removeParakeetModel,
+  type ParakeetModelState,
+} from "../lib/parakeetModelClient";
+import {
+  PARAKEET_ARCHIVE_BYTES,
+  PARAKEET_UNPACKED_BYTES,
+} from "../lib/parakeetModelFacts";
 
 /**
  * Interview types split into two top-level groups. The existing types are never
@@ -238,28 +250,86 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({ onClose }) => {
   // hand-edited settings file with a nonsense value cannot reach a branch that
   // expects two engines.
   const primaryAsr = normalizePrimaryAsr(useStore((s) => s.settings.primaryAsr));
-  const [parakeetModelStatus, setParakeetModelStatus] =
-    useState<ParakeetStatus>("disabled");
-  const [parakeetModelMessage, setParakeetModelMessage] = useState<
-    string | null
-  >(null);
   /** One-line confirmation of the last engine change, shown under the picker. */
   const [engineNote, setEngineNote] = useState<string | null>(null);
 
+  // ── Model download state ────────────────────────────────────────────────
+  // Polled while the picker is on Parakeet. A poll is cheap — the main process
+  // stats four files — and polling is what makes the progress bar move, because
+  // the download call itself does not resolve until the transfer finishes.
+  const [modelState, setModelState] = useState<ParakeetModelState>(() => ({
+    status: "missing",
+    progress: null,
+    bytesDownloaded: 0,
+    bytesTotal: PARAKEET_ARCHIVE_BYTES,
+    message: null,
+    dir: "",
+  }));
+  const [modelBusy, setModelBusy] = useState(false);
+  /** Set once a download has been started, so polling does not spam the log. */
+  const modelStartedRef = useRef(false);
+
   useEffect(() => {
-    if (primaryAsr !== "parakeet") {
-      setParakeetModelStatus("disabled");
-      setParakeetModelMessage(null);
-      return;
-    }
+    if (primaryAsr !== "parakeet") return;
     let cancelled = false;
-    void getParakeetStatus().then((status) => {
-      if (!cancelled) setParakeetModelStatus(status);
-    });
+    let timer: number | undefined;
+
+    const poll = async () => {
+      const next = await getParakeetModelStatus();
+      if (cancelled) return;
+      setModelState(next);
+      // While a transfer is running, poll fast enough to animate the bar. Once
+      // it settles, back off to a slow heartbeat so an idle Settings page is
+      // not stat-ing files four times a second forever.
+      timer = window.setTimeout(
+        () => void poll(),
+        isTransferInProgress(next) ? 400 : 4000,
+      );
+    };
+    void poll();
+
     return () => {
       cancelled = true;
+      if (timer !== undefined) window.clearTimeout(timer);
     };
   }, [primaryAsr]);
+
+  const startDownload = useCallback(async () => {
+    if (modelBusy) return;
+    setModelBusy(true);
+    if (!modelStartedRef.current) {
+      modelStartedRef.current = true;
+      setEngineNote(
+        "Downloading the speech model. It is stored in this app's data folder, never bundled with the installer, and can be deleted at any time.",
+      );
+    }
+    try {
+      // The poll above renders progress; this call only reports the OUTCOME, so
+      // its result is deliberately not used to drive the bar.
+      const finalState = await downloadParakeetModel();
+      setModelState(finalState);
+      if (finalState.status === "ready") {
+        setEngineNote(
+          "Speech model installed. It loads on Start Interview (~7 s).",
+        );
+      }
+    } finally {
+      setModelBusy(false);
+    }
+  }, [modelBusy]);
+
+  const cancelDownload = useCallback(async () => {
+    await cancelParakeetModelDownload();
+    setModelState(await getParakeetModelStatus());
+  }, []);
+
+  const removeModel = useCallback(async () => {
+    const next = await removeParakeetModel();
+    setModelState(next);
+    setEngineNote(
+      "Speech model deleted. If Parakeet is selected it will fall back to Moonshine until it is downloaded again.",
+    );
+  }, []);
 
   /**
    * Change the primary engine AND persist it immediately.
@@ -285,7 +355,6 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({ onClose }) => {
           "Parakeet selected. It loads on Start Interview (~7 s, a few hundred MB). Moonshine stays unloaded unless a single segment needs it.",
         );
       } else {
-        setParakeetModelMessage(null);
         setEngineNote(
           "Moonshine selected. It loads on Start Interview and streams words as the interviewer speaks.",
         );
@@ -715,16 +784,115 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({ onClose }) => {
               </>
             )}
           </p>
-          {parakeetModelStatus !== "ready" && primaryAsr === "parakeet" && (
-            <p className="text-[9px] text-amber-200/70 mt-2">
-              {parakeetModelMessage ??
-                `The local Parakeet model is currently ${parakeetModelStatus}. Until it is ready, Moonshine handles every segment — still entirely on this machine.`}
-            </p>
-          )}
           {engineNote && (
             <p className="text-[9px] text-white/35 mt-1">{engineNote}</p>
           )}
         </Section>
+
+        {/* ── Parakeet model download ───────────────────────────────────── */}
+        {/*
+         * Shown whenever Parakeet is selected. The model is NEVER bundled: it
+         * is ~631 MB unpacked, and shipping it would put half a gigabyte into
+         * every installer for a feature that is off by default and make the
+         * installer the thing that decides which engine you get.
+         *
+         * Every button here is retry-safe. "Retry" is hidden while a transfer
+         * is running (a retry would just join the in-flight one and look inert),
+         * and the main process joins a concurrent download rather than starting
+         * a second 460 MB transfer.
+         */}
+        {primaryAsr === "parakeet" && (
+          <Section label="Speech model (local)">
+            <p className="text-[9px] text-white/40">
+              {describeModelState(modelState)}
+            </p>
+
+            {isTransferInProgress(modelState) && (
+              <div className="mt-1.5">
+                <div className="h-1.5 rounded bg-white/[0.08] overflow-hidden">
+                  <div
+                    className="h-full bg-white/40 transition-all"
+                    style={{ width: `${modelState.progress ?? 0}%` }}
+                    role="progressbar"
+                    aria-valuenow={modelState.progress ?? 0}
+                    aria-valuemin={0}
+                    aria-valuemax={100}
+                  />
+                </div>
+                <p className="text-[9px] text-white/30 mt-1">
+                  {modelState.status === "verifying"
+                    ? "Unpacking and checking files…"
+                    : `${modelState.progress ?? 0}% · ${formatBytes(modelState.bytesDownloaded)} of ${formatBytes(modelState.bytesTotal)}`}
+                </p>
+              </div>
+            )}
+
+            {modelState.status === "error" && modelState.message && (
+              <p className="text-[9px] text-red-300/80 mt-1.5">
+                {modelState.message}
+              </p>
+            )}
+
+            {modelState.status === "error" && (
+              <p className="text-[9px] text-amber-200/70 mt-1.5">
+                Moonshine will be used for every segment until this is fixed —
+                still entirely on this machine.
+              </p>
+            )}
+
+            <div className="flex flex-wrap gap-2 mt-2">
+              {canRetryDownload(modelState) && (
+                <button
+                  type="button"
+                  onClick={() => void startDownload()}
+                  disabled={modelBusy}
+                  className="px-2 py-1 rounded bg-white/[0.08] hover:bg-white/[0.14] text-white/70 text-[9px] disabled:opacity-40"
+                >
+                  {modelState.status === "error" ? "Retry download" : "Download the model"}
+                </button>
+              )}
+              {isTransferInProgress(modelState) && (
+                <button
+                  type="button"
+                  onClick={() => void cancelDownload()}
+                  className="px-2 py-1 rounded bg-white/[0.05] hover:bg-white/[0.1] text-white/60 text-[9px]"
+                >
+                  Cancel
+                </button>
+              )}
+              {modelState.status === "ready" && (
+                <button
+                  type="button"
+                  onClick={() => void removeModel()}
+                  className="px-2 py-1 rounded bg-white/[0.05] hover:bg-white/[0.1] text-white/50 text-[9px]"
+                >
+                  Delete the {formatBytes(PARAKEET_UNPACKED_BYTES)} model
+                </button>
+              )}
+              {/* ── The way out ───────────────────────────────────────────
+                  Always present, and not only on failure: the clean recovery
+                  from "this model will not install on my machine" must be
+                  obvious without reading an error message first. Moonshine
+                  needs no download and is already installed. */}
+              <button
+                type="button"
+                onClick={() => selectPrimaryAsr("moonshine")}
+                className="px-2 py-1 rounded bg-white/[0.05] hover:bg-white/[0.1] text-white/60 text-[9px]"
+              >
+                Switch back to Moonshine
+              </button>
+            </div>
+
+            {modelState.status === "ready" && (
+              <p className="text-[9px] text-white/25 mt-1.5">{MODEL_INTEGRITY_NOTE}</p>
+            )}
+            {modelState.dir && (
+              <p className="text-[9px] text-white/20 mt-1 break-all">
+                Installed in {modelState.dir}
+              </p>
+            )}
+          </Section>
+        )}
 
         {/* Transcription Model (Moonshine only) */}
         <Section label="Transcription Model">

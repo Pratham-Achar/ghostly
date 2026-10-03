@@ -100,7 +100,46 @@ contextBridge.exposeInMainWorld("ghostly", {
   // not a packaged build, so these are inert in a shipped app.
   parakeetStatus: (): Promise<{
     status: "disabled" | "missing" | "loading" | "ready" | "error";
+    mode?: "primary" | "comparison";
   }> => ipcRenderer.invoke("parakeet:status"),
+
+  // ── Model download (Settings) ────────────────────────────────────────
+  //
+  // Safe to poll: the handler stats four files and returns a small object. The
+  // download itself runs entirely in the main process — the renderer has no
+  // filesystem access, and 460 MB must not be buffered in a web context.
+  //
+  // `modelDownload` is idempotent while a download is running, so a double
+  // click joins the in-flight transfer rather than starting a second one.
+  parakeetModelStatus: (): Promise<{
+    status: "missing" | "downloading" | "verifying" | "ready" | "error";
+    progress: number | null;
+    bytesDownloaded: number;
+    bytesTotal: number;
+    message: string | null;
+    dir: string;
+  }> => ipcRenderer.invoke("parakeet:modelStatus"),
+
+  parakeetModelDownload: (): Promise<{
+    status: "missing" | "downloading" | "verifying" | "ready" | "error";
+    progress: number | null;
+    bytesDownloaded: number;
+    bytesTotal: number;
+    message: string | null;
+    dir: string;
+  }> => ipcRenderer.invoke("parakeet:modelDownload"),
+
+  parakeetModelCancel: (): Promise<{ ok: boolean }> =>
+    ipcRenderer.invoke("parakeet:modelCancel"),
+
+  parakeetModelRemove: (): Promise<{
+    status: "missing" | "downloading" | "verifying" | "ready" | "error";
+    progress: number | null;
+    bytesDownloaded: number;
+    bytesTotal: number;
+    message: string | null;
+    dir: string;
+  }> => ipcRenderer.invoke("parakeet:modelRemove"),
 
   parakeetLoad: (): Promise<{
     ok: boolean;
@@ -136,6 +175,7 @@ contextBridge.exposeInMainWorld("ghostly", {
     queued: number;
     inFlight: number;
     consecutiveFailures: number;
+    mode?: "primary" | "comparison";
   }> => ipcRenderer.invoke("parakeet:diagnostics"),
 
   // ── Dev-only screen visibility ───────────────────────────────────────

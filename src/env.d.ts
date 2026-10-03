@@ -135,6 +135,7 @@ interface Window {
     // the app is not packaged.
     parakeetStatus: () => Promise<{
       status: "disabled" | "missing" | "loading" | "ready" | "error";
+      mode?: "primary" | "comparison";
     }>;
     parakeetLoad: () => Promise<{
       ok: boolean;
@@ -162,9 +163,47 @@ interface Window {
       status: string;
       loadMs: number | null;
       rssMb: number | null;
+      decodeMs?: number | null;
+      rtf?: number | null;
+      mode?: "primary" | "comparison";
       queued: number;
       inFlight: number;
       consecutiveFailures: number;
+    }>;
+
+    // ── Model download ────────────────────────────────────────────────
+    //
+    // The renderer drives this and displays it, but performs none of it. The
+    // download, the extraction and every integrity check happen in the main
+    // process, which is the only side with filesystem access.
+    //
+    // Typed inline rather than imported: this file is a global `declare`
+    // script, and adding a top-level import would turn it into a module and
+    // silently break the `Window` augmentation for every consumer.
+    parakeetModelStatus: () => Promise<{
+      status: "missing" | "downloading" | "verifying" | "ready" | "error";
+      progress: number | null;
+      bytesDownloaded: number;
+      bytesTotal: number;
+      message: string | null;
+      dir: string;
+    }>;
+    parakeetModelDownload: () => Promise<{
+      status: "missing" | "downloading" | "verifying" | "ready" | "error";
+      progress: number | null;
+      bytesDownloaded: number;
+      bytesTotal: number;
+      message: string | null;
+      dir: string;
+    }>;
+    parakeetModelCancel: () => Promise<{ ok: boolean }>;
+    parakeetModelRemove: () => Promise<{
+      status: "missing" | "downloading" | "verifying" | "ready" | "error";
+      progress: number | null;
+      bytesDownloaded: number;
+      bytesTotal: number;
+      message: string | null;
+      dir: string;
     }>;
 
     // ── Dev-only screen visibility ────────────────────────────────────
