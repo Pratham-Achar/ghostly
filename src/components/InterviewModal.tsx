@@ -53,6 +53,10 @@ export const InterviewModal: React.FC<InterviewModalProps> = ({
     primaryAsr,
     parakeetStatus,
     parakeetMessage,
+    parakeetUiState,
+    parakeetUiMessage,
+    downloadParakeet,
+    useMoonshineEngine,
     fallbackNotice,
     retryParakeet,
   } = useInterviewAudio();
@@ -305,6 +309,41 @@ export const InterviewModal: React.FC<InterviewModalProps> = ({
               </span>
             </div>
           )}
+        </div>
+      )}
+
+      {/* Parakeet cannot transcribe — say so, and offer the two real choices.
+          Deliberately NOT a disabled "Loading…" caption: an engine that is
+          missing, corrupt or failed will never finish loading, so the only
+          honest states are the words and the two buttons. Nothing here can
+          reach a cloud engine — "Use Moonshine" is local. */}
+      {primaryAsr === "parakeet" && parakeetUiMessage && (
+        <div className="px-4 py-3 border-b border-amber-400/20 bg-amber-500/[0.06]">
+          <p className="text-[10px] font-mono text-amber-200/90 leading-relaxed">
+            {parakeetUiMessage}
+          </p>
+          <div className="mt-2 flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() => void downloadParakeet()}
+              disabled={parakeetUiState === "downloading"}
+              className="px-2 py-1 rounded bg-accent/20 hover:bg-accent/30 disabled:opacity-40 text-accent transition-colors text-[10px] font-mono"
+            >
+              {parakeetUiState === "downloading"
+                ? "Downloading…"
+                : "Download model"}
+            </button>
+            <button
+              type="button"
+              onClick={useMoonshineEngine}
+              className="px-2 py-1 rounded bg-white/[0.05] hover:bg-white/[0.1] text-white/70 transition-colors text-[10px] font-mono"
+            >
+              Use Moonshine
+            </button>
+            <span className="text-[9px] font-mono text-white/30">
+              Audio stays on this machine either way.
+            </span>
+          </div>
         </div>
       )}
 

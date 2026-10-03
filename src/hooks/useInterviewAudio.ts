@@ -44,8 +44,17 @@ import {
 } from "../lib/parakeetClient";
 import type { ParakeetStatus } from "../lib/parakeetClient";
 import {
+  downloadParakeetModel,
+  getParakeetModelStatus,
+} from "../lib/parakeetModelClient";
+import {
+  describeParakeetUiState,
   isInterviewStartReady,
-  shouldEagerLoadParakeet,
+  isParakeetStartAllowed,
+  parakeetSegmentDisposition,
+  parakeetUiStateFromModelState,
+  shouldProbeParakeetModel,
+  type ParakeetUiState,
 } from "../lib/asrReadiness";
 import {
   describeClipping,
@@ -287,20 +296,36 @@ export function useInterviewAudio() {
   const [parakeetStatus, setParakeetStatus] =
     useState<ParakeetStatus>("disabled");
   const [parakeetMessage, setParakeetMessage] = useState<string | null>(null);
+  /**
+   * What the UI knows about the Parakeet MODEL — installed, missing, corrupt,
+   * loading, ready, failed.
+   *
+   * Deliberately separate from `parakeetStatus`, which is the HOST's state.
+   * "The files are on disk" and "the model is loaded" are different questions,
+   * and answering only the second one is what left the panel stuck on
+   * "Loading…" with a model that had been downloaded hours earlier.
+   */
+  const [parakeetUi, setParakeetUi] = useState<ParakeetUiState>("unknown");
+  const parakeetUiRef = useRef<ParakeetUiState>("unknown");
+
+  /** Mirrored for the audio callbacks, which are created outside React. */
+  parakeetUiRef.current = parakeetUi;
 
   /**
    * Whether the Start button and the start hotkey may run.
    *
    * Readiness follows the PRIMARY engine (see `lib/asrReadiness.ts`): a Moonshine
    * primary is gated on Moonshine's own `isModelReady`, and a Parakeet primary on
-   * Parakeet's own model state. `isModelReady` below is Moonshine-only state — it
-   * stays false by design when Moonshine is not loaded, so it must never be the
-   * sole signal for a Parakeet session.
+   * what is known about the model.
+   *
+   * A model that is missing, corrupt or failed does NOT block Start. Capture can
+   * run on the local Moonshine fallback, and blocking it in exactly those states
+   * is what produced a permanently dead button captioned "Loading…".
    */
   const startReady = isInterviewStartReady(
     primaryAsr,
     isModelReady,
-    parakeetStatus === "ready",
+    isParakeetStartAllowed(parakeetUi) || parakeetStatus === "ready",
   );
   /**
    * Set when a segment had to be handed to Moonshine because Parakeet failed.
@@ -1056,6 +1081,17 @@ export function useInterviewAudio() {
         return;
       }
 
+      // ── Parakeet is not going to transcribe this one ─────────────────────
+      // A missing, corrupt or failed model is not "still loading": nothing is
+      // coming. Queueing here parked the segment in a buffer that nothing would
+      // ever drain, so the interviewer was simply never transcribed. Hand it to
+      // the LOCAL Moonshine fallback now, which loads Moonshine lazily and says
+      // so on screen.
+      if (parakeetSegmentDisposition(parakeetUiRef.current) === "fallback") {
+        fallbackSegmentToMoonshine(segment, "the local speech model is not available");
+        return;
+      }
+
       // ── The model is still loading ──────────────────────────────────────
       // The brief allows queueing or falling back here; this QUEUES. Falling
       // back would mean kicking off Moonshine's ~22 s load, which is slower
@@ -1072,7 +1108,7 @@ export function useInterviewAudio() {
         );
       }
     },
-    [addLog, runParakeetSegment],
+    [addLog, fallbackSegmentToMoonshine, runParakeetSegment],
   );
 
   /**
@@ -1093,11 +1129,13 @@ export function useInterviewAudio() {
     parakeetLoadInFlightRef.current = true;
     try {
       setParakeetStatus("loading");
+      setParakeetUi("loading");
       setParakeetMessage("Loading speech model…");
       const result = await loadParakeetModel();
       if (result.ok) {
         parakeetReadyRef.current = true;
         setParakeetStatus("ready");
+        setParakeetUi("ready");
         setParakeetMessage(null);
         addLog(
           `Speech model ready (${result.loadMs ?? "?"} ms, ${result.rssMb ?? "?"} MB in the worker process).`,
@@ -1108,6 +1146,10 @@ export function useInterviewAudio() {
       parakeetReadyRef.current = false;
       const code = result.code ?? "error";
       setParakeetStatus(code === "model_missing" ? "missing" : "error");
+      // The failure is final for this session, so the UI state says so too: the
+      // panel must offer the download / Moonshine choice instead of waiting for
+      // a load that has already failed.
+      setParakeetUi(code === "model_missing" ? "missing" : "failed");
       setParakeetMessage(
         code === "model_missing"
           ? "The local speech model is not installed. Download it in Settings, or switch back to Moonshine — Moonshine will be used for every segment in the meantime."
@@ -1128,18 +1170,66 @@ export function useInterviewAudio() {
     }
   }, [addLog, drainParakeetQueue, fallbackSegmentToMoonshine]);
 
-  // ── Parakeet primary: load the model as soon as the engine is selected ─────
-  //
-  // The Start button and the start hotkey are both gated on readiness, so
-  // waiting for a Start press to load Parakeet is circular: the press that would
-  // load it is refused because it has not loaded, and the UI sits on
-  // "Initializing AI engine…" forever. Loading here — when the modal opens, or
-  // the moment the engine switches to Parakeet — breaks that loop. Moonshine is
-  // untouched: it loads in its own effect, and this never asks for it.
+  // ── Parakeet primary: model STATE, never a model LOAD ──────────────────────
+  /**
+   * Ask the main process what is on disk.
+   *
+   * The load is ~7 s and several hundred MB and belongs on Start Interview; a
+   * probe is four `statSync` calls against the model files. Keeping them apart is
+   * the difference between opening the interview panel and paying for a model
+   * whether or not anybody ends up transcribing.
+   */
+  const refreshParakeetModelState = useCallback(async () => {
+    setParakeetUi((prev) =>
+      prev === "loading" || prev === "ready" ? prev : "checking",
+    );
+    const state = await getParakeetModelStatus();
+    setParakeetUi((prev) =>
+      // A load in progress owns the state until it settles.
+      prev === "loading" || prev === "ready" ? prev : parakeetUiStateFromModelState(state),
+    );
+    return state;
+  }, []);
+
+  // Probe when the modal opens, and again whenever the engine becomes Parakeet.
+  // This is a status check, NOT a load: `parakeet:modelStatus` only inspects file
+  // sizes, so opening the panel costs nothing.
   useEffect(() => {
-    if (!shouldEagerLoadParakeet(primaryAsr)) return;
-    void ensureParakeetLoaded();
-  }, [primaryAsr, ensureParakeetLoaded]);
+    if (!shouldProbeParakeetModel(primaryAsr)) return;
+    void refreshParakeetModelState();
+  }, [primaryAsr, refreshParakeetModelState]);
+
+  /** Download the model in-app, then re-probe. Progress is polled by the UI. */
+  const downloadParakeet = useCallback(async () => {
+    setParakeetUi("downloading");
+    const state = await downloadParakeetModel();
+    setParakeetUi(parakeetUiStateFromModelState(state));
+    addLog(
+      state.status === "ready"
+        ? "Speech model downloaded and verified."
+        : `Speech model download ${state.status}: ${state.message ?? "no detail given"}`,
+    );
+    return state;
+  }, [addLog]);
+
+  /**
+   * Switch to Moonshine and write through to the main process immediately.
+   *
+   * Not left to the settings debounce: the main process reads `primaryAsr` from
+   * the store to decide whether Parakeet is enabled at all, so a switch that had
+   * not landed yet would leave the host answering for an engine the user just
+   * turned off.
+   */
+  const useMoonshineEngine = useCallback(() => {
+    useStore.getState().updateSettings({ primaryAsr: "moonshine" });
+    void window.ghostly.saveSettings({
+      ...useStore.getState().settings,
+      primaryAsr: "moonshine",
+    });
+    addLog(
+      "Switched to the Moonshine engine. It loads on Start Interview; interview audio stays on this machine.",
+    );
+  }, [addLog]);
 
   const startInterview = async () => {
     // Which engine gates readiness. With Parakeet primary there is deliberately
@@ -1600,6 +1690,16 @@ export function useInterviewAudio() {
     parakeetStatus,
     /** Human-readable reason the model is unavailable, or null while fine. */
     parakeetMessage,
+    /** What is known about the Parakeet MODEL, as opposed to the loaded host. */
+    parakeetUiState: parakeetUi,
+    /** The "Download model / Use Moonshine" explanation, or null when fine. */
+    parakeetUiMessage: describeParakeetUiState(parakeetUi),
+    /** Download the model in-app (never a silent cloud ASR switch). */
+    downloadParakeet,
+    /** Switch the primary engine to Moonshine, written through to the store. */
+    useMoonshineEngine,
+    /** Re-read the model status without loading anything. */
+    refreshParakeetModelState,
     /**
      * Set when a segment had to be handled by Moonshine because Parakeet could
      * not. Surfaced so a silent change of transcription engine is impossible to

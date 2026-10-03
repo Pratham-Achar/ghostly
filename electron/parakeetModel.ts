@@ -78,8 +78,16 @@ export interface ParakeetModelState {
 }
 
 export interface ParakeetModelDeps {
-  /** Directory that will contain the model folder. */
+  /** Directory that CONTAINS the model folder. Normally `<userData>/models`. */
   baseDir: string;
+  /**
+   * The absolute model directory, when the caller has already resolved one.
+   *
+   * Preferred over deriving one from `baseDir`, because the whole point is that
+   * the downloader and the LOADER must agree: a completed download that lands
+   * where nothing looks for it is indistinguishable from a missing model.
+   */
+  dir?: string;
   /** Injectable download, so tests never touch the network. */
   download?: (opts: {
     url: string;
@@ -93,8 +101,33 @@ export interface ParakeetModelDeps {
   fetchImpl?: typeof fetch;
 }
 
-/** Where the model lives for a given userData directory. */
+/**
+ * Where the model lives inside a models directory.
+ *
+ * `baseDir` is the directory that CONTAINS the model folder — normally
+ * `<userData>/models`. It deliberately adds no `models` segment of its own.
+ *
+ * ── The bug this fixes ──────────────────────────────────────────────────────
+ * This used to append `"models"` here while `resolveModelDir` also appended
+ * `"models"` to the same parent, so a completed 460 MB download was installed
+ * at `<userData>/models/models/<name>` while the loader and every status check
+ * looked in `<userData>/models/<name>`. The model reported as downloaded and
+ * then as `model_missing` on the same install, forever.
+ */
 export function modelDirFor(baseDir: string, name = PARAKEET_MODEL_DIR_NAME): string {
+  return path.join(baseDir, name);
+}
+
+/**
+ * The doubled path an earlier build could install to: `<baseDir>/models/<name>`.
+ *
+ * Kept so an existing download can be moved into place instead of being
+ * re-fetched — see {@link ensureModelInPlace}.
+ */
+export function legacyModelDirFor(
+  baseDir: string,
+  name = PARAKEET_MODEL_DIR_NAME,
+): string {
   return path.join(baseDir, "models", name);
 }
 
@@ -124,6 +157,39 @@ export function inspectModelDir(dir: string): {
     if (size !== file.bytes) wrongSize.push(file.name);
   }
   return { ready: missing.length === 0 && wrongSize.length === 0, missing, wrongSize };
+}
+
+/**
+ * Make sure the model is where {@link modelDirFor} says it should be.
+ *
+ * Moves a complete install out of the legacy doubled path. Nothing else is
+ * touched: an incomplete or absent legacy directory is left alone, so a failed
+ * download cannot be mistaken for a good one and the size check still runs.
+ *
+ * Never throws. A migration that fails must degrade to "model not installed",
+ * which is a state the UI can act on, rather than taking the app down.
+ */
+export function ensureModelInPlace(
+  baseDir: string,
+  name = PARAKEET_MODEL_DIR_NAME,
+  log?: (line: string) => void,
+): { dir: string; migratedFrom: string | null } {
+  const dir = modelDirFor(baseDir, name);
+  if (inspectModelDir(dir).ready) return { dir, migratedFrom: null };
+
+  const legacy = legacyModelDirFor(baseDir, name);
+  if (legacy === dir || !inspectModelDir(legacy).ready) {
+    return { dir, migratedFrom: null };
+  }
+  try {
+    fs.mkdirSync(path.dirname(dir), { recursive: true });
+    fs.renameSync(legacy, dir);
+    log?.(`[Parakeet-Model] moved an existing install from ${legacy} to ${dir}`);
+    return { dir, migratedFrom: legacy };
+  } catch (err) {
+    log?.(`[Parakeet-Model] could not move ${legacy} to ${dir}: ${String(err)}`);
+    return { dir, migratedFrom: null };
+  }
 }
 
 /**
@@ -240,8 +306,11 @@ export class ParakeetModelManager {
   private readonly dir: string;
 
   constructor(private readonly deps: ParakeetModelDeps) {
-    this.dir = modelDirFor(deps.baseDir);
     this.log = deps.log ?? ((line) => console.log(line));
+    // Before the dir is fixed, so a legacy install is adopted rather than
+    // reported missing.
+    ensureModelInPlace(deps.baseDir, PARAKEET_MODEL_DIR_NAME, this.log);
+    this.dir = deps.dir ?? modelDirFor(deps.baseDir);
     this.state = this.freshState();
   }
 

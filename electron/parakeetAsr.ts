@@ -19,6 +19,7 @@ import {
 } from "./parakeetDiagnostics";
 import {
   ParakeetModelManager,
+  ensureModelInPlace,
   type ParakeetModelStatus as ParakeetModelFileStatus,
 } from "./parakeetModel";
 
@@ -214,7 +215,20 @@ export function registerParakeetHandlers(options: {
   modelDir: string;
   paddingMs?: () => number | undefined;
 }): { getHost: () => ParakeetHost } {
+  // A completed download from an earlier build can sit one directory too deep
+  // (see `ensureModelInPlace`). Move it into place BEFORE anything looks for
+  // it, otherwise the loader reports `model_missing` against a 652 MB encoder
+  // that is really on disk and the only remedy looks like re-downloading it.
+  // Runs at most once per registration, and never loads the model.
+  let modelPlaced = false;
+  const ensureModelPlaced = () => {
+    if (modelPlaced) return;
+    modelPlaced = true;
+    ensureModelInPlace(path.dirname(options.modelDir));
+  };
+
   const getHost = (): ParakeetHost => {
+    ensureModelPlaced();
     if (!host) {
       host = createParakeetHost({
         modelDir: options.modelDir,
@@ -231,6 +245,10 @@ export function registerParakeetHandlers(options: {
   const getModelManager = (): ParakeetModelManager => {
     if (!modelManager) {
       modelManager = new ParakeetModelManager({
+        // `dir` is passed explicitly so the downloader and the loader are given
+        // the SAME resolved string, rather than each deriving one. Deriving them
+        // independently is how they came to disagree.
+        dir: options.modelDir,
         baseDir: path.dirname(options.modelDir),
       });
     }
