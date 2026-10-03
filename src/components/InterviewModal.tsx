@@ -35,6 +35,7 @@ export const InterviewModal: React.FC<InterviewModalProps> = ({
     interim,
     isRecording,
     logs,
+    addLog,
     debugAudios,
     debugWavOn,
     setDebugWav,
@@ -516,9 +517,29 @@ export const InterviewModal: React.FC<InterviewModalProps> = ({
                   <input
                     type="checkbox"
                     checked={!!asrCompareParakeet}
-                    onChange={(e) =>
-                      updateSettings({ asrCompareParakeet: e.target.checked })
-                    }
+                    onChange={(e) => {
+                      const enabled = e.target.checked;
+                      updateSettings({ asrCompareParakeet: enabled });
+                      // Persist explicitly.
+                      //
+                      // The auto-save effect that normally mirrors settings to
+                      // electron-store lives in SettingsPanel, which is a
+                      // different component. Ticking the box here updated
+                      // zustand and nothing else, so the main process — which
+                      // reads the flag from the STORE, not from zustand — never
+                      // saw it, and the feature could never turn on. Writing
+                      // through on change is what makes the toggle work at all.
+                      const next = {
+                        ...useStore.getState().settings,
+                        asrCompareParakeet: enabled,
+                      };
+                      void window.ghostly.saveSettings(next);
+                      addLog(
+                        enabled
+                          ? "Parakeet comparison ON — the model loads on Start Interview (~7 s, ~650 MB) and is released on Stop."
+                          : "Parakeet comparison OFF — the model is not loaded.",
+                      );
+                    }}
                     className="accent-white/60 mt-0.5"
                   />
                   <span>

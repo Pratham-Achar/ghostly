@@ -260,6 +260,47 @@ console.log("\n── Wiring and safety ─────────────�
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+console.log("\n── The toggle must actually reach the main process ────────");
+// ═══════════════════════════════════════════════════════════════════════════
+
+{
+  // ── A real bug this caught ──────────────────────────────────────────────
+  // The settings auto-save effect lives in SettingsPanel. The Parakeet toggle
+  // lives in InterviewModal, so ticking it updated zustand and nothing else:
+  // the main process reads the flag from electron-store, never saw it, and the
+  // feature could never turn on — while the checkbox visibly said "on".
+  const modal = await readFile("src/components/InterviewModal.tsx", "utf8");
+  checkTrue(
+    "48 the toggle writes settings through to the main process",
+    /asrCompareParakeet: enabled[\s\S]{0,200}saveSettings/.test(modal),
+  );
+  checkTrue(
+    "49 the toggle confirms itself in the debug log",
+    /Parakeet comparison ON/.test(modal),
+  );
+  checkTrue(
+    "50 the persisted object is built from live store state",
+    /\.\.\.useStore\.getState\(\)\.settings[\s\S]{0,120}asrCompareParakeet/.test(modal),
+  );
+
+  const hook = await readFile("src/hooks/useInterviewAudio.ts", "utf8");
+  checkTrue("51 the hook exposes addLog for dev controls",
+    /^  return \{[\s\S]{0,1200}^    addLog,$/m.test(hook));
+}
+
+{
+  // App.tsx rebuilds the settings object from the store on launch. If it did
+  // not carry unknown keys through, the flag would be dropped on every restart.
+  const app = await readFile("src/App.tsx", "utf8");
+  checkTrue(
+    "52 App.tsx spreads saved settings so the flag survives a restart",
+    /\.\.\.defaults,[\s\S]{0,80}\.\.\.rest,/.test(app),
+  );
+  checkTrue("53 App.tsx does not hard-code asrCompareParakeet to false",
+    !/asrCompareParakeet:\s*false/.test(app));
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 console.log(`\n${pass} passed, ${fail} failed`);
 if (failures.length) {
   console.log("\nFAILURES:\n" + failures.map((f) => `  - ${f}`).join("\n"));

@@ -1016,6 +1016,15 @@ export function useInterviewAudio() {
     interim,
     isRecording,
     logs,
+    /**
+     * Append a line to the visible debug log.
+     *
+     * Exposed because dev-only controls live in other components (the Parakeet
+     * toggle is in InterviewModal, not in this hook), and a control that
+     * changes engine behaviour without saying so in the log is exactly the kind
+     * of thing that gets misdiagnosed later.
+     */
+    addLog,
     debugAudios,
     /** Whether the dev-only WAV dump is currently recording. */
     debugWavOn,
