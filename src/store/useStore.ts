@@ -102,6 +102,21 @@ export interface AsrComparison {
   groqCorrectedText?: string;
   /** Telemetry from the Groq Whisper run. */
   groqTelemetry?: GroqAsrTelemetry | null;
+  /**
+   * Raw Parakeet transcript for this segment (DEVELOPMENT COMPARISON ONLY).
+   *
+   * Never read by the question gate, the correction path, the prompt builder
+   * or the AI. It lives in this developer-only slice and nowhere else.
+   */
+  parakeetText?: string;
+  /** Parakeet decode latency in ms, for a like-for-like comparison. */
+  parakeetMs?: number | null;
+  /**
+   * Why the Parakeet cell is what it is: a status while loading, or the
+   * failure reason when there is no text (`timeout`, `model_missing`, ...).
+   * A failed comparison must be visible as a failure, never silently blank.
+   */
+  parakeetStatus?: string;
   timestamp: number;
 }
 
@@ -179,6 +194,21 @@ export interface Settings {
   asrCompareGroq?: boolean;
   /** Configurable Whisper model id. Defaults to `whisper-large-v3`. */
   groqAsrModel?: string;
+  /**
+   * Developer-only: additionally transcribe every segment with local NVIDIA
+   * Parakeet (sherpa-onnx, CPU) for a fourth comparison column.
+   *
+   * Defaults OFF, and the main process additionally refuses it in a packaged
+   * build, so the ~631 MB model is never even resolved unless a developer asks
+   * for it. Moonshine remains the production engine and there is no fallback
+   * between them in either direction.
+   */
+  asrCompareParakeet?: boolean;
+  /**
+   * Optional model directory override, read by the main process when spawning
+   * the utility process. Unset means the default `models/` location.
+   */
+  parakeetModelDir?: string;
   /**
    * When on, the answering agent fires by itself as soon as the interviewer
    * finishes a clear question — no hotkey. Manual triggers keep working.
@@ -329,6 +359,9 @@ export const useStore = create<GhostlyStore>((set, get) => ({
     asrEngine: "moonshine",
     asrCompareMode: false,
     asrCompareGroq: false,
+    // Dev-only, and OFF by default: the Parakeet model is ~631 MB and costs
+    // several hundred MB of resident memory.
+    asrCompareParakeet: false,
     groqAsrModel: "whisper-large-v3",
     autoAnswer: false,
   },

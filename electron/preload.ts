@@ -58,6 +58,57 @@ contextBridge.exposeInMainWorld("ghostly", {
     prompt?: string;
   }): Promise<any> => ipcRenderer.invoke("groq:transcribe", payload),
 
+  // ── Parakeet (DEVELOPMENT COMPARISON ENGINE ONLY) ─────────────────────
+  //
+  // Deliberately narrow: the renderer may ask for the model status, ask for the
+  // model to be loaded or released, submit an already-captured 16 kHz segment
+  // for a comparison transcript, and read dev diagnostics. It can never touch
+  // the model itself, and the result is written ONLY to the isolated
+  // `asrComparisons` slice — never to the transcript, the question gate, the
+  // prompt, or the answer path.
+  //
+  // The main process refuses every call unless the dev setting is on and it is
+  // not a packaged build, so these are inert in a shipped app.
+  parakeetStatus: (): Promise<{
+    status: "disabled" | "missing" | "loading" | "ready" | "error";
+  }> => ipcRenderer.invoke("parakeet:status"),
+
+  parakeetLoad: (): Promise<{
+    ok: boolean;
+    loadMs?: number;
+    rssMb?: number;
+    code?: string;
+    message?: string;
+    status?: string;
+  }> => ipcRenderer.invoke("parakeet:load"),
+
+  parakeetUnload: (): Promise<{ ok: boolean }> =>
+    ipcRenderer.invoke("parakeet:unload"),
+
+  parakeetTranscribe: (payload: {
+    samples: Float32Array;
+    sampleRate: number;
+  }): Promise<{
+    ok: boolean;
+    text?: string;
+    decodeMs?: number;
+    loadMs?: number;
+    rssMb?: number;
+    rtf?: number;
+    code?: string;
+    message?: string;
+  }> => ipcRenderer.invoke("parakeet:transcribe", payload),
+
+  // Counts and timings only — never audio, never model contents.
+  parakeetDiagnostics: (): Promise<{
+    status: string;
+    loadMs: number | null;
+    rssMb: number | null;
+    queued: number;
+    inFlight: number;
+    consecutiveFailures: number;
+  }> => ipcRenderer.invoke("parakeet:diagnostics"),
+
   // ── Dev-only screen visibility ───────────────────────────────────────
   // Runtime-only and dev-gated in the main process. Returns the mode that
   // actually took effect, which may differ from the request if it was

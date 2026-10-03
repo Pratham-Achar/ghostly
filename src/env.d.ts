@@ -102,6 +102,47 @@ interface Window {
         }
     >;
 
+    // ── Parakeet (DEVELOPMENT COMPARISON ENGINE ONLY) ────────────────
+    //
+    // Mirrors the ASR-engine pattern: the renderer hands over audio it has
+    // already captured and receives a transcript. There is no handle to the
+    // model, no path to it, and no way to make it part of the live pipeline.
+    // The main process refuses all of this unless the dev setting is on and
+    // the app is not packaged.
+    parakeetStatus: () => Promise<{
+      status: "disabled" | "missing" | "loading" | "ready" | "error";
+    }>;
+    parakeetLoad: () => Promise<{
+      ok: boolean;
+      loadMs?: number;
+      rssMb?: number;
+      code?: string;
+      message?: string;
+      status?: string;
+    }>;
+    parakeetUnload: () => Promise<{ ok: boolean }>;
+    parakeetTranscribe: (payload: {
+      samples: Float32Array;
+      sampleRate: number;
+    }) => Promise<{
+      ok: boolean;
+      text?: string;
+      decodeMs?: number;
+      loadMs?: number;
+      rssMb?: number;
+      rtf?: number;
+      code?: string;
+      message?: string;
+    }>;
+    parakeetDiagnostics: () => Promise<{
+      status: string;
+      loadMs: number | null;
+      rssMb: number | null;
+      queued: number;
+      inFlight: number;
+      consecutiveFailures: number;
+    }>;
+
     // ── Dev-only screen visibility ────────────────────────────────────
     // Runtime-only (not persisted) and refused by the main process in a
     // packaged build.

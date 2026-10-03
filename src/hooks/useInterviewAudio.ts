@@ -38,6 +38,11 @@ import {
   formatGroqTelemetryForLog,
 } from "../lib/groqWhisper";
 import {
+  loadParakeetModel,
+  unloadParakeetModel,
+  runParakeetComparison,
+} from "../lib/parakeetClient";
+import {
   describeClipping,
   float32ToWavWithClipping,
   isDebugWavEnabled,
@@ -370,6 +375,60 @@ export function useInterviewAudio() {
     [upsertComparison],
   );
 
+  // ── Optional fourth engine: Parakeet (LOCAL, dev comparison only) ────────
+  //
+  // Given the SAME buffer as Moonshine, Deepgram and Groq, so all four engines
+  // decode identical audio. Strictly fire-and-forget: the load, the decode, the
+  // queue and every failure belong to the host in the main process, and nothing
+  // here can delay or alter the Moonshine path.
+  //
+  // ISOLATION — the important part: the result is written ONLY to
+  // `asrComparisons`, via `upsertComparison`. It is never added to
+  // `interviewMessages`, never corrected into the transcript, never read by the
+  // question gate, and never included in a prompt. Moonshine stays the
+  // production engine and there is no fallback in either direction.
+  const compareWithParakeet = useCallback(
+    (audio: Float32Array, speechSeconds: number, phraseId: number) => {
+      const { settings } = useStore.getState();
+
+      // Feature flag. Off by default, and off in production builds.
+      if (!settings.asrCompareParakeet) return;
+      if (!import.meta.env.DEV) return;
+
+      void runParakeetComparison(audio, {
+        onResult: (result) => {
+          if (!result.ok) {
+            // Record WHY there is no text. A silently blank column would be
+            // indistinguishable from "Parakeet heard nothing", which is exactly
+            // the kind of quiet failure that makes a comparison meaningless.
+            upsertComparison(phraseId, {
+              audioSeconds: speechSeconds,
+              parakeetStatus: result.code ?? "error",
+            });
+            // Category-level message only — never a transcript.
+            console.warn(
+              `[Parakeet] comparison skipped: code=${result.code ?? "error"}`,
+            );
+            return;
+          }
+          upsertComparison(phraseId, {
+            audioSeconds: speechSeconds,
+            parakeetText: result.text ?? "",
+            parakeetMs: result.decodeMs ?? null,
+            parakeetStatus: "ok",
+          });
+          console.log(
+            `[Parakeet] comparison phraseId=${phraseId} decodeMs=${result.decodeMs ?? "?"} rssMb=${result.rssMb ?? "?"}`,
+          );
+        },
+        onError: (message) => {
+          // Category-level message only — never a transcript.
+          console.warn(`[Parakeet] comparison skipped: ${message}`);
+        },
+      });
+    },
+    [upsertComparison],
+  );
 
   const handleLevel = useCallback(
     (sample: { rms: number; peak: number; speaking: boolean }) => {
@@ -456,14 +515,15 @@ export function useInterviewAudio() {
         }
       }
       if (type === "final") {
-        // Comparison mode only: pair Moonshine's result with the Deepgram
-        // result already recorded for this same phraseId, so the developer
-        // view shows both engines on identical audio. A no-op when the feature
-        // flag is off, which is the default.
+        // Comparison mode only: pair Moonshine's result with the Deepgram /
+        // Groq / Parakeet results already recorded for this same phraseId, so
+        // the developer view shows every engine on identical audio. A no-op
+        // when the feature flags are off, which is the default.
         if (
           import.meta.env.DEV &&
           (useStore.getState().settings.asrCompareMode ||
-            useStore.getState().settings.asrCompareGroq)
+            useStore.getState().settings.asrCompareGroq ||
+            useStore.getState().settings.asrCompareParakeet)
         ) {
           const target = useStore
             .getState()
@@ -599,6 +659,23 @@ export function useInterviewAudio() {
     setIsRecording(true);
     addLog("Starting system audio capture (interviewer only)...");
 
+    // ── Parakeet: load the model HERE, not at app launch ────────────────
+    // Cold load measured ~6 s and several hundred MB of RSS. Doing it on Start
+    // keeps that cost off app launch, where a session with the feature off
+    // would pay it for nothing. Fire-and-forget with a result log: capture
+    // continues regardless, because this is a diagnostic, not a dependency.
+    if (import.meta.env.DEV && useStore.getState().settings.asrCompareParakeet) {
+      void loadParakeetModel().then((result) => {
+        if (result.ok) {
+          addLog(
+            `Parakeet comparison model ready (${result.loadMs ?? "?"} ms, ${result.rssMb ?? "?"} MB RSS).`,
+          );
+        } else {
+          addLog(`Parakeet comparison unavailable: ${result.code ?? "error"}.`);
+        }
+      });
+    }
+
     let closeContext: (() => void) | null = null;
     let displayStream: MediaStream | null = null;
 
@@ -721,6 +798,7 @@ export function useInterviewAudio() {
         },
         compareWithDeepgram,
         compareWithGroq,
+        compareWithParakeet,
       );
       addLog("System (interviewer) audio capture started.");
 
@@ -894,6 +972,12 @@ export function useInterviewAudio() {
     flushWaitersRef.current.forEach((resolve) => resolve(0));
     flushWaitersRef.current.clear();
     addLog("Stopped Interview.");
+    // Release the Parakeet model immediately rather than waiting for the idle
+    // timeout: the interview is over, and on an 8 GB laptop held during a call
+    // the resident memory is worth having back now.
+    if (import.meta.env.DEV && useStore.getState().settings.asrCompareParakeet) {
+      void unloadParakeetModel();
+    }
     // The ONLY path that releases the context. It must not also call
     // `.close()` on the legacy handle, or the same AudioContext is closed twice.
     teardownRef.current?.();
@@ -1025,6 +1109,15 @@ function setupVADWorklet(
    * engines so all three transcribe identical audio.
    */
   onCompareWithGroq: (
+    audio: Float32Array,
+    speechSeconds: number,
+    phraseId: number,
+  ) => void,
+  /**
+   * Optional fourth engine (local Parakeet, dev comparison only). Fires with
+   * the SAME buffer as the other engines.
+   */
+  onCompareWithParakeet: (
     audio: Float32Array,
     speechSeconds: number,
     phraseId: number,
@@ -1189,6 +1282,7 @@ function setupVADWorklet(
       // engine, and their failures must never affect the Moonshine path.
       onCompareWithDeepgram(downsampled, speechSeconds, phraseId);
       onCompareWithGroq(downsampled, speechSeconds, phraseId);
+      onCompareWithParakeet(downsampled, speechSeconds, phraseId);
 
       // Count it as owed BEFORE posting, so there is no window in which a
       // hotkey pressed between this line and the post sees an empty queue.

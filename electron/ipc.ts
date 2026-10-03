@@ -1,7 +1,8 @@
-import { ipcMain, desktopCapturer, session } from "electron";
+import { ipcMain, desktopCapturer, session, app } from "electron";
 import { captureFullScreen } from "./capture";
 import { registerDeepgramHandlers } from "./deepgram";
 import { registerGroqAsrHandlers } from "./groqAsr";
+import { registerParakeetHandlers } from "./parakeetAsr";
 import Store from "electron-store";
 
 const store = new Store({
@@ -132,4 +133,19 @@ export function registerIpcHandlers(): void {
   // Groq Whisper ASR (comparison only). The long-lived key never crosses the
   // IPC boundary — the main process performs the request. See electron/groqAsr.ts.
   registerGroqAsrHandlers(store);
+
+  // Parakeet (DEVELOPMENT COMPARISON ENGINE ONLY). Off unless the dev setting is
+  // on, and hard-disabled in a packaged build — so a shipped app never even
+  // resolves the model directory, let alone loads several hundred MB of it.
+  //
+  // The flag is read from the same persisted `settings` blob the renderer
+  // writes, rather than duplicated here, so there is exactly one switch.
+  registerParakeetHandlers({
+    isEnabled: () =>
+      !app.isPackaged &&
+      process.env.NODE_ENV !== "production" &&
+      (store.get("settings") as { asrCompareParakeet?: boolean } | undefined)
+        ?.asrCompareParakeet === true,
+    modelDir: store.get("parakeetModelDir") as string | undefined,
+  });
 }

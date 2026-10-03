@@ -19,6 +19,7 @@
   "include": [
     "electron/**/*.ts",
     "electron.vite.config.ts",
-    "src/lib/groqWhisper.ts"
+    "src/lib/groqWhisper.ts",
+    "src/lib/parakeetHost.ts"
   ]
 }

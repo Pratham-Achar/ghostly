@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef } from "react";
 import { useInterviewAudio } from "../hooks/useInterviewAudio";
 import { useStore } from "../store/useStore";
+import { getParakeetStatus, type ParakeetStatus } from "../lib/parakeetClient";
 import type { InterviewTurn } from "../lib/interviewAgent";
 
 interface InterviewModalProps {
@@ -45,7 +46,31 @@ export const InterviewModal: React.FC<InterviewModalProps> = ({
   const [showLogs, setShowLogs] = useState(false);
   // Developer-only engine comparison, read straight from the store.
   const asrComparisons = useStore((s) => s.asrComparisons);
+  const asrCompareParakeet = useStore((s) => s.settings.asrCompareParakeet);
+  const updateSettings = useStore((s) => s.updateSettings);
+  // Model status for the dev panel. Polled only while the dev comparison is on:
+  // the model loads on Start and unloads on Stop, so a slow poll is enough to
+  // show "loading" rather than a stale "ready".
+  const [parakeetStatus, setParakeetStatus] = useState<ParakeetStatus>("disabled");
   const messagesEndRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!import.meta.env.DEV || !asrCompareParakeet) {
+      setParakeetStatus("disabled");
+      return;
+    }
+    let cancelled = false;
+    const poll = async () => {
+      const status = await getParakeetStatus();
+      if (!cancelled) setParakeetStatus(status);
+    };
+    void poll();
+    const timer = window.setInterval(poll, 2000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [asrCompareParakeet]);
 
   // Auto-scroll to bottom of messages
   useEffect(() => {
@@ -406,6 +431,10 @@ export const InterviewModal: React.FC<InterviewModalProps> = ({
                     ASR comparison (same audio):
                   </div>
                   {asrComparisons.map((c) => {
+                    // The Parakeet column is only rendered while the dev
+                    // comparison is on, so a shipped build never shows a cell
+                    // for an engine that was never run.
+                    const showParakeet = !!asrCompareParakeet;
                     const t = c.deepgramTelemetry;
                     const g = c.groqTelemetry;
                     const ms = (v: number | null | undefined) =>
@@ -422,7 +451,9 @@ export const InterviewModal: React.FC<InterviewModalProps> = ({
                         <div className="text-[9px] text-white/40">
                           {c.audioSeconds.toFixed(1)}s audio
                         </div>
-                        <div className="grid grid-cols-3 gap-1.5 text-[9px]">
+                        <div
+                          className={`grid gap-1.5 text-[9px] ${showParakeet ? "grid-cols-4" : "grid-cols-3"}`}
+                        >
                           <div>
                             <div className="text-white/40 mb-0.5">Moonshine</div>
                             <div className="text-white/70">
@@ -450,6 +481,19 @@ export const InterviewModal: React.FC<InterviewModalProps> = ({
                               </div>
                             )}
                           </div>
+                          {showParakeet && (
+                            <div>
+                              <div className="text-white/40 mb-0.5">
+                                Parakeet{` ${ms(c.parakeetMs)}`}
+                              </div>
+                              <div className="text-white/70">
+                                {c.parakeetText ||
+                                  (c.parakeetStatus && c.parakeetStatus !== "ok"
+                                    ? `(${c.parakeetStatus})`
+                                    : "(pending)")}
+                              </div>
+                            </div>
+                          )}
                         </div>
                         <div className="text-[8px] text-white/30">
                           {`dg final ${ms(t?.firstFinalMs)} · speech_final ${ms(t?.speechFinalMs)} · total ${ms(t?.totalMs)}`}
@@ -459,6 +503,32 @@ export const InterviewModal: React.FC<InterviewModalProps> = ({
                     );
                   })}
                 </div>
+              )}
+
+              {/* ── Parakeet comparison (dev only) ───────────────────── */}
+              {/* A DEVELOPMENT COMPARISON ENGINE, off by default. The model is
+                  ~631 MB and costs several hundred MB of resident memory, so
+                  it is loaded on Start and released on Stop. Moonshine remains
+                  the production engine: this column never feeds the transcript,
+                  the question gate or the AI. */}
+              {import.meta.env.DEV && (
+                <label className="flex items-start gap-2 text-[9px] text-white/50 cursor-pointer select-none">
+                  <input
+                    type="checkbox"
+                    checked={!!asrCompareParakeet}
+                    onChange={(e) =>
+                      updateSettings({ asrCompareParakeet: e.target.checked })
+                    }
+                    className="accent-white/60 mt-0.5"
+                  />
+                  <span>
+                    Compare with local Parakeet (dev only — Moonshine stays the
+                    engine that reaches the AI)
+                    <span className="block text-white/30 mt-0.5">
+                      status: {parakeetStatus}
+                    </span>
+                  </span>
+                </label>
               )}
 
               {/* Audio Debugger */}

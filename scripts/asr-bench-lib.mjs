@@ -142,7 +142,19 @@ export function parseManifest(raw) {
       throw new Error(`manifest entry ${entry.id} is missing a file`);
     }
     if (typeof entry.reference !== "string" || !entry.reference) {
-      throw new Error(`manifest entry ${entry.id} is missing a reference`);
+      // An empty reference is almost always a stub from
+      // `scripts/import-debug-audio.mjs` waiting to be filled in, so say that
+      // rather than leaving the user with a bare field name. The wording also
+        // restates WHY it refuses: a fabricated reference yields a real-looking
+      // WER that measures nothing.
+      throw new Error(
+        `manifest entry "${entry.id}" has no reference text. ` +
+          `Imported clips start empty on purpose — fill "reference" in ` +
+          `tests/fixtures/asr/manifest.json with the exact words spoken. ` +
+          `This harness refuses to score a clip with no reference rather than ` +
+          `inventing one, because a WER against a guessed reference looks like ` +
+          `a measurement while measuring nothing.`,
+      );
     }
   }
 
