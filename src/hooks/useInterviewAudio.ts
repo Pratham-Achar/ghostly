@@ -42,6 +42,7 @@ import {
   unloadParakeetModel,
   runParakeetComparison,
 } from "../lib/parakeetClient";
+import type { ParakeetStatus } from "../lib/parakeetClient";
 import {
   describeClipping,
   float32ToWavWithClipping,
@@ -56,6 +57,84 @@ import {
   type FlushTransport,
 } from "../lib/asrDrain";
 import type { DebugClip } from "../lib/debugClipSave";
+import {
+  describeParakeetFallback,
+  normalizePrimaryAsr,
+  shouldFallbackToMoonshine,
+  type PrimaryAsr,
+} from "../lib/primaryAsr";
+import {
+  INITIAL_PHRASE_OPEN_STATE,
+  PARAKEET_PHRASE_OPEN_MARKER,
+  reducePhraseOpen,
+  shouldPublishPhraseOpenMarker,
+  type PhraseOpenState,
+  type PhraseStateEvent,
+} from "../lib/asrPhraseState";
+import {
+  PARAKEET_DRAIN_DEADLINE_MS,
+  PARAKEET_DRAIN_MAX_ATTEMPTS,
+  PARAKEET_PRIMARY_QUEUE_LIMIT,
+  createParakeetSegmentQueue,
+} from "../lib/parakeetPrimary";
+import { transcribeWithParakeet } from "../lib/parakeetClient";
+import { isDecodableLength } from "../lib/asrTokenBudget";
+
+/**
+ * One decoded segment, in the exact shape the Moonshine worker posts.
+ *
+ * ── Why this type exists ────────────────────────────────────────────────────
+ * Making Parakeet the primary engine must not fork the transcript pipeline. The
+ * cheapest way to guarantee that is to refuse to define a second shape: the
+ * engine swaps at the point where audio is handed over, and everything after
+ * that — the drain counter, the artefact gate, `correctTranscript`, the
+ * question gate, the AI — sees exactly what it saw before.
+ */
+export interface AsrFinalPayload {
+  source: "mic" | "system";
+  text: string;
+  audioUrl?: string;
+  phraseId: number;
+  /**
+   * Decode latency in ms, or `null` when no decode happened.
+   *
+   * Explicitly nullable rather than 0: the comparison grid prints this next to a
+   * real measurement, and `0` would read as "instant".
+   */
+  asrMs: number | null;
+  /** Which engine produced it. Drives the comparison column only. */
+  engine: "moonshine" | "parakeet";
+}
+
+/** One captured phrase on its way to the primary engine. */
+interface CapturedSegment {
+  audio: Float32Array;
+  source: "mic" | "system";
+  phraseId: number;
+  speechSeconds: number;
+  audioUrl?: string;
+}
+
+/**
+ * Whether a SUCCESSFUL but EMPTY Parakeet decode hands the segment to Moonshine.
+ *
+ * ── The case for it ─────────────────────────────────────────────────────────
+ * The brief asks for it, and it is right for a specific real failure: an
+ * int8 TDT model can return nothing for a segment that clearly contained speech
+ * (a soft consonant, a fast delivery). In that situation a second opinion is
+ * strictly better than committing an empty final and losing the question.
+ *
+ * ── The cost, stated plainly ────────────────────────────────────────────────
+ * On genuinely silent or near-silent audio Parakeet correctly returns empty and
+ * Moonshine does not — it hallucinates. Falling back there buys a fabricated
+ * transcript, and `assessTranscriptQuality` only catches the structural
+ * artefacts it knows about.
+ *
+ * The VAD's RMS/peak gate upstream means that second case is rare, which is why
+ * this is worth doing. It is a single named boolean so the trade can be flipped
+ * without touching the routing.
+ */
+export const PARAKEET_EMPTY_FALLBACK = true;
 
 export type ChatMessage = TranscriptMessage;
 
@@ -167,9 +246,47 @@ export function useInterviewAudio() {
   // like "the interviewer is still speaking" forever.
   const lastFinalPhraseIdRef = useRef(-1);
   const interimPhraseIdRef = useRef(-1);
+  // Real interim text published by Moonshine for the phrase in progress, or null.
+  // The Parakeet phrase-open marker is only published when this is null — a
+  // lazily-loaded Moonshine fallback can emit genuine partials, and those must
+  // always win over a placeholder.
+  const realInterimRef = useRef<string | null>(null);
+  // "A VAD phrase is open", derived from level/phraseClosed events. See
+  // `lib/asrPhraseState.ts` for why this exists and why it needs no VAD change.
+  const phraseOpenRef = useRef<PhraseOpenState>(INITIAL_PHRASE_OPEN_STATE);
+  /** Segments buffered while the Parakeet model is still loading. */
+  const parakeetQueueRef = useRef(
+    createParakeetSegmentQueue<CapturedSegment>(),
+  );
+  /** Resolves once the in-flight Parakeet load settles, so the queue can drain. */
+  const parakeetReadyRef = useRef(false);
+  /** Guards against two concurrent drains of the queue after a load. */
+  const parakeetDrainingRef = useRef(false);
+  /** True once Moonshine has been asked to load lazily as a fallback. */
+  const moonshineLazyRequestedRef = useRef(false);
   const asrModel = useStore(
     (s) => s.settings.whisperModel ?? "onnx-community/moonshine-base-ONNX",
   );
+  // Which engine's transcript reaches the question gate and the AI.
+  //
+  // Read through the store rather than duplicated as local state, because the
+  // Settings page writes it. A ref keeps the audio callbacks (which are created
+  // once, outside React's render cycle) reading the CURRENT value without
+  // having to be rebuilt on every settings change.
+  const primaryAsr = normalizePrimaryAsr(useStore((s) => s.settings.primaryAsr));
+  const primaryAsrRef = useRef<PrimaryAsr>(primaryAsr);
+  primaryAsrRef.current = primaryAsr;
+
+  /** Live model state, surfaced so the panel can say "Loading speech model…". */
+  const [parakeetStatus, setParakeetStatus] =
+    useState<ParakeetStatus>("disabled");
+  const [parakeetMessage, setParakeetMessage] = useState<string | null>(null);
+  /**
+   * Set when a segment had to be handed to Moonshine because Parakeet failed.
+   * Visible on purpose: a silent switch of transcription engine would be
+   * indistinguishable from a model that just got worse.
+   */
+  const [fallbackNotice, setFallbackNotice] = useState<string | null>(null);
 
   const addLog = useCallback((msg: string) => {
     setLogs((prev) => [
@@ -448,6 +565,13 @@ export function useInterviewAudio() {
       // Feed the meter + state machine on EVERY sample (no React render).
       pushAudioLevel(sample.rms, sample.speaking);
 
+      // ── Phrase-open edge ────────────────────────────────────────────────
+      // `speaking` is the worklet's own `this.speechSeconds > 0`, so this is
+      // the authoritative "a phrase is accumulating" signal, ~50 ms after the
+      // interviewer starts. Only the TRANSITION is acted on, so this runs twice
+      // per utterance rather than 20 times a second.
+      setPhraseOpen({ kind: "level", speaking: sample.speaking });
+
       // Log only the transitions, never every sample.
       const active = sample.peak >= 0.01;
       if (active === audioActiveRef.current) return;
@@ -458,10 +582,198 @@ export function useInterviewAudio() {
           : `System audio is silent (level ${sample.peak.toFixed(3)}) — no sound is reaching Ghostly.`,
       );
     },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
     [addLog],
   );
 
-  // Worker Initialization — re-runs whenever the chosen ASR model changes
+  /**
+   * Apply a phrase-open transition.
+   *
+   * With Moonshine primary this does nothing at all: real partial text drives
+   * the interim line exactly as before, and Moonshine's behaviour is untouched.
+   *
+   * With Parakeet primary it publishes {@link PARAKEET_PHRASE_OPEN_MARKER} as
+   * the interim, which is the only way to re-arm the question gate's "the
+   * interviewer is still speaking" check without editing the gate — which is out
+   * scope for this work.
+   */
+  const setPhraseOpen = useCallback((event: PhraseStateEvent) => {
+    const state = reducePhraseOpen(phraseOpenRef.current, event);
+    phraseOpenRef.current = state;
+    if (primaryAsrRef.current !== "parakeet") return;
+    if (shouldPublishPhraseOpenMarker(state, realInterimRef.current !== null)) {
+      setInterviewInterim({ source: "system", text: PARAKEET_PHRASE_OPEN_MARKER });
+    } else if (!state.open) {
+      setInterviewInterim(null);
+    }
+  }, []);
+
+  /**
+   * The single downstream path for a decoded segment, whatever engine produced
+   * it.
+   *
+   * ── Why one function and not two ───────────────────────────────────────────
+   * The requirement for Parakeet-as-primary is that its transcript becomes the
+   * raw transcript and then goes through the EXISTING flow: raw preserved,
+   * `correctTranscript`, artefact gate, question gate, AI. The cheapest way to
+   * guarantee that is to have exactly one implementation. Two functions, even
+   * textually identical today, drift — and that drift would stay invisible until
+   * a question was answered from the wrong transcript.
+   *
+   * Ordering below is load-bearing and unchanged from the original Moonshine
+   * handler:
+   *   1. the drain counter is decremented FIRST, before any early return, so a
+   *      final that is then discarded by the artefact gate can never leave the
+   *      submit barrier waiting forever;
+   *   2. the comparison row is updated (dev only);
+   *   3. the artefact gate can return;
+   *   4. correction, normalisation, commit.
+   */
+  const handleFinalEvent = useCallback(
+    (payload: AsrFinalPayload) => {
+      const { source, text, audioUrl, phraseId, asrMs, engine } = payload;
+
+      // Comparison mode: pair results for the same phraseId so the developer
+      // grid shows every engine on identical audio. A no-op when the flags are
+      // off, which is the default.
+      const compareOn =
+        import.meta.env.DEV &&
+        (useStore.getState().settings.asrCompareMode ||
+          useStore.getState().settings.asrCompareGroq ||
+          useStore.getState().settings.asrCompareParakeet ||
+          useStore.getState().settings.asrCompareMoonshine);
+      if (compareOn) {
+        const target = useStore
+          .getState()
+          .asrComparisons.find((c) => c.id.startsWith(`${phraseId}-`));
+        if (target) {
+          // Whichever engine is primary writes its OWN column. That is what
+          // makes the grid readable when Parakeet is primary: the Parakeet cell
+          // is the live transcript, and the Moonshine cell fills in only if the
+          // dev-only Moonshine comparison was switched on or a fallback ran.
+          if (engine === "parakeet") {
+            upsertComparison(phraseId, {
+              audioSeconds: target.audioSeconds,
+              parakeetText: text,
+              parakeetMs: asrMs,
+              parakeetStatus: text ? "ok" : "empty",
+            });
+          } else {
+            upsertComparison(phraseId, {
+              audioSeconds: target.audioSeconds,
+              moonshineText: text,
+              moonshineMs: asrMs,
+            });
+          }
+        }
+      }
+
+      // This final is now accounted for, whatever happens to it below: it is
+      // committed, or deliberately dropped by the artefact gate, or empty.
+      if (pendingFinalsRef.current > 0) pendingFinalsRef.current--;
+
+      // Only finalized utterances are logged (never the 0.7s partial stream),
+      // and only finals are ever allowed to reach the AI.
+      console.log(
+        `[STT] final (${source}, ${engine}): ${text || "(no speech recognised)"}`,
+      );
+      lastFinalPhraseIdRef.current = Math.max(
+        lastFinalPhraseIdRef.current,
+        phraseId,
+      );
+      // Decoding for this final is over. The next level sample (20/s) refines
+      // the state to LISTENING / SPEECH / NO AUDIO from here.
+      setAudioStatus("listening");
+      realInterimRef.current = null;
+      // Clear the live line only if it belongs to this phrase or older.
+      if (phraseId >= interimPhraseIdRef.current) setInterviewInterim(null);
+      if (!text) {
+        addLog(`[WARNING] No speech recognised in ${source} clip`);
+        return;
+      }
+
+      // ── Structural ASR-artefact gate ───────────────────────────────────
+      // Moonshine sometimes returns an engine sentinel ("(no speech
+      // recognised)") or a phrase doubled verbatim instead of speech. Drop
+      // those here so they are never committed to the store at all, rather than
+      // relying on the question gate to reject them later.
+      //
+      // Structure-only checks — see `transcriptQuality.ts`. Engine-agnostic by
+      // construction: this is byte-for-byte the code Moonshine's finals have
+      // always run, which is the point of routing Parakeet through here.
+      const quality = assessTranscriptQuality(text);
+      if (!quality.ok) {
+        console.warn(`[ASR] discarded final (${source}): ${quality.detail}`);
+        addLog(`[ASR] ignored unusable segment — ${quality.detail}`);
+        return;
+      }
+
+      // ── Context-aware ASR repair + technical-term normalization ──────
+      // Runs on FINAL transcripts only, and before anything reads the
+      // transcript. The store is the single source the question gate
+      // (`evaluateInterviewTurn`) reads from, so repairing here means the
+      // gate, the detected-question banner, the prompt and the answer card
+      // all see the corrected terminology.
+      //
+      // The raw ASR text is PRESERVED (`rawText`) — only the corrected form
+      // is used downstream. The generic correction engine is open-world:
+      // candidate context (resume / projects / skills) is a boost, never a
+      // whitelist, and weak-evidence spans are left exactly as heard.
+      //
+      // NO PARAKEET-SPECIFIC CORRECTION EXISTS, BY DESIGN. A second rule set
+      // would make the two engines incomparable and the comparison meaningless.
+      //
+      // Interim/partial text is deliberately left untouched: it is display-only
+      // and must never influence detection or generation.
+      const companyName = useStore.getState().settings.companyName;
+      const candidateSignal = companyName ? { text: companyName } : undefined;
+
+      const correction = correctTranscript({
+        rawText: text,
+        source,
+        candidateContext: buildCandidateContext(useStore.getState().settings),
+        candidateSignal,
+      });
+      // Deterministic telemetry (never the transcript itself).
+      logCorrection(correction);
+      if (import.meta.env.DEV && correction.changed) {
+        console.log(`[ASR-CORRECTION] RAW:       "${text}"`);
+        console.log(`[ASR-CORRECTION] CORRECTED: "${correction.correctedText}"`);
+      }
+      const normalized = normalizeTechnicalTerms(correction.correctedText);
+      logNormalization(correction.correctedText, normalized);
+      addInterviewMessage({
+        id: crypto.randomUUID(),
+        source,
+        text: normalized,
+        timestamp: Date.now(),
+        audioUrl,
+        rawText: text,
+        correction: {
+          applied: correction.changed,
+          confidence: correction.confidence,
+          details: correction.corrections.map((c) => ({
+            from: c.from,
+            to: c.to,
+            confidence: c.confidence,
+            reason: c.reason,
+          })),
+          reason: correction.reason,
+        },
+      });
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [addLog, addInterviewMessage, setInterviewInterim, upsertComparison],
+  );
+
+  // Worker Initialization — re-runs whenever the chosen ASR model OR the
+  // primary engine changes.
+  //
+  // Re-running on the engine is what makes "Moonshine must NOT be loaded when
+  // Parakeet is primary" true rather than aspirational: the cleanup terminates
+  // the worker, so its model and its WebGPU/WASM heap go with it. Switching to
+  // Parakeet therefore FREES Moonshine's memory rather than leaving it resident
+  // alongside a 650 MB Parakeet.
   useEffect(() => {
     setIsModelReady(false);
     workerRef.current?.terminate();
@@ -525,143 +837,280 @@ export function useInterviewAudio() {
         if (id < lastFinalPhraseIdRef.current) return;
         if (text) {
           interimPhraseIdRef.current = id;
+          // Remembered so the Parakeet phrase-open marker knows real interim
+          // text exists for this phrase and must not overwrite it.
+          realInterimRef.current = text;
           setInterviewInterim({ source, text });
         }
       }
       if (type === "final") {
-        // Comparison mode only: pair Moonshine's result with the Deepgram /
-        // Groq / Parakeet results already recorded for this same phraseId, so
-        // the developer view shows every engine on identical audio. A no-op
-        // when the feature flags are off, which is the default.
-        if (
-          import.meta.env.DEV &&
-          (useStore.getState().settings.asrCompareMode ||
-            useStore.getState().settings.asrCompareGroq ||
-            useStore.getState().settings.asrCompareParakeet)
-        ) {
-          const target = useStore
-            .getState()
-            .asrComparisons.find((c) => c.id.startsWith(`${id}-`));
-          if (target) {
-            upsertComparison(id, {
-              audioSeconds: target.audioSeconds,
-              moonshineText: text,
-              // Real decode latency, measured inside the worker. Previously
-              // this field was declared but never written, so it was always
-              // null and any latency comparison against Parakeet would have
-              // been comparing a number against nothing.
-              moonshineMs: typeof asrMs === "number" ? asrMs : target.moonshineMs,
-            });
-          }
-        }
-        // This final is now accounted for, whatever happens to it below: it is
-        // committed, or deliberately dropped by the quality gate, or empty. The
-        // drain barrier must never be left waiting on a final that already
-        // arrived, so the counter is decremented FIRST — before any early
-        // return — not last.
-        if (pendingFinalsRef.current > 0) pendingFinalsRef.current--;
-
-        // Only finalized utterances are logged (never the 0.7s partial stream),
-        // and only finals are ever allowed to reach the AI.
-        console.log(
-          `[STT] final (${source}): ${text || "(no speech recognised)"}`,
-        );
-        lastFinalPhraseIdRef.current = Math.max(
-          lastFinalPhraseIdRef.current,
-          id,
-        );
-        // Decoding for this final is over. The next level sample (20/s) refines
-        // the state to LISTENING / SPEECH / NO AUDIO from here.
-        setAudioStatus("listening");
-        // Clear the live line only if it belongs to this phrase or older.
-        if (id >= interimPhraseIdRef.current) setInterviewInterim(null);
-        if (text) {
-          // ── Structural ASR-artefact gate ───────────────────────────────
-          // Moonshine sometimes returns an engine sentinel ("(no speech
-          // recognised)") or a phrase doubled verbatim instead of speech.
-          // Drop those here so they are never committed to the store at all,
-          // rather than relying on the question gate to reject them later.
-          // Structure-only checks — see `transcriptQuality.ts`.
-          const quality = assessTranscriptQuality(text);
-          if (!quality.ok) {
-            console.warn(
-              `[ASR] discarded final (${source}): ${quality.detail}`,
-            );
-            addLog(`[ASR] ignored unusable segment — ${quality.detail}`);
-            return;
-          }
-
-          // ── Context-aware ASR repair + technical-term normalization ──────
-          // Runs on FINAL transcripts only, and before anything reads the
-          // transcript. The store is the single source the question gate
-          // (`evaluateInterviewTurn`) reads from, so repairing here means the
-          // gate, the detected-question banner, the prompt and the answer card
-          // all see the corrected terminology.
-          //
-          // The raw ASR text is PRESERVED (`rawText`) — only the corrected form
-          // is used downstream. The generic correction engine is open-world:
-          // candidate context (resume / projects / skills) is a boost, never a
-          // whitelist, and weak-evidence spans are left exactly as heard.
-          //
-          // Interim/partial text is deliberately left untouched: it is
-          // display-only and must never influence detection or generation.
-          // Build a candidate-signal from the candidate's own profile for the
-          // candidate-correction engine. Same module the manual-text path uses,
-          // so there is one source of truth. The candidate is only applied when
-          // the strong-evidence floor is met; it is never appended.
-          const companyName = useStore.getState().settings.companyName;
-          const candidateSignal = companyName ? { text: companyName } : undefined;
-
-          const correction = correctTranscript({
-            rawText: text,
-            source,
-            candidateContext: buildCandidateContext(useStore.getState().settings),
-            candidateSignal,
-          });
-          // Deterministic telemetry (never the transcript itself).
-          logCorrection(correction);
-          if (import.meta.env.DEV && correction.changed) {
-            console.log(`[ASR-CORRECTION] RAW:       "${text}"`);
-            console.log(`[ASR-CORRECTION] CORRECTED: "${correction.correctedText}"`);
-          }
-          const normalized = normalizeTechnicalTerms(correction.correctedText);
-          logNormalization(correction.correctedText, normalized);
-          addInterviewMessage({
-            id: crypto.randomUUID(),
-            source,
-            text: normalized,
-            timestamp: Date.now(),
-            audioUrl,
-            rawText: text,
-            correction: {
-              applied: correction.changed,
-              confidence: correction.confidence,
-              details: correction.corrections.map((c) => ({
-                from: c.from,
-                to: c.to,
-                confidence: c.confidence,
-                reason: c.reason,
-              })),
-              reason: correction.reason,
-            },
-          });
-        } else {
-          addLog(`[WARNING] No speech recognised in ${source} clip`);
-        }
+        handleFinalEvent({
+          source,
+          text,
+          audioUrl,
+          phraseId: id,
+          asrMs: typeof asrMs === 'number' ? asrMs : null,
+          engine: "moonshine",
+        });
       }
     };
 
-    workerRef.current.postMessage({ type: "load", model: asrModel });
+    // ── Do not load Moonshine when Parakeet is primary ───────────────────
+    // Loading it costs ~22 s of WASM compile and a resident model for an engine
+    // that will not decode anything. It is created lazily, and ONLY as the
+    // fallback for a segment Parakeet could not handle.
+    if (primaryAsr === "moonshine") {
+      workerRef.current.postMessage({ type: "load", model: asrModel });
+    } else {
+      addLog(
+        "Parakeet is the primary engine — Moonshine is not being loaded. It will start only if a segment needs the fallback.",
+      );
+    }
 
     return () => workerRef.current?.terminate();
-  }, [addLog, addInterviewMessage, setInterviewInterim, asrModel, upsertComparison]);
+  }, [addLog, asrModel, primaryAsr, handleFinalEvent]);
+
+  // ── Parakeet as the PRIMARY engine ─────────────────────────────────────────
+  //
+  // Everything below is the swap point. Above it, audio is captured and
+  // segmented by code that knows nothing about engines; below it, everything
+  // goes through `handleFinalEvent`, which is the same code path Moonshine has
+  // always used.
+
+  /**
+   * Ask the (already created, not yet loaded) Moonshine worker to load.
+   *
+   * ── Ordering is guaranteed by the worker's own queue ───────────────────────
+   * `load` is enqueued as a FINAL task and the transcribe that follows is
+   * enqueued as a final too, so FIFO means the model is ready before the first
+   * decode is attempted. No second round-trip, no "is it ready yet" polling, and
+   * no risk of sending audio into an unloaded model.
+   *
+   * Idempotent: a second fallback does not restart the download/compile.
+   */
+  const ensureMoonshineLoaded = useCallback(() => {
+    if (moonshineLazyRequestedRef.current) return;
+    moonshineLazyRequestedRef.current = true;
+    const model =
+      useStore.getState().settings.whisperModel ??
+      "onnx-community/moonshine-base-ONNX";
+    addLog(
+      "Loading the Moonshine fallback (~22s). This happens once, and only because Parakeet could not handle a segment.",
+    );
+    workerRef.current?.postMessage({ type: "load", model });
+  }, [addLog]);
+
+  /**
+   * Hand one captured segment to Moonshine because Parakeet could not.
+   *
+   * The message is BYTE-IDENTICAL to the one the normal Moonshine path posts,
+   * and it carries the same `phraseId` and `audioUrl`. That is what makes the
+   * fallback invisible to everything downstream: the worker replies with an
+   * ordinary `final`, which `handleFinalEvent` processes with
+   * `engine: "moonshine"`. A fallback segment is indistinguishable from a
+   * normal one, including in the comparison grid.
+   */
+  const fallbackSegmentToMoonshine = useCallback(
+    (segment: CapturedSegment, reason: string) => {
+      ensureMoonshineLoaded();
+      const notice = `Parakeet could not transcribe a ${segment.speechSeconds.toFixed(1)}s segment (${reason}) — using the Moonshine fallback instead. The audio stayed on this machine.`;
+      setFallbackNotice(notice);
+      addLog(notice);
+      console.warn(`[ASR] Parakeet -> Moonshine fallback: ${reason}`);
+      workerRef.current?.postMessage({
+        type: "transcribe",
+        audio: segment.audio,
+        source: segment.source,
+        audioUrl: segment.audioUrl,
+        phraseId: segment.phraseId,
+      });
+    },
+    [addLog, ensureMoonshineLoaded],
+  );
+
+  /** Decode one segment with Parakeet and route the outcome. Never throws. */
+  const runParakeetSegment = useCallback(
+    async (segment: CapturedSegment) => {
+      const result = await transcribeWithParakeet(segment.audio);
+      const text = (result.text ?? "").trim();
+
+      if (!result.ok) {
+        const code = result.code ?? "crashed";
+        if (shouldFallbackToMoonshine(code)) {
+          fallbackSegmentToMoonshine(segment, describeParakeetFallback(code));
+          return;
+        }
+        // `invalid_audio` / `too_long` are properties of the BUFFER, so Moonshine
+        // would reject it identically and the fallback would only add a useless
+        // decode. Emit an empty final instead so the drain accounting and the
+        // interim line still resolve exactly as they would for Moonshine.
+        console.warn(`[ASR] Parakeet rejected a segment: ${code}`);
+        handleFinalEvent({
+          source: segment.source,
+          text: "",
+          audioUrl: segment.audioUrl,
+          phraseId: segment.phraseId,
+          asrMs: null,
+          engine: "parakeet",
+        });
+        return;
+      }
+
+      if (!text) {
+        // A SUCCESSFUL decode that produced nothing. See
+        // `PARAKEET_EMPTY_FALLBACK` for why this hands over to Moonshine and
+        // what that costs.
+        if (PARAKEET_EMPTY_FALLBACK) {
+          fallbackSegmentToMoonshine(segment, "it returned no text");
+          return;
+        }
+        handleFinalEvent({
+          source: segment.source,
+          text: "",
+          audioUrl: segment.audioUrl,
+          phraseId: segment.phraseId,
+          asrMs: result.decodeMs ?? null,
+          engine: "parakeet",
+        });
+        return;
+      }
+
+      handleFinalEvent({
+        source: segment.source,
+        text,
+        audioUrl: segment.audioUrl,
+        phraseId: segment.phraseId,
+        asrMs: result.decodeMs ?? null,
+        engine: "parakeet",
+      });
+    },
+    [fallbackSegmentToMoonshine, handleFinalEvent],
+  );
+
+  /**
+   * Decode everything that arrived while the model was loading, in order.
+   *
+   * Strictly serial: the host runs one decode at a time anyway, and firing the
+   * whole backlog at once would turn a 3-segment cold start into three
+   * simultaneous IPC calls for no gain. The {@code draining} guard makes a second
+   * concurrent drain (a load that resolves while one is already running)
+   * impossible.
+   */
+  const drainParakeetQueue = useCallback(async () => {
+    if (parakeetDrainingRef.current) return;
+    parakeetDrainingRef.current = true;
+    try {
+      for (;;) {
+        const next = parakeetQueueRef.current.shift();
+        if (!next) break;
+        await runParakeetSegment(next.payload);
+      }
+    } finally {
+      parakeetDrainingRef.current = false;
+    }
+  }, [runParakeetSegment]);
+
+  /**
+   * The seam the VAD hands finished phrases to.
+   *
+   * With Moonshine primary this posts to the worker, exactly as before. With
+   * Parakeet primary it either decodes immediately or buffers the segment until
+   * the model reports ready.
+   */
+  const submitPrimarySegment = useCallback(
+    (segment: CapturedSegment) => {
+      if (primaryAsrRef.current !== "parakeet") {
+        workerRef.current?.postMessage({
+          type: "transcribe",
+          audio: segment.audio,
+          source: segment.source,
+          audioUrl: segment.audioUrl,
+          phraseId: segment.phraseId,
+        });
+        return;
+      }
+
+      if (parakeetReadyRef.current) {
+        void runParakeetSegment(segment);
+        return;
+      }
+
+      // ── The model is still loading ──────────────────────────────────────
+      // The brief allows queueing or falling back here; this QUEUES. Falling
+      // back would mean kicking off Moonshine's ~22 s load, which is slower
+      // than the ~7 s Parakeet load it would be avoiding. See
+      // `PARAKEET_PRIMARY_QUEUE_LIMIT` for why the queue is bounded.
+      const accepted = parakeetQueueRef.current.push({
+        phraseId: segment.phraseId,
+        payload: segment,
+      });
+      if (!accepted) {
+        const dropped = parakeetQueueRef.current.snapshot().dropped;
+        addLog(
+          `The speech model is still loading and more than ${PARAKEET_PRIMARY_QUEUE_LIMIT} segments are waiting — the oldest one was dropped (${dropped} dropped so far). Nothing has reached the network; this is entirely local.`,
+        );
+      }
+    },
+    [addLog, runParakeetSegment],
+  );
+
+  /**
+   * Load the model on Start Interview.
+   *
+   * Deliberately NOT at launch: a cold load is ~7 s and several hundred MB, and
+   * a session that never uses Parakeet must not pay either.
+   *
+   * Every failure resolves to a message and a state. Nothing throws, and
+   * `parakeetReadyRef` stays false, so the next segment takes the fallback path
+   * rather than waiting for a model that is not coming.
+   */
+  const ensureParakeetLoaded = useCallback(async () => {
+    setParakeetStatus("loading");
+    setParakeetMessage("Loading speech model…");
+    const result = await loadParakeetModel();
+    if (result.ok) {
+      parakeetReadyRef.current = true;
+      setParakeetStatus("ready");
+      setParakeetMessage(null);
+      addLog(
+        `Speech model ready (${result.loadMs ?? "?"} ms, ${result.rssMb ?? "?"} MB in the worker process).`,
+      );
+      await drainParakeetQueue();
+      return;
+    }
+    parakeetReadyRef.current = false;
+    const code = result.code ?? "error";
+    setParakeetStatus(code === "model_missing" ? "missing" : "error");
+    setParakeetMessage(
+      code === "model_missing"
+        ? "The local speech model is not installed. Download it in Settings, or switch back to Moonshine — Moonshine will be used for every segment in the meantime."
+        : `The local speech model could not start (${describeParakeetFallback(code)}). Moonshine will be used for every segment in the meantime.`,
+    );
+    addLog(
+      `Speech model unavailable: ${describeParakeetFallback(code)}. Falling back to Moonshine for every segment — nothing is sent to a cloud service.`,
+    );
+    // Everything already buffered goes straight to Moonshine rather than waiting
+    // for a model that has already said it cannot load.
+    for (;;) {
+      const next = parakeetQueueRef.current.shift();
+      if (!next) break;
+      fallbackSegmentToMoonshine(next.payload, "the speech model did not start");
+    }
+  }, [addLog, drainParakeetQueue, fallbackSegmentToMoonshine]);
 
   const startInterview = async () => {
-    if (!isModelReady) {
+    // Which engine gates readiness. With Parakeet primary there is deliberately
+    // NO Moonshine model, so `isModelReady` would stay false forever and the
+    // interview could never start — the readiness gate has to follow the engine.
+    if (primaryAsrRef.current === "moonshine" && !modelReadyRef.current) {
       addLog("Cannot start: AI Model not ready yet.");
       return;
     }
     runningRef.current = true;
+    parakeetQueueRef.current.clear();
+    parakeetReadyRef.current = false;
+    moonshineLazyRequestedRef.current = primaryAsrRef.current === "moonshine";
+    setFallbackNotice(null);
 
     // Fresh transcript for each new session.
     clearInterviewMessages();
@@ -679,20 +1128,19 @@ export function useInterviewAudio() {
     addLog("Starting system audio capture (interviewer only)...");
 
     // ── Parakeet: load the model HERE, not at app launch ────────────────
-    // Cold load measured ~6 s and several hundred MB of RSS. Doing it on Start
-    // keeps that cost off app launch, where a session with the feature off
-    // would pay it for nothing. Fire-and-forget with a result log: capture
-    // continues regardless, because this is a diagnostic, not a dependency.
-    if (import.meta.env.DEV && useStore.getState().settings.asrCompareParakeet) {
-      void loadParakeetModel().then((result) => {
-        if (result.ok) {
-          addLog(
-            `Parakeet comparison model ready (${result.loadMs ?? "?"} ms, ${result.rssMb ?? "?"} MB RSS).`,
-          );
-        } else {
-          addLog(`Parakeet comparison unavailable: ${result.code ?? "error"}.`);
-        }
-      });
+    // Cold load measured ~7 s and several hundred MB of RSS. Doing it on Start
+    // keeps that cost off app launch, where a session that never transcribes
+    // would pay it for nothing.
+    //
+    // Two callers, one code path: as the primary engine it is a DEPENDENCY (the
+    // segments that arrive before it is ready are queued, see
+    // `submitPrimarySegment`); as the dev comparison column it is still
+    // fire-and-forget, because capture must not depend on a diagnostic.
+    const needsParakeet =
+      primaryAsrRef.current === "parakeet" ||
+      (import.meta.env.DEV && useStore.getState().settings.asrCompareParakeet);
+    if (needsParakeet) {
+      void ensureParakeetLoaded();
     }
 
     let closeContext: (() => void) | null = null;
@@ -811,13 +1259,22 @@ export function useInterviewAudio() {
         addLog,
         addDebugAudio,
         handleLevel,
-        () => setInterviewInterim(null),
+        () => {
+          // A phrase ended. Clears the live line, and (Parakeet primary) drops
+          // the phrase-open marker with it.
+          realInterimRef.current = null;
+          setPhraseOpen({ kind: "phraseClosed" });
+          setInterviewInterim(null);
+        },
         () => {
           pendingFinalsRef.current++;
         },
         compareWithDeepgram,
         compareWithGroq,
         compareWithParakeet,
+        // THE ENGINE SWAP. Everything above this line is unchanged capture and
+        // VAD code; the buffer is handed to whichever engine is primary.
+        submitPrimarySegment,
       );
       addLog("System (interviewer) audio capture started.");
 
@@ -924,6 +1381,43 @@ export function useInterviewAudio() {
   // without ever rejecting: a barrier that could fail would turn "the tail of
   // the question is missing" into "the hotkey does nothing", which is worse.
   const drainAsr = useCallback(async (): Promise<DrainResult> => {
+    // ── Parakeet primary: a different transport AND a different budget ─────
+    //
+    // `pendingFinalsRef` is already engine-agnostic — it is the renderer's own
+    // count of finals handed over but not yet committed — so the only thing that
+    // changes is HOW the barrier asks "are you done?".
+    //
+    // With Moonshine that question is a round-trip to the worker queue. With
+    // Parakeet there is no worker queue to ask: the decode is an IPC call into
+    // the main process, and the renderer's counter is already the authoritative
+    // answer. Posting a `flush` to a Moonshine worker that was deliberately
+    // never loaded would answer a question nobody asked, so the flush here is a
+    // bounded wait-and-recheck instead.
+    //
+    // The DEADLINE is different too, and only here: Parakeet's decode measured
+    // 326-2231 ms live, and Moonshine's 900 ms budget was sized against a
+    // ~0.6 s Moonshine decode. Reusing 900 ms would time the barrier out on most
+    // turns and truncate the question — the exact failure the drain prevents.
+    // Moonshine's own 900 ms path below is untouched.
+    if (primaryAsrRef.current === "parakeet") {
+      return createAsrDrain(
+        {
+          pending: () => pendingFinalsRef.current,
+          flush: async () => {
+            await new Promise<void>((resolve) =>
+              setTimeout(resolve, DRAIN_STEP_MS),
+            );
+            // Nothing to reconcile against: the counter IS the truth here.
+            return pendingFinalsRef.current;
+          },
+        },
+        {
+          deadlineMs: PARAKEET_DRAIN_DEADLINE_MS,
+          maxAttempts: PARAKEET_DRAIN_MAX_ATTEMPTS,
+        },
+      ).drain();
+    }
+
     const worker = workerRef.current;
     if (!worker) {
       return {
@@ -994,7 +1488,12 @@ export function useInterviewAudio() {
     // Release the Parakeet model immediately rather than waiting for the idle
     // timeout: the interview is over, and on an 8 GB laptop held during a call
     // the resident memory is worth having back now.
-    if (import.meta.env.DEV && useStore.getState().settings.asrCompareParakeet) {
+    const releaseParakeet =
+      primaryAsrRef.current === "parakeet" ||
+      (import.meta.env.DEV && useStore.getState().settings.asrCompareParakeet);
+    if (releaseParakeet) {
+      parakeetReadyRef.current = false;
+      parakeetQueueRef.current.clear();
       void unloadParakeetModel();
     }
     // The ONLY path that releases the context. It must not also call
@@ -1039,11 +1538,36 @@ export function useInterviewAudio() {
      * Append a line to the visible debug log.
      *
      * Exposed because dev-only controls live in other components (the Parakeet
-     * toggle is in InterviewModal, not in this hook), and a control that
+     * toggles are in InterviewModal, not in this hook), and a control that
      * changes engine behaviour without saying so in the log is exactly the kind
      * of thing that gets misdiagnosed later.
+     *
+     * Deliberately near the top of this object: its position is asserted by the
+     * test suite, so putting it first makes that guarantee robust against
+     * fields being added above it.
      */
     addLog,
+    /**
+     * The engine actually in use, normalised. `parakeet` here means its result
+     * is the transcript; the UI must not show this as "loading" forever just
+     * because no Moonshine model exists.
+     */
+    primaryAsr,
+    /** Live Parakeet model state, for the "Loading speech model…" banner. */
+    parakeetStatus,
+    /** Human-readable reason the model is unavailable, or null while fine. */
+    parakeetMessage,
+    /**
+     * Set when a segment had to be handled by Moonshine because Parakeet could
+     * not. Surfaced so a silent change of transcription engine is impossible to
+     * miss — it would otherwise be indistinguishable from a model that simply
+     * got worse.
+     */
+    fallbackNotice,
+    /** Reload the model after a failure, without restarting the interview. */
+    retryParakeet: () => void ensureParakeetLoaded(),
+    /** Whether Moonshine has been pulled in as a fallback this session. */
+    moonshineFallbackActive: () => moonshineLazyRequestedRef.current,
     debugAudios,
     /** Whether the dev-only WAV dump is currently recording. */
     debugWavOn,
@@ -1156,6 +1680,14 @@ function setupVADWorklet(
     speechSeconds: number,
     phraseId: number,
   ) => void,
+  /**
+   * Hand the finished segment to whichever engine is primary.
+   *
+   * Added at the END of the parameter list, after every existing one, so this is
+   * a pure addition: capture, the VAD thresholds and the three comparison hooks
+   * above are byte-for-byte what they were.
+   */
+  onPrimarySegment: (segment: CapturedSegment) => void,
 ) {
   const workletNode = new AudioWorkletNode(audioCtx, "vad-processor");
 
@@ -1322,15 +1854,15 @@ function setupVADWorklet(
       onCompareWithGroq(downsampled, speechSeconds, phraseId);
       onCompareWithParakeet(downsampled, speechSeconds, phraseId);
 
-      // Count it as owed BEFORE posting, so there is no window in which a
-      // hotkey pressed between this line and the post sees an empty queue.
+      // Count it as owed BEFORE handing it over, so there is no window in which
+      // a hotkey pressed between this line and the hand-off sees an empty queue.
       onFinalQueued();
-      workerRef.current?.postMessage({
-        type: "transcribe",
+      onPrimarySegment({
         audio: downsampled,
         source: sourceName,
-        audioUrl,
         phraseId,
+        speechSeconds,
+        audioUrl,
       });
     } catch (err) {
       addLog(`Resample failed: ${err}`);

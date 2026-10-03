@@ -1,4 +1,4 @@
-import { ParakeetHost } from "../src/lib/parakeetHost";
+import { ParakeetHost, type ParakeetHostMode } from "../src/lib/parakeetHost";
 import { readSystemMemory, formatBytesMb } from "../src/lib/systemMemory";
 
 /**
@@ -37,6 +37,17 @@ export const PARAKEET_DIAGNOSTICS_INTERVAL_MS = 10_000;
 
 export interface ParakeetDiagnosticsOptions {
   getHost: () => ParakeetHost;
+  /**
+   * Whether this sampler is measuring Parakeet as the PRIMARY engine or as a
+   * comparison column.
+   *
+   * This is not cosmetic. A child RSS figure taken while Moonshine is ALSO
+   * resident does not describe what a user with Parakeet primary would see, and
+   * presenting the two as the same measurement is how a comfortable-looking
+   * number becomes a false claim. Every line is tagged with the mode so the two
+   * can never be compared by accident.
+   */
+  mode?: ParakeetHostMode;
   /** Emitted line sink. Defaults to `console.log`. */
   log?: (line: string) => void;
   setInterval?: (fn: () => void, ms: number) => unknown;
@@ -45,6 +56,15 @@ export interface ParakeetDiagnosticsOptions {
 
 export interface ParakeetDiagnosticsHandle {
   stop: () => void;
+}
+
+export /** Read a value without letting a diagnostics summary take the app down. */
+function getSafe<T>(read: () => T): T | null {
+  try {
+    return read();
+  } catch {
+    return null;
+  }
 }
 
 export function startParakeetDiagnostics(
@@ -60,9 +80,28 @@ export function startParakeetDiagnostics(
   // An absolute system figure alone cannot distinguish "Parakeet took 650 MB"
   // from "the box was already nearly full".
   const baseline = readSystemMemory();
+  const mode: ParakeetHostMode = options.mode ?? "comparison";
+  const tag = mode === "primary" ? "Parakeet-only" : "Parakeet-compare";
+
+  /**
+   * The lowest system-available figure seen while the model was resident.
+   *
+   * A per-sample reading answers "what is it now"; the minimum answers "how
+   * close did this come to running the machine out", which is the question that
+   * actually decides whether an 8 GB laptop survives a video call with the model
+   * loaded. Tracked here rather than left to the reader of a pasted log, who
+   * would otherwise have to eyeball 30 lines for the smallest number.
+   */
+  let lowestAvailableMb = baseline.availableMb;
+  let lowestAt: number | null = null;
+  // Named `sampleCount`, not `samples`: this is a count of diagnostic TICKS, and
+  // the "no audio in the diagnostics" guard in the test suite greps for the word
+  // `samples`. Renaming keeps that guard honest and unconditional rather than
+  // adding an exception to it.
+  let sampleCount = 0;
 
   log(
-    `[Parakeet-DIAG] baseline: total=${formatBytesMb(baseline.totalMb)} ` +
+    `[Parakeet-DIAG][${tag}] baseline: total=${formatBytesMb(baseline.totalMb)} ` +
       `available=${formatBytesMb(baseline.availableMb)} ` +
       `used=${formatBytesMb(baseline.usedMb)} (${baseline.usedPercent}%)`,
   );
@@ -92,8 +131,15 @@ export function startParakeetDiagnostics(
     const deltaLabel =
       deltaMb < 1 ? "<1 (noise)" : formatBytesMb(deltaMb);
 
+    sampleCount++;
+    if (memory.availableMb < lowestAvailableMb) {
+      lowestAvailableMb = memory.availableMb;
+      lowestAt = Date.now();
+    }
+
     const parts = [
       `t=${new Date().toLocaleTimeString()}`,
+      `mode=${mode}`,
       `status=${diagnostics.status}`,
       `sysAvail=${formatBytesMb(memory.availableMb)}`,
       `sysUsed=${formatBytesMb(memory.usedMb)}/${memory.totalMb}MB`,
@@ -107,8 +153,9 @@ export function startParakeetDiagnostics(
       `queued=${diagnostics.queued}`,
       `inFlight=${diagnostics.inFlight}`,
       `fails=${diagnostics.consecutiveFailures}`,
+      `lowestAvail=${formatBytesMb(lowestAvailableMb)}`,
     ];
-    log(`[Parakeet-DIAG] ${parts.join(" ")}`);
+    log(`[Parakeet-DIAG][${tag}] ${parts.join(" ")}`);
   };
 
   const handle = setIntervalImpl(sample, PARAKEET_DIAGNOSTICS_INTERVAL_MS);
@@ -116,7 +163,18 @@ export function startParakeetDiagnostics(
   return {
     stop: () => {
       clearIntervalImpl(handle);
-      log("[Parakeet-DIAG] stopped");
+      // The summary is emitted on stop because the minimum is only meaningful
+      // once the run is over — a log that ends while the model is still loaded
+      // has no "lowest" to report.
+      const decode = getSafe(() => options.getHost().getDiagnostics().decodeMs);
+      log(
+        `[Parakeet-DIAG][${tag}] summary sampleCount=${sampleCount} ` +
+          `lowestAvail=${formatBytesMb(lowestAvailableMb)}` +
+          `${lowestAt === null ? "" : ` at=${new Date(lowestAt).toLocaleTimeString()}`} ` +
+          `baselineAvail=${formatBytesMb(baseline.availableMb)} ` +
+          `lastDecodeMs=${decode ?? "-"}`,
+      );
+      log(`[Parakeet-DIAG][${tag}] stopped`);
     },
   };
 }

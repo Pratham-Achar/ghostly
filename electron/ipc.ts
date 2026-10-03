@@ -2,7 +2,7 @@ import { ipcMain, desktopCapturer, session, app } from "electron";
 import { captureFullScreen } from "./capture";
 import { registerDeepgramHandlers } from "./deepgram";
 import { registerGroqAsrHandlers } from "./groqAsr";
-import { registerParakeetHandlers } from "./parakeetAsr";
+import { registerParakeetHandlers, resolveModelDir } from "./parakeetAsr";
 import { registerAsrExportHandlers } from "./asrExport";
 import { registerDebugClipHandlers } from "./debugClipWriter";
 import Store from "electron-store";
@@ -150,18 +150,47 @@ export function registerIpcHandlers(): void {
     resolveDir: () => app.getPath("userData"),
   });
 
-  // Parakeet (DEVELOPMENT COMPARISON ENGINE ONLY). Off unless the dev setting is
-  // on, and hard-disabled in a packaged build — so a shipped app never even
-  // resolves the model directory, let alone loads several hundred MB of it.
+  // ── Parakeet ─────────────────────────────────────────────────────────────
   //
-  // The flag is read from the same persisted `settings` blob the renderer
-  // writes, rather than duplicated here, so there is exactly one switch.
+  // Two INDEPENDENT ways in, read from the same persisted `settings` blob the
+  // renderer writes — not from zustand, which lives in the renderer and never
+  // crosses the process boundary. That was the original bug: the toggle updated
+  // a renderer-side store and the main process, which is what actually decides,
+  // never saw it.
+  //
+  //   1. `primaryAsr === "parakeet"` — the user chose Parakeet in Settings.
+  //      Allowed in a packaged build, because the model is downloaded into
+  //      userData at the user's own request rather than shipped in the installer.
+  //
+  //   2. `asrCompareParakeet === true` — the dev-only comparison column. Still
+  //      hard-disabled when packaged, so a shipped app never resolves a model
+  //      directory it has no business touching.
+  //
+  // Note (1) is deliberately allowed in production. It is NOT an implicit
+  // default: it only takes effect after an explicit user selection, and the code
+  // default written into the store is `"moonshine"`.
   registerParakeetHandlers({
-    isEnabled: () =>
-      !app.isPackaged &&
-      process.env.NODE_ENV !== "production" &&
-      (store.get("settings") as { asrCompareParakeet?: boolean } | undefined)
-        ?.asrCompareParakeet === true,
-    modelDir: store.get("parakeetModelDir") as string | undefined,
+    isEnabled: () => {
+      const settings = store.get("settings") as
+        | { asrCompareParakeet?: boolean; primaryAsr?: string }
+        | undefined;
+      if (!settings) return false;
+      if (settings.primaryAsr === "parakeet") return true;
+      return (
+        !app.isPackaged &&
+        process.env.NODE_ENV !== "production" &&
+        settings.asrCompareParakeet === true
+      );
+    },
+    isPrimary: () =>
+      (store.get("settings") as { primaryAsr?: string } | undefined)
+        ?.primaryAsr === "parakeet",
+    modelDir: resolveModelDir({
+      override: store.get("parakeetModelDir") as string | undefined,
+      userDataDir: app.getPath("userData"),
+    }),
+    paddingMs: () =>
+      (store.get("settings") as { parakeetPaddingMs?: number } | undefined)
+        ?.parakeetPaddingMs,
   });
 }

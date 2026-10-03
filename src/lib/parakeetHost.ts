@@ -191,6 +191,24 @@ export interface ParakeetHostDeps {
   modelDir: string;
   /** Feature flag. When false the host refuses every request. */
   isEnabled: () => boolean;
+  /**
+   * Silence padding applied to each segment, in ms, read fresh per request.
+   *
+   * ── Resolved in MAIN, not sent by the renderer ────────────────────────────
+   * The renderer is an untrusted web context; letting it choose its own padding
+   * would let it post a 10-minute buffer to a model that bills CPU time. It is a
+   * resolver so the padded-vs-unpadded dev toggle can flip it mid-session
+   * without rebuilding the host.
+   *
+   * Returns `undefined` to mean {@link PARAKEET_PADDING_MS}. `0` is honoured and
+   * means genuinely unpadded — that distinction is the whole point of the A/B.
+   */
+  paddingMs?: () => number | undefined;
+  /**
+   * Whether Parakeet is the PRIMARY engine or a comparison column. Affects
+   * diagnostics labelling only; never the decode itself.
+   */
+  mode?: () => ParakeetHostMode;
   /** Clock injection for deterministic tests. */
   now?: () => number;
   setTimer?: (fn: () => void, ms: number) => unknown;
@@ -198,6 +216,16 @@ export interface ParakeetHostDeps {
   /** Diagnostics sink. Must never receive audio or model contents. */
   log?: (line: string) => void;
 }
+
+/**
+ * How Parakeet is being used this session.
+ *
+ * Carried into the diagnostics line because the memory figure means something
+ * completely different in the two cases: "Parakeet-only" is the number that
+ * matters for shipping, while "comparison" is a developer number measured with
+ * Moonshine ALSO resident and is therefore not comparable.
+ */
+export type ParakeetHostMode = "primary" | "comparison";
 
 export interface ParakeetHostResult {
   ok: boolean;
@@ -223,7 +251,12 @@ export class ParakeetHost {
   private nextId = 1;
   private pending = new Map<number, Pending>();
   /** One decode at a time: a second request waits rather than racing the model. */
-  private queue: Array<{ samples: Float32Array; resolve: (r: ParakeetHostResult) => void }> = [];
+  private queue: Array<{
+    samples: Float32Array;
+    resolve: (r: ParakeetHostResult) => void;
+    /** Resolved at enqueue time so one toggle cannot affect a queued segment. */
+    paddingMs: number;
+  }> = [];
   private busy = false;
   private consecutiveFailures = 0;
   private idleTimer: unknown = null;
@@ -250,6 +283,26 @@ export class ParakeetHost {
     this.setTimer = deps.setTimer ?? ((fn, ms) => setTimeout(fn, ms));
     this.clearTimer = deps.clearTimer ?? ((h) => clearTimeout(h as never));
     this.log = deps.log ?? (() => {});
+  }
+
+  /**
+   * The padding for the next request, clamped to something sane.
+   *
+   * A non-finite or negative value falls back to the provisional default rather
+   * than reaching `applyParakeetPadding`, where it would silently become "no
+   * padding" and quietly invalidate an A/B measurement.
+   */
+  private resolvePaddingMs(): number {
+    const raw = this.deps.paddingMs?.();
+    if (typeof raw !== "number" || !Number.isFinite(raw) || raw < 0) {
+      return PARAKEET_PADDING_MS;
+    }
+    return Math.round(raw);
+  }
+
+  /** Whether Parakeet is the primary engine right now. */
+  getMode(): ParakeetHostMode {
+    return this.deps.mode?.() ?? "comparison";
   }
 
   getStatus(): ParakeetModelStatus {
@@ -374,7 +427,7 @@ export class ParakeetHost {
     }
 
     return new Promise<ParakeetHostResult>((resolve) => {
-      this.queue.push({ samples, resolve });
+      this.queue.push({ samples, resolve, paddingMs: this.resolvePaddingMs() });
       this.pump();
     });
   }
@@ -390,7 +443,11 @@ export class ParakeetHost {
 
     // Padding is applied HERE, on the Parakeet copy only. The caller's buffer
     // is untouched, so Moonshine still receives the original samples.
-    const padded = applyParakeetPadding(next.samples);
+    const padded = applyParakeetPadding(
+      next.samples,
+      PARAKEET_SAMPLE_RATE,
+      next.paddingMs,
+    );
     const requestId = this.nextId++;
     const seconds = padded.length / PARAKEET_SAMPLE_RATE;
 
@@ -401,7 +458,7 @@ export class ParakeetHost {
         type: "transcribe",
         samples: padded,
         sampleRate: PARAKEET_SAMPLE_RATE,
-        paddingMs: PARAKEET_PADDING_MS,
+        paddingMs: next.paddingMs,
       },
       { timeoutMs: PARAKEET_REQUEST_TIMEOUT_MS },
     ).then((r) => {

@@ -212,11 +212,33 @@ section("4. Fixture manifest parsing");
   ok("manifest: file exists", existsSync(manifestPath), manifestPath);
   const manifest = parseManifest(readFileSync(manifestPath, "utf8"));
 
-  check("manifest: 15 questions", manifest.questions.length, 15);
+  // The manifest grows every time real interview clips are imported (see
+  // `scripts/import-debug-audio.mjs`), so pinning the TOTAL was asserting that
+  // nobody had ever recorded a real interview — which is the opposite of what
+  // this corpus is for. Assert the synthetic subset is intact instead, and
+  // separately that any real clips are honestly marked.
+  const synthetic = manifest.questions.filter((q) => q.id.startsWith("q"));
+  const real = manifest.questions.filter((q) => q.id.startsWith("real-"));
+  check("manifest: all 15 synthetic questions are present", synthetic.length, 15);
   check("manifest: 3 short segments", manifest.shortSegments.length, 3);
   check(
-    "manifest: ids are q01..q15",
-    manifest.questions.map((q) => q.id),
+    "manifest: every real clip has a spoken reference",
+    real.every((q) => typeof q.reference === "string" && q.reference.trim() !== ""),
+    true,
+  );
+  check(
+    "manifest: every real clip points at a wav",
+    real.every((q) => typeof q.file === "string" && q.file.endsWith(".wav")),
+    true,
+  );
+  check(
+    "manifest: every real clip carries the phraseId it was captured with",
+    real.every((q) => typeof q.phraseId === "number"),
+    true,
+  );
+  check(
+    "manifest: synthetic ids are q01..q15",
+    synthetic.map((q) => q.id),
     Array.from({ length: 15 }, (_, i) => `q${String(i + 1).padStart(2, "0")}`),
   );
   check(

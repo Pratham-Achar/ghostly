@@ -1,5 +1,6 @@
 import { ipcMain, utilityProcess } from "electron";
 import path from "node:path";
+import fs from "node:fs";
 import {
   ParakeetHost,
   PARAKEET_SAMPLE_RATE,
@@ -9,6 +10,7 @@ import {
   type ParakeetChildLike,
   type ParakeetHostReply,
   type ParakeetHostRequest,
+  type ParakeetHostMode,
   type ParakeetModelStatus,
 } from "../src/lib/parakeetHost";
 import {
@@ -34,11 +36,20 @@ import {
  * and a normalised result, never a handle into the engine.
  */
 
-/** Default model location. Overridable for a relocated model directory. */
+/**
+ * Dev location of the model, relative to the repo root.
+ *
+ * A packaged app never resolves this: {@link resolveModelDir} prefers the
+ * userData copy that the in-app downloader writes, and only falls back here
+ * when running from source.
+ */
+export const PARAKEET_MODEL_DIR_NAME = "sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8";
+
+/** Dev fallback: `models/<name>` next to the repo root. */
 export const DEFAULT_PARAKEET_MODEL_DIR = path.join(
   process.cwd(),
   "models",
-  "sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8",
+  PARAKEET_MODEL_DIR_NAME,
 );
 
 export interface ParakeetIpcOutcome {
@@ -51,6 +62,8 @@ export interface ParakeetIpcOutcome {
   code?: string;
   message?: string;
   status?: ParakeetModelStatus;
+  /** Whether this call was Parakeet-as-primary or Parakeet-as-comparison. */
+  mode?: ParakeetHostMode;
 }
 
 export interface ParakeetTranscribePayload {
@@ -81,23 +94,69 @@ function adaptUtilityProcess(child: Electron.UtilityProcess): ParakeetChildLike 
   };
 }
 
-/** Create the host with real Electron wiring. Exported so tests can inspect it. */
-export function createParakeetHost(options: {
-  modelDir?: string;
+/** Create the host with real Electron wiring. Exported so tests can inspect it. */export function createParakeetHost(options: {
+  modelDir: string;
   isEnabled: () => boolean;
+  isPrimary?: () => boolean;
+  paddingMs?: () => number | undefined;
   log?: (line: string) => void;
-} ): ParakeetHost {
-  const modelDir = options.modelDir ?? DEFAULT_PARAKEET_MODEL_DIR;
-  const workerPath = path.join(__dirname, "parakeetWorker.cjs");
+}): ParakeetHost {
+  const modelDir = options.modelDir;
+  const workerPath = resolveWorkerPath();
 
   const deps: ParakeetHostDeps = {
     modelDir,
     isEnabled: options.isEnabled,
+    mode: () => (options.isPrimary?.() ? "primary" : "comparison"),
+    paddingMs: options.paddingMs,
     log: options.log ?? ((line) => console.log(line)),
     spawnChild: () =>
       adaptUtilityProcess(utilityProcess.fork(workerPath, [], { stdio: "pipe" })),
   };
   return new ParakeetHost(deps);
+}
+
+/**
+ * Locate `parakeetWorker.cjs` in dev and in a packaged app.
+ *
+ * electron-vite copies the worker next to `index.js` in `out/main`, so
+ * `__dirname` is right in development. It is WRONG inside an asar archive in one
+ * specific way that matters here: `utilityProcess.fork` executes the script with
+ * a real Node runtime, which cannot load a JavaScript file from inside the
+ * archive. The unpacked copy lives beside it under `app.asar.unpacked`, so the
+ * packaged path is rewritten to that.
+ *
+ * Both candidates are checked rather than assumed, because guessing wrong here
+ * fails as an unhelpful ENOENT inside the fork, long after the useful error
+ * message has scrolled away.
+ */
+export function resolveWorkerPath(
+  dir: string = __dirname,
+  exists: (p: string) => boolean = (p) => fs.existsSync(p),
+): string {
+  const packaged = path.join(dir, "..", "app.asar.unpacked", "out", "main", "parakeetWorker.cjs");
+  if (exists(packaged)) return packaged;
+  return path.join(dir, "parakeetWorker.cjs");
+}
+
+/**
+ * Where the model actually lives.
+ *
+ * Preference order is deliberate: an explicit override first (developer), then
+ * the userData copy the in-app downloader manages, then the dev `models/`
+ * folder. A packaged app has no `models/` directory and must never be pointed
+ * at one, so the packaged caller is expected to pass its userData path.
+ */
+export function resolveModelDir(options: {
+  override?: string;
+  userDataDir?: string;
+  devDir?: string;
+}): string {
+  if (options.override) return options.override;
+  if (options.userDataDir) {
+    return path.join(options.userDataDir, "models", PARAKEET_MODEL_DIR_NAME);
+  }
+  return options.devDir ?? DEFAULT_PARAKEET_MODEL_DIR;
 }
 
 let host: ParakeetHost | null = null;
@@ -120,33 +179,42 @@ let diagnostics: ParakeetDiagnosticsHandle | null = null;
  */
 export function registerParakeetHandlers(options: {
   isEnabled: () => boolean;
-  modelDir?: string;
+  isPrimary?: () => boolean;
+  modelDir: string;
+  paddingMs?: () => number | undefined;
 }): { getHost: () => ParakeetHost } {
   const getHost = (): ParakeetHost => {
     if (!host) {
       host = createParakeetHost({
         modelDir: options.modelDir,
         isEnabled: options.isEnabled,
+        isPrimary: options.isPrimary,
+        paddingMs: options.paddingMs,
       });
     }
     return host;
   };
+  const mode = (): ParakeetHostMode =>
+    options.isPrimary?.() ? "primary" : "comparison";
 
   // Cheap, safe status probe for the settings UI. Never loads anything.
-  ipcMain.handle("parakeet:status", (): { status: ParakeetModelStatus } => {
-    if (!options.isEnabled()) return { status: "disabled" };
-    try {
-      return { status: getHost().getStatus() };
-    } catch {
-      return { status: "error" };
-    }
-  });
+  ipcMain.handle(
+    "parakeet:status",
+    (): { status: ParakeetModelStatus; mode?: ParakeetHostMode } => {
+      if (!options.isEnabled()) return { status: "disabled" };
+      try {
+        return { status: getHost().getStatus(), mode: mode() };
+      } catch {
+        return { status: "error" };
+      }
+    },
+  );
 
   // Explicit model load, called on Start Interview rather than at launch.
   ipcMain.handle("parakeet:load", async (): Promise<ParakeetIpcOutcome> => {
     try {
       if (!options.isEnabled()) {
-        return { ok: false, code: "disabled", message: "Parakeet comparison is off" };
+        return { ok: false, code: "disabled", message: "Parakeet is not enabled" };
       }
       const result = await getHost().load();
       if (result.ok && !diagnostics) {
@@ -154,9 +222,9 @@ export function registerParakeetHandlers(options: {
         // (available, plus the delta since the model loaded), the child's own
         // RSS, and the latest decode ms / RTF. Numbers only — never a
         // transcript, never audio.
-        diagnostics = startParakeetDiagnostics({ getHost });
+        diagnostics = startParakeetDiagnostics({ getHost, mode: mode() });
       }
-      return { ...result, status: getHost().getStatus() };
+      return { ...result, status: getHost().getStatus(), mode: mode() };
     } catch (err) {
       return {
         ok: false,
@@ -184,14 +252,16 @@ export function registerParakeetHandlers(options: {
     }
   });
 
-  // Transcription. This is the comparison path — the result is a transcript for
-  // the dev diagnostics table, nothing more.
+  // Transcription. The same handler serves both roles: as a comparison column it
+  // feeds the dev diagnostics table, and as the primary engine it feeds the
+  // normal transcript pipeline. What the result is USED for is decided in the
+  // renderer; this side only decodes.
   ipcMain.handle(
     "parakeet:transcribe",
     async (_event, payload: ParakeetTranscribePayload): Promise<ParakeetIpcOutcome> => {
       try {
         if (!options.isEnabled()) {
-          return { ok: false, code: "disabled", message: "Parakeet comparison is off" };
+          return { ok: false, code: "disabled", message: "Parakeet is not enabled" };
         }
         // The host validates the samples (Float32Array, 16 kHz, length cap);
         // this pre-check exists so an obviously wrong payload never even reaches
@@ -240,7 +310,10 @@ export function registerParakeetHandlers(options: {
       if (!options.isEnabled()) {
         return { status: "disabled" as ParakeetModelStatus };
       }
-      return getHost().getDiagnostics();
+      // The mode is recomputed per call, not captured at load: the user can flip
+      // the primary engine in Settings while the model is loaded, and a stale
+      // label on a memory figure is exactly the false claim this avoids.
+      return { ...getHost().getDiagnostics(), mode: mode() };
     } catch {
       return { status: "error" as ParakeetModelStatus };
     }

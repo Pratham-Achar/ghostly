@@ -7,12 +7,20 @@
  * is the whole surface.
  *
  * ── What it is NOT ─────────────────────────────────────────────────────────
- * Parakeet is a DEVELOPMENT COMPARISON ENGINE. It is never the production
- * default and never a fallback for Moonshine. Its transcript goes to the
- * isolated `asrComparisons` slice ONLY: it is never added to
- * `interviewMessages`, never passed to the question gate, never corrected into
- * the transcript, and never included in a prompt. There is deliberately no
- * function here that can do any of those things.
+ * AS A COMPARISON ENGINE, Parakeet is not a fallback for Moonshine: its
+ * transcript goes to the isolated `asrComparisons` slice ONLY. It is never added
+ * to `interviewMessages`, never passed to the question gate, never corrected
+ * into the transcript, and never included in a prompt.
+ *
+ * AS A PRIMARY ENGINE (a separate, explicit setting — see `lib/primaryAsr.ts`),
+ * the transcript it returns is the raw transcript and flows through exactly the
+ * same downstream pipeline Moonshine uses. There is still no second pipeline and
+ * no Parakeet-specific correction: the shape returned here is the shape the
+ * normal `final` event has.
+ *
+ * The one thing this module will never do, in either mode, is send audio
+ * anywhere. There is no code path from here to Groq or Deepgram; the fallback
+ * for a failed segment is Moonshine, locally, or nothing.
  *
  * ── Never throws ───────────────────────────────────────────────────────────
  * Every failure path reports through `onError` (or returns a result object).
@@ -38,11 +46,47 @@ export interface ParakeetTranscript {
   rtf?: number;
   code?: string;
   message?: string;
+  /** Whether the model is the primary engine or a comparison column. */
+  mode?: "primary" | "comparison";
 }
 
 export interface ParakeetComparisonCallbacks {
   onResult: (result: ParakeetTranscript) => void;
   onError: (message: string) => void;
+}
+
+/**
+ * Transcribe one segment and AWAIT the result.
+ *
+ * ── The difference from {@link runParakeetComparison} ────────────────────────
+ * That one is fire-and-forget and exists to fill a diagnostics column, so it may
+ * be slow. This one is on the critical path to the transcript: its result, or
+ * its failure, decides whether the segment is committed and whether Moonshine
+ * has to take over. It still never throws — a failure is a resolved
+ * `{ok: false, code}`, because a rejection here would be an unhandled promise in
+ * an audio callback with no caller to catch it.
+ */
+export async function transcribeWithParakeet(
+  audio: Float32Array,
+): Promise<ParakeetTranscript> {
+  if (!bridge()) {
+    return { ok: false, code: "disabled", message: "Parakeet bridge unavailable." };
+  }
+  if (audio.length === 0) {
+    return { ok: false, code: "invalid_audio", message: "Empty segment." };
+  }
+  try {
+    const response = await window.ghostly.parakeetTranscribe({
+      samples: audio,
+      sampleRate: 16000,
+    });
+    if (!response || typeof response !== "object") {
+      return { ok: false, code: "malformed", message: "Unexpected response." };
+    }
+    return response;
+  } catch {
+    return { ok: false, code: "crashed", message: "Parakeet transcribe failed." };
+  }
 }
 
 function bridge(): Window["ghostly"]["parakeetTranscribe"] | null {
@@ -104,6 +148,10 @@ export async function getParakeetDiagnostics(): Promise<{
   status: string;
   loadMs: number | null;
   rssMb: number | null;
+  decodeMs?: number | null;
+  rtf?: number | null;
+  /** Present so the UI can label the figures; never infer it client-side. */
+  mode?: "primary" | "comparison";
   queued: number;
   inFlight: number;
   consecutiveFailures: number;

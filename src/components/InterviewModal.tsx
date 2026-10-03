@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef } from "react";
 import { useInterviewAudio } from "../hooks/useInterviewAudio";
 import { useStore } from "../store/useStore";
 import { getParakeetStatus, type ParakeetStatus } from "../lib/parakeetClient";
+import { PARAKEET_PADDING_MS } from "../lib/parakeetHost";
 import { serializeAsrComparisonExport } from "../lib/asrComparisonExport";
 import {
   debugClipFileName,
@@ -49,27 +50,41 @@ export const InterviewModal: React.FC<InterviewModalProps> = ({
     downloadProgress,
     startInterview,
     stopInterview,
+    primaryAsr,
+    parakeetStatus,
+    parakeetMessage,
+    fallbackNotice,
+    retryParakeet,
   } = useInterviewAudio();
   const [showLogs, setShowLogs] = useState(false);
   // Developer-only engine comparison, read straight from the store.
   const asrComparisons = useStore((s) => s.asrComparisons);
   const asrCompareParakeet = useStore((s) => s.settings.asrCompareParakeet);
   const updateSettings = useStore((s) => s.updateSettings);
-  // Model status for the dev panel. Polled only while the dev comparison is on:
+  const [parakeetPaddingMs, setParakeetPaddingMs] = useState(
+    () => useStore.getState().settings.parakeetPaddingMs ?? PARAKEET_PADDING_MS,
+  );
+  // Comparison-mode model status. Polled only while the dev comparison is on:
   // the model loads on Start and unloads on Stop, so a slow poll is enough to
   // show "loading" rather than a stale "ready".
-  const [parakeetStatus, setParakeetStatus] = useState<ParakeetStatus>("disabled");
+  //
+  // Named apart from the hook's `parakeetStatus` on purpose: this one describes
+  // the COMPARISON column, that one describes the engine that is actually
+  // transcribing. Merging them would let a healthy comparison column make a
+  // broken primary engine look fine.
+  const [compareModelStatus, setCompareModelStatus] =
+    useState<ParakeetStatus>("disabled");
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     if (!import.meta.env.DEV || !asrCompareParakeet) {
-      setParakeetStatus("disabled");
+      setCompareModelStatus("disabled");
       return;
     }
     let cancelled = false;
     const poll = async () => {
       const status = await getParakeetStatus();
-      if (!cancelled) setParakeetStatus(status);
+      if (!cancelled) setCompareModelStatus(status);
     };
     void poll();
     const timer = window.setInterval(poll, 2000);
@@ -441,7 +456,11 @@ export const InterviewModal: React.FC<InterviewModalProps> = ({
                     // The Parakeet column is only rendered while the dev
                     // comparison is on, so a shipped build never shows a cell
                     // for an engine that was never run.
-                    const showParakeet = !!asrCompareParakeet;
+                    // The Parakeet column shows whenever Parakeet is EITHER the
+                    // primary engine (it is filling this cell with the live
+                    // transcript) or the dev comparison is on.
+                    const showParakeet =
+                      !!asrCompareParakeet || primaryAsr === "parakeet";
                     const t = c.deepgramTelemetry;
                     const g = c.groqTelemetry;
                     const ms = (v: number | null | undefined) =>
@@ -461,10 +480,14 @@ export const InterviewModal: React.FC<InterviewModalProps> = ({
                         <div
                           className={`grid gap-1.5 text-[9px] ${showParakeet ? "grid-cols-4" : "grid-cols-3"}`}
                         >
-                          <div>
-                            <div className="text-white/40 mb-0.5">Moonshine</div>
+                          <div>                            <div className="text-white/40 mb-0.5">
+                              Moonshine
+                              {primaryAsr === "parakeet" && (
+                                <span className="text-white/25"> (fallback only)</span>
+                              )}
+                            </div>
                             <div className="text-white/70">
-                              {c.moonshineText || "(pending)"}
+                              {c.moonshineText || "(not run)"}
                             </div>
                           </div>
                           <div>
@@ -543,6 +566,102 @@ export const InterviewModal: React.FC<InterviewModalProps> = ({
                 </button>
               )}
 
+              {/* ── Primary engine + model state ─────────────────────── */}
+              {/*
+               * Always visible, not dev-gated: which engine is transcribing is
+               * not a developer detail. If it is not on screen, a silent switch
+               * to the fallback would be indistinguishable from the model simply
+               * getting worse.
+               */}
+              <div className="text-[9px] text-white/40 space-y-1">
+                <div>
+                  Engine:{" "}
+                  <span className="text-white/70">
+                    {primaryAsr === "parakeet"
+                      ? "Parakeet (local)"
+                      : "Moonshine (local)"}
+                  </span>
+                </div>
+                {primaryAsr === "parakeet" && (
+                  <div
+                    className={
+                      parakeetStatus === "ready"
+                        ? "text-emerald-300/70"
+                        : parakeetStatus === "loading"
+                          ? "text-amber-200/80"
+                          : "text-amber-300/90"
+                    }
+                  >
+                    {parakeetStatus === "ready"
+                      ? "Speech model ready."
+                      : parakeetStatus === "loading"
+                        ? "Loading speech model…"
+                        : `Speech model: ${parakeetStatus}`}
+                  </div>
+                )}
+                {parakeetMessage && (
+                  <div className="text-amber-200/80">{parakeetMessage}</div>
+                )}
+                {primaryAsr === "parakeet" && parakeetStatus === "error" && (
+                  <button
+                    onClick={retryParakeet}
+                    className="px-2 py-1 rounded bg-white/[0.05] hover:bg-white/[0.1] text-white/60 transition-colors"
+                  >
+                    Retry loading the speech model
+                  </button>
+                )}
+                {fallbackNotice && (
+                  <div className="text-amber-200/80">{fallbackNotice}</div>
+                )}
+              </div>
+
+              {/* ── Padding A/B (dev only) ───────────────────────────── */}
+              {/*
+               * `PARAKEET_PADDING_MS` (300 ms of silence each side) is marked
+               * PROVISIONAL because it was never measured against real interview
+               * audio. This toggle is the measurement instrument: flip it, run the
+               * same conversation, and the comparison grid shows the same clips
+               * decoded both ways, with an empty result visible as such rather
+               * than as a blank cell.
+               *
+               * The value is written through to electron-store for the same
+               * reason the comparison toggle above is: the main process reads the
+               * padding from the STORE, not from zustand.
+               */}
+              {import.meta.env.DEV && (
+                <label className="flex items-start gap-2 text-[9px] text-white/50 cursor-pointer select-none">
+                  <input
+                    type="checkbox"
+                    checked={parakeetPaddingMs === 0}
+                    onChange={(e) => {
+                      const nextMs = e.target.checked ? 0 : PARAKEET_PADDING_MS;
+                      setParakeetPaddingMs(nextMs);
+                      const next = {
+                        ...useStore.getState().settings,
+                        parakeetPaddingMs: nextMs,
+                      };
+                      void window.ghostly.saveSettings(next);
+                      addLog(
+                        nextMs === 0
+                          ? "Parakeet padding OFF — segments are decoded exactly as captured."
+                          : `Parakeet padding ON — ${nextMs} ms of silence is added to each side before decoding.`,
+                      );
+                    }}
+                    className="accent-white/60 mt-0.5"
+                  />
+                  <span>
+                    Parakeet padding A/B (dev only)
+                    <span className="block text-white/30 mt-0.5">
+                      {parakeetPaddingMs === 0
+                        ? "unpadded — 0 ms"
+                        : `padded — ${parakeetPaddingMs ?? PARAKEET_PADDING_MS} ms each side`}
+                      . Applies to the next segment decoded. Compare this run
+                      against a padded one on the same clips.
+                    </span>
+                  </span>
+                </label>
+              )}
+
               {/* ── Parakeet comparison (dev only) ───────────────────── */}
               {/* A DEVELOPMENT COMPARISON ENGINE, off by default. The model is
                   ~631 MB and costs several hundred MB of resident memory, so
@@ -583,7 +702,7 @@ export const InterviewModal: React.FC<InterviewModalProps> = ({
                     Compare with local Parakeet (dev only — Moonshine stays the
                     engine that reaches the AI)
                     <span className="block text-white/30 mt-0.5">
-                      status: {parakeetStatus}
+                      status: {compareModelStatus}
                     </span>
                   </span>
                 </label>

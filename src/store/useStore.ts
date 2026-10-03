@@ -3,12 +3,20 @@ import type { ProviderName } from "../lib/ai";
 import type { InterviewTurn } from "../lib/interviewAgent";
 import type { DeepgramTelemetry } from "../lib/deepgramProtocol";
 import type { GroqAsrTelemetry } from "../lib/groqWhisper";
+import { DEFAULT_PRIMARY_ASR, type PrimaryAsr } from "../lib/primaryAsr";
 
 /**
  * Transcription engines. `moonshine` is local and default; `deepgram` is the
  * optional cloud engine used only for A/B comparison.
  */
 export type AsrEngine = "moonshine" | "deepgram";
+
+/**
+ * Which engine produces the transcript that reaches the question gate and the
+ * AI. See `lib/primaryAsr.ts` for why this is a real setting and why the code
+ * default is Moonshine.
+ */
+export type { PrimaryAsr } from "../lib/primaryAsr";
 
 export interface Solution {
   id: string;
@@ -205,8 +213,38 @@ export interface Settings {
    */
   asrCompareParakeet?: boolean;
   /**
+   * The engine whose transcript becomes `interviewMessages` — the one the
+   * question gate, the prompt and the answer all read.
+   *
+   * `'moonshine'` (the default, and the value a settings blob written before
+   * this phase resolves to) keeps the existing behaviour exactly. `'parakeet'`
+   * routes local Parakeet through the SAME downstream pipeline — raw preserved,
+   * `correctTranscript`, quality gate, question gate, AI — with no second code
+   * path and no engine-specific correction.
+   *
+   * When Parakeet fails for a segment, the fallback is Moonshine and nothing
+   * else. There is deliberately no path from here to Groq or Deepgram: audio
+   * must not leave the machine without the user choosing to send it.
+   */
+  primaryAsr?: PrimaryAsr;
+  /**
+   * Developer-only: when Parakeet is primary, ALSO run Moonshine over the same
+   * buffer and fill the Moonshine column of the comparison grid.
+   *
+   * Off by default, and off in production builds. Moonshine costs a ~22 s model
+   * load, which is the entire reason Parakeet is primary in the first place, so
+   * this is opt-in per session and never happens implicitly.
+   */
+  asrCompareMoonshine?: boolean;
+  /**
+   * Developer-only: override for {@link PARAKEET_PADDING_MS}, in ms. `0` disables
+   * padding entirely, which is what the padded-vs-unpadded A/B on saved real
+   * clips flips. Unset means the provisional 300 ms default.
+   */
+  parakeetPaddingMs?: number;
+  /**
    * Optional model directory override, read by the main process when spawning
-   * the utility process. Unset means the default `models/` location.
+   * the utility process. Unset means the default location for the install.
    */
   parakeetModelDir?: string;
   /**
@@ -362,6 +400,11 @@ export const useStore = create<GhostlyStore>((set, get) => ({
     // Dev-only, and OFF by default: the Parakeet model is ~631 MB and costs
     // several hundred MB of resident memory.
     asrCompareParakeet: false,
+    // Moonshine stays the code default so a settings blob written before
+    // Parakeet existed resolves to a working engine on upgrade. Selecting
+    // Parakeet is a UI action, never a source edit.
+    primaryAsr: DEFAULT_PRIMARY_ASR,
+    asrCompareMoonshine: false,
     groqAsrModel: "whisper-large-v3",
     autoAnswer: false,
   },

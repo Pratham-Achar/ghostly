@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import { useStore } from "../store/useStore";
 import { getProvider, type ProviderName } from "../lib/ai";
 import { INTERVIEW_PROVIDER_ORDER } from "../lib/providerDiagnostics";
@@ -6,6 +6,11 @@ import {
   findShortcutConflicts,
   INTERVIEW_SHORTCUTS,
 } from "../lib/interviewShortcuts";
+import { normalizePrimaryAsr, type PrimaryAsr } from "../lib/primaryAsr";
+import {
+  getParakeetStatus,
+  type ParakeetStatus,
+} from "../lib/parakeetClient";
 
 /**
  * Interview types split into two top-level groups. The existing types are never
@@ -227,6 +232,67 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({ onClose }) => {
   };
 
   const micDropdownRef = useRef<HTMLDivElement>(null);
+
+  // ── Primary ASR engine ──────────────────────────────────────────────────
+  // Read through the store's own normaliser rather than casting, so a
+  // hand-edited settings file with a nonsense value cannot reach a branch that
+  // expects two engines.
+  const primaryAsr = normalizePrimaryAsr(useStore((s) => s.settings.primaryAsr));
+  const [parakeetModelStatus, setParakeetModelStatus] =
+    useState<ParakeetStatus>("disabled");
+  const [parakeetModelMessage, setParakeetModelMessage] = useState<
+    string | null
+  >(null);
+  /** One-line confirmation of the last engine change, shown under the picker. */
+  const [engineNote, setEngineNote] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (primaryAsr !== "parakeet") {
+      setParakeetModelStatus("disabled");
+      setParakeetModelMessage(null);
+      return;
+    }
+    let cancelled = false;
+    void getParakeetStatus().then((status) => {
+      if (!cancelled) setParakeetModelStatus(status);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [primaryAsr]);
+
+  /**
+   * Change the primary engine AND persist it immediately.
+   *
+   * ── Why the explicit write-through, when auto-save already exists ─────────
+   * The 500 ms debounced auto-save effect further down this file is the
+   * mechanism that actually works, and this component is the only reason it does.
+   *
+   * The earlier Parakeet comparison toggle lived in a different component, had
+   * no auto-save, updated zustand, and therefore never reached electron-store —
+   * so the main process, which is the thing that actually decides, never saw it
+   * and the feature could not be switched on at all. Writing through here makes
+   * the ordering irrelevant: even if the debounce is still pending, or the panel
+   * is closed, the main process already knows.
+   */
+  const selectPrimaryAsr = useCallback(
+    (next: PrimaryAsr) => {
+      const settings = useStore.getState().settings;
+      updateSettings({ primaryAsr: next });
+      void window.ghostly.saveSettings({ ...settings, primaryAsr: next });
+      if (next === "parakeet") {
+        setEngineNote(
+          "Parakeet selected. It loads on Start Interview (~7 s, a few hundred MB). Moonshine stays unloaded unless a single segment needs it.",
+        );
+      } else {
+        setParakeetModelMessage(null);
+        setEngineNote(
+          "Moonshine selected. It loads on Start Interview and streams words as the interviewer speaks.",
+        );
+      }
+    },
+    [],
+  );
 
   // Fetch microphones
   useEffect(() => {
@@ -601,12 +667,72 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({ onClose }) => {
           </select>
         </Section>
 
-        {/* Transcription Model */}
+        {/* ── Speech recognition engine (primary) ─────────────────────────── */}
+        {/*
+         * The one switch that decides which engine's transcript reaches the
+         * question gate and the AI. It lives HERE, inside SettingsPanel, rather
+         * than in a debug panel for a specific reason: the auto-save effect at
+         * the bottom of this file mirrors `settings` to electron-store, which is
+         * the ONLY store the main process reads. A control anywhere else updates
+         * zustand and the main process never learns about it — which is exactly
+         * the bug that made the Parakeet comparison toggle appear dead.
+         */}
+        <Section label="Speech Recognition">
+          <div className="inline-flex rounded-lg overflow-hidden border border-white/[0.12]">
+            <button
+              type="button"
+              onClick={() => selectPrimaryAsr("moonshine")}
+              aria-pressed={primaryAsr === "moonshine"}
+              className={primaryAsr === "moonshine" ? VIS_ACTIVE : VIS_INACTIVE}
+            >
+              Moonshine (local)
+            </button>
+            <button
+              type="button"
+              onClick={() => selectPrimaryAsr("parakeet")}
+              aria-pressed={primaryAsr === "parakeet"}
+              className={primaryAsr === "parakeet" ? VIS_ACTIVE : VIS_INACTIVE}
+            >
+              Parakeet (local)
+            </button>
+          </div>
+          <p className="text-[9px] text-white/30 mt-1">
+            {primaryAsr === "parakeet" ? (
+              <>
+                Parakeet runs entirely on this machine and is more accurate than
+                Moonshine on interview speech. It needs a one-time ~631 MB model
+                download and about 700 MB of memory while an interview runs, and
+                it takes ~7 s to start the first time. Moonshine is NOT loaded
+                while Parakeet is healthy — it starts only if a single segment
+                fails, and that fallback stays local too. Audio is never sent to
+                a cloud service by either engine.
+              </>
+            ) : (
+              <>
+                Moonshine runs locally and shows words as the interviewer
+                speaks. It needs no download beyond the model itself and is the
+                default for new installs.
+              </>
+            )}
+          </p>
+          {parakeetModelStatus !== "ready" && primaryAsr === "parakeet" && (
+            <p className="text-[9px] text-amber-200/70 mt-2">
+              {parakeetModelMessage ??
+                `The local Parakeet model is currently ${parakeetModelStatus}. Until it is ready, Moonshine handles every segment — still entirely on this machine.`}
+            </p>
+          )}
+          {engineNote && (
+            <p className="text-[9px] text-white/35 mt-1">{engineNote}</p>
+          )}
+        </Section>
+
+        {/* Transcription Model (Moonshine only) */}
         <Section label="Transcription Model">
           <select
             value={settings.whisperModel ?? "onnx-community/moonshine-base-ONNX"}
             onChange={(e) => updateSettings({ whisperModel: e.target.value })}
             className="settings-select"
+            disabled={primaryAsr === "parakeet"}
           >
             {ASR_MODELS.map((m) => (
               <option key={m.id} value={m.id}>
@@ -615,8 +741,9 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({ onClose }) => {
             ))}
           </select>
           <p className="text-[9px] text-white/30 mt-1">
-            Moonshine runs locally and streams text as the interviewer speaks.
-            Switching reloads the engine (~first run downloads the model).
+            {primaryAsr === "parakeet"
+              ? "Moonshine is not loaded while Parakeet is the primary engine. This still chooses which Moonshine model starts if it ever has to load as the fallback."
+              : "Moonshine runs locally and streams text as the interviewer speaks. Switching reloads the engine (~first run downloads the model)."}
           </p>
         </Section>
 
