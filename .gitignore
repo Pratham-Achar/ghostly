@@ -25,6 +25,11 @@ yarn-error.log*
 debug-audio/
 *.wav
 
+# ASR evaluation models — hundreds of MB, fetched on demand, never bundled.
+# The Parakeet int8 encoder alone is ~620 MB. Downloaded from the official
+# k2-fsa/sherpa-onnx release; see tests/fixtures/asr/README.md.
+models/
+
 # IDE/Editor
 .vscode/
 .idea/
