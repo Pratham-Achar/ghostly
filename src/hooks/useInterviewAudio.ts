@@ -471,6 +471,7 @@ export function useInterviewAudio() {
         phraseId,
         requestId,
         pending,
+        asrMs,
       } = e.data;
       const id: number = phraseId ?? 0;
       if (type === "log") addLog(message);
@@ -532,6 +533,11 @@ export function useInterviewAudio() {
             upsertComparison(id, {
               audioSeconds: target.audioSeconds,
               moonshineText: text,
+              // Real decode latency, measured inside the worker. Previously
+              // this field was declared but never written, so it was always
+              // null and any latency comparison against Parakeet would have
+              // been comparing a number against nothing.
+              moonshineMs: typeof asrMs === "number" ? asrMs : target.moonshineMs,
             });
           }
         }

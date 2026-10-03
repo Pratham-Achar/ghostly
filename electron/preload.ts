@@ -58,6 +58,18 @@ contextBridge.exposeInMainWorld("ghostly", {
     prompt?: string;
   }): Promise<any> => ipcRenderer.invoke("groq:transcribe", payload),
 
+  // ── Dev-only ASR comparison export ─────────────────────────────────
+  // Writes the `asrComparisons` records to a JSON file. The destination is
+  // fixed by the main process and is NOT chosen by the renderer — an export
+  // that accepts an arbitrary path is a file-write primitive. The payload is
+  // engine text and numbers only; there is no audio anywhere in this path.
+  writeAsrComparisonExport: (json: string): Promise<{
+    ok: boolean;
+    path?: string;
+    bytes?: number;
+    message?: string;
+  }> => ipcRenderer.invoke("asr:write-export", { json }),
+
   // ── Parakeet (DEVELOPMENT COMPARISON ENGINE ONLY) ─────────────────────
   //
   // Deliberately narrow: the renderer may ask for the model status, ask for the

@@ -102,6 +102,16 @@ interface Window {
         }
     >;
 
+    // ── Dev-only ASR comparison export ────────────────────────────────
+    // Writes engine text + numbers to a JSON file at a path chosen by the MAIN
+    // process. There is no audio in this path.
+    writeAsrComparisonExport: (json: string) => Promise<{
+      ok: boolean;
+      path?: string;
+      bytes?: number;
+      message?: string;
+    }>;
+
     // ── Parakeet (DEVELOPMENT COMPARISON ENGINE ONLY) ────────────────
     //
     // Mirrors the ASR-engine pattern: the renderer hands over audio it has

@@ -732,10 +732,23 @@ console.log("\n── Isolation: Moonshine unchanged, AI unaffected ────
 
   // The Moonshine worker path must be untouched by this feature.
   const worker = await readFile("src/lib/asr.worker.ts", "utf8");
+  // Strip comments before checking: the worker legitimately MENTIONS Parakeet in
+  // a comment explaining why it now reports its own latency. The property that
+  // matters is that no Parakeet CODE lives in Moonshine's process, so the
+  // check is for imports/calls, not for the word.
+  const workerCode = worker
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/\/\/.*$/gm, "");
   checkTrue("103 the Moonshine worker has no Parakeet code",
-    !/parakeet/i.test(worker));
+    !/parakeet|sherpa|utilityProcess/i.test(workerCode));
+  checkTrue("103b Moonshine's worker never imports the Parakeet host",
+    !/parakeetHost/i.test(worker));
   checkTrue("104 Moonshine still decodes with its own max_new_tokens budget",
-    /max_new_tokens/.test(worker));
+    /max_new_tokens/.test(workerCode));
+  // Moonshine must keep reporting its own real decode latency, so its numbers
+  // can be compared with anything. Without this the field is silently null.
+  checkTrue("104b the worker reports its own decode latency on a final",
+    /type: "final"[\s\S]{0,200}asrMs/.test(workerCode));
 }
 
 {

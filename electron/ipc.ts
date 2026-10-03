@@ -3,6 +3,7 @@ import { captureFullScreen } from "./capture";
 import { registerDeepgramHandlers } from "./deepgram";
 import { registerGroqAsrHandlers } from "./groqAsr";
 import { registerParakeetHandlers } from "./parakeetAsr";
+import { registerAsrExportHandlers } from "./asrExport";
 import Store from "electron-store";
 
 const store = new Store({
@@ -133,6 +134,14 @@ export function registerIpcHandlers(): void {
   // Groq Whisper ASR (comparison only). The long-lived key never crosses the
   // IPC boundary — the main process performs the request. See electron/groqAsr.ts.
   registerGroqAsrHandlers(store);
+
+  // Dev-only: write the `asrComparisons` export to JSON for offline
+  // benchmarking. Moonshine runs in a Web Worker and cannot be driven from the
+  // Node harness, so its results have to come out of a live session — this is
+  // the only path that gets them out. Engine text and numbers, never audio.
+  registerAsrExportHandlers({
+    resolveDir: () => app.getPath("userData"),
+  });
 
   // Parakeet (DEVELOPMENT COMPARISON ENGINE ONLY). Off unless the dev setting is
   // on, and hard-disabled in a packaged build — so a shipped app never even

@@ -351,8 +351,14 @@ function registerStub(stubs, existingIds, id) {
     file: `${id}.wav`,
     // FILL THIS IN with the exact spoken words.
     reference: "",
+    // FILL THIS IN with the phraseId from the exported comparison JSON, so this
+    // clip is joined to the transcript the live session measured for it. Left
+    // empty, the clip can only be matched by duration, which is ambiguous
+    // whenever two segments round to the same length — and a wrong pairing
+    // produces a confident, meaningless WER.
+    phraseId: null,
     technicalTerms: [],
-    notes: "real capture; reference text still needs filling in",
+    notes: "real capture; reference text and phraseId still need filling in",
   });
 }
 

@@ -255,7 +255,16 @@ async function runTranscription(data: any, isPartial: boolean) {
       console.log(
         `[ASR] ignored too-short segment source=${source} samples=${got} required=${MIN_SAMPLES}`,
       );
-      postMessage({ type: "final", source, text: "", audioUrl, phraseId });
+      postMessage({
+        type: "final",
+        source,
+        text: "",
+        audioUrl,
+        phraseId,
+        // No decode happened, so there is no latency to report. Explicit null
+        // rather than 0, which would read as "instant" in the comparison table.
+        asrMs: null,
+      });
     }
     return;
   }
@@ -316,7 +325,21 @@ async function runTranscription(data: any, isPartial: boolean) {
   log(`Transcribed ${source} in ${elapsed}s`);
   // A final is always posted (even when empty) so the hook can clear the
   // interim line for this phrase.
-  postMessage({ type: "final", source, text, audioUrl, phraseId });
+  //
+  // `asrMs` is the DECODE time already measured above, carried out so
+  // `asrComparisons` can hold a real Moonshine latency. Without it the
+  // `moonshineMs` field existed but was permanently null, and any Moonshine
+  // vs Parakeet latency comparison would have been fabricated. This is
+  // reporting only: the decode itself, the token budget, and everything
+  // downstream are untouched.
+  postMessage({
+    type: "final",
+    source,
+    text,
+    audioUrl,
+    phraseId,
+    asrMs: Math.round(elapsedMs),
+  });
 }
 
 self.addEventListener("message", (e) => {

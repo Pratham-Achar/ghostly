@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef } from "react";
 import { useInterviewAudio } from "../hooks/useInterviewAudio";
 import { useStore } from "../store/useStore";
 import { getParakeetStatus, type ParakeetStatus } from "../lib/parakeetClient";
+import { serializeAsrComparisonExport } from "../lib/asrComparisonExport";
 import type { InterviewTurn } from "../lib/interviewAgent";
 
 interface InterviewModalProps {
@@ -504,6 +505,37 @@ export const InterviewModal: React.FC<InterviewModalProps> = ({
                     );
                   })}
                 </div>
+              )}
+
+              {/* ── Export comparison records (dev only) ──────────────── */}
+              {/* Moonshine runs in a Web Worker and cannot be driven from the
+                  Node benchmark, so its accuracy and latency can only come from
+                  a real session. This writes what the session measured:
+                  engine text and numbers, never audio. */}
+              {import.meta.env.DEV && asrComparisons.length > 0 && (
+                <button
+                  onClick={() => {
+                    const json = serializeAsrComparisonExport(
+                      useStore.getState().asrComparisons,
+                    );
+                    void window.ghostly
+                      .writeAsrComparisonExport(json)
+                      .then((result) => {
+                        if (result.ok && result.path) {
+                          addLog(`Exported ${asrComparisons.length} comparison row(s) to ${result.path}`);
+                          console.log(`[ASR-EXPORT] ${result.path} (${result.bytes} bytes)`);
+                        } else {
+                          addLog(`Export failed: ${result.message ?? "unknown error"}`);
+                        }
+                      })
+                      .catch(() =>
+                        addLog("Export failed: could not reach the main process."),
+                      );
+                  }}
+                  className="px-2 py-1 rounded bg-white/[0.05] hover:bg-white/[0.1] text-white/60 text-[9px] transition-colors"
+                >
+                  Export comparison JSON ({asrComparisons.length})
+                </button>
               )}
 
               {/* ── Parakeet comparison (dev only) ───────────────────── */}

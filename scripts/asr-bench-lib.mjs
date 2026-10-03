@@ -141,6 +141,18 @@ export function parseManifest(raw) {
     if (typeof entry.file !== "string" || !entry.file) {
       throw new Error(`manifest entry ${entry.id} is missing a file`);
     }
+    // `phraseId` is OPTIONAL. It links a clip to the row in the exported live
+    // comparison JSON that measured it; without it a clip can only be joined by
+    // duration, which is ambiguous whenever two segments share a rounded
+    // length. Absent is fine — it just means this clip cannot be paired to a
+    // live Moonshine result, and the report says so rather than guessing.
+    if (
+      entry.phraseId !== undefined &&
+      entry.phraseId !== null &&
+      typeof entry.phraseId !== "number"
+    ) {
+      throw new Error(`manifest entry ${entry.id} has a non-numeric phraseId`);
+    }
     if (typeof entry.reference !== "string" || !entry.reference) {
       // An empty reference is almost always a stub from
       // `scripts/import-debug-audio.mjs` waiting to be filled in, so say that
