@@ -20,6 +20,11 @@ npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 
+# Debug audio — recorded interview audio, never committed.
+# See src/lib/debugWav.ts (dev-only, opt-in).
+debug-audio/
+*.wav
+
 # IDE/Editor
 .vscode/
 .idea/

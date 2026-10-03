@@ -1,6 +1,8 @@
 import React, { useState, useRef, useEffect } from "react";
 import { useStore } from "../store/useStore";
 import { INTERVIEW_TYPES } from "./SettingsPanel";
+import { InterviewContext } from "./InterviewContext";
+import { AudioStatusBar } from "./AudioStatusBar";
 import logo from "../assets/logo.png";
 
 interface TopBarProps {
@@ -60,6 +62,13 @@ export const TopBar: React.FC<TopBarProps> = ({
   return (
     <div className="w-full flex justify-center mt-3 pointer-events-none">
       <div className="flex flex-col items-center gap-2 pointer-events-none">
+        {/* Pre-interview context — sits directly above "Start Interview" */}
+        <InterviewContext />
+
+        {/* Live interviewer-audio health: state + level, straight off the
+            system-loopback stream that feeds the ASR. */}
+        <AudioStatusBar />
+
         <div
           className="
             relative z-50
@@ -94,7 +103,7 @@ export const TopBar: React.FC<TopBarProps> = ({
           {/* Separator */}
           <div className="w-px h-4 bg-white/10" />
 
-          {/* New Custom Output Language Select */}
+          {/* Interview Type Select */}
           <div
             className="relative"
             ref={dropdownRef}

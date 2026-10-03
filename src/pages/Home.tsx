@@ -2,7 +2,65 @@ import React, { useEffect, useState, useCallback, useRef } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { useStore } from "../store/useStore";
 import { getProvider } from "../lib/ai";
-import { buildPrompt } from "../lib/prompts";
+import {
+  orchestrateAnswer,
+  type AttemptSpec,
+} from "../lib/ai/orchestrator";
+import {
+  isOpenRouterFreeModel,
+  OPENROUTER_FREE_MODEL,
+} from "../lib/ai/openrouter";
+import { describeProviderChain } from "../lib/providerDiagnostics";
+import { buildPrompt, buildInterviewContext } from "../lib/prompts";
+import {
+  buildInterviewSystemPrompt,
+  buildInterviewUserPrompt,
+  evaluateInterviewTurn,
+  isDuplicateSubmit,
+  isWaitResponse,
+  normalizeTurn,
+  turnSignature,
+  INTERVIEW_SYSTEM_PROMPT,
+  type InterviewTurn,
+  type SubmitRecord,
+} from "../lib/interviewAgent";
+import { validateAnswerOutput } from "../lib/outputValidation";
+import { describeDrain, drainInterviewAsr } from "../lib/asrDrain";
+import { createShortcutGuard } from "../lib/interviewShortcuts";
+import { correctQuestionWithCandidate } from "../lib/candidateCorrection";
+import {
+  getInterviewControls,
+  planInterviewToggle,
+  requestPendingStart,
+} from "../lib/interviewControls";
+
+/**
+ * In auto-answer mode, how long to wait after the last finalized utterance before
+ * answering. The ASR already waited out the end-of-speech pause; this extra beat
+ * absorbs "pause … keep going" phrasing without adding noticeable latency.
+ */
+const AUTO_ANSWER_SETTLE_MS = 600;
+
+/** Friendly provider name for the overlay / logs. */
+const providerLabel = (provider: string): string =>
+  provider === "groq"
+    ? "Groq"
+    : provider === "gemini"
+      ? "Gemini"
+      : provider === "openai"
+        ? "OpenAI"
+        : provider === "anthropic"
+          ? "Anthropic"
+          :provider === "openrouter"
+        ? "OpenRouter"
+        : provider === "nvidia"
+          ? "NVIDIA"
+          : provider;
+
+const logTruncate = (text: string, max: number): string => {
+  const clean = text.replace(/\s+/g, " ").trim();
+  return clean.length <= max ? clean : `${clean.slice(0, max)}…`;
+};
 import { v4 as uuidv4 } from "uuid";
 import { TopBar } from "../components/TopBar";
 import { SettingsPanel } from "../components/SettingsPanel";
@@ -20,25 +78,54 @@ export const Home: React.FC = () => {
     addScreenshot,
     removeScreenshot,
     setCurrentSolution,
-    appendToSolution,
     setIsStreaming,
     setError,
     clearSolution,
     addToHistory,
     addSessionMessage,
+    updateSettings,
+    clearInterviewMessages,
+    agentNotice,
+    setAgentNotice,
+    interviewMessages,
+    detectedQuestion,
+    setDetectedQuestion,
+    answerIssue,
+    setAnswerIssue,
+    openRouterBackendProvider,
+    setOpenRouterBackendProvider,
   } = useStore();
 
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [interviewOpen, setInterviewOpen] = useState(false);
+  // Collapsed = the transcript panel shrinks to one bar so the answer has room.
+  const [interviewCollapsed, setInterviewCollapsed] = useState(false);
   const [followUpText, setFollowUpText] = useState("");
   const screenshotsRef = useRef<string[]>(screenshots);
+  const interviewOpenRef = useRef(interviewOpen);
   const abortControllerRef = useRef<AbortController | null>(null);
+  // Every AI run gets its own id. A superseded run (older id) must never append
+  // to the screen or save history, even if its HTTP stream is still draining.
+  const requestIdRef = useRef(0);
+  // Remembers a gated (unanswered) turn so pressing the hotkey twice in a row
+  // on the exact same transcript counts as an explicit "answer anyway".
+  const lastGateRef = useRef<{ signature: string; ts: number }>({
+    signature: "",
+    ts: 0,
+  });
   const chatEndRef = useRef<HTMLDivElement>(null);
+  // Repeat / editable-target guard for the global interview shortcuts. Kept in
+  // a ref so it survives re-renders and holds its cooldown state.
+  const shortcutGuardRef = useRef(createShortcutGuard());
 
-  // Keep ref in sync
+  // Keep refs in sync
   useEffect(() => {
     screenshotsRef.current = screenshots;
   }, [screenshots]);
+
+  useEffect(() => {
+    interviewOpenRef.current = interviewOpen;
+  }, [interviewOpen]);
 
   // Auto-scroll chat
   useEffect(() => {
@@ -60,34 +147,248 @@ export const Home: React.FC = () => {
   const runAIStream = useCallback(
     async (
       screenshotList: string[],
-      transcriptOverride?: string,
+      turn?: InterviewTurn,
       followUpQuery?: string,
+      /**
+       * Who triggered this run. `retry` bypasses the duplicate-submit guard and
+       * re-asks the same question on purpose.
+       */
+      origin: "auto" | "manual" | "retry" = "manual",
+      /**
+       * Candidate repeated-word correction signal. When present, it is applied
+       * to the interviewer's final question AFTER the local gate has confirmed
+       * there is a valid question. It is a correction signal only — never an
+       * appended utterance, never a new question, never sent to AI separately.
+       * The optional `timestamp` is informational ordering only and never a
+       * hard guard. The voice path (useInterviewAudio) also supplies this.
+       */
+      candidateSignal?: { text: string; timestamp?: number },
     ) => {
-      const apiKey = settings.apiKeys[settings.activeProvider];
-      if (!apiKey) {
+      // We only strictly require screenshots for the FIRST dsa/code question if no followUp or transcript
+      const isGeneral = settings.interviewType === "general";
+      const isFollowUp = !!followUpQuery;
+      // Utterances the VAD split are re-joined first, so "Can you explain" +
+      // "… the CAP theorem" counts as one complete question.
+      const interviewTurn = turn ? normalizeTurn(turn) : undefined;
+      const isInterview = !!interviewTurn;
+      // `retry` is shown exactly like a manual run in the overlay.
+      const displayMode: "auto" | "manual" =
+        origin === "auto" ? "auto" : "manual";
+
+      // Ordered provider chain.
+      //
+      // A live interview goes through OpenRouter ONLY — it is the single
+      // gateway, and OpenRouter itself owns provider routing/fallback. The
+      // screenshot / follow-up flow stays on whatever provider is chosen in
+      // Settings, which also defaults to OpenRouter.
+      const attempts: AttemptSpec[] = (
+        isInterview
+          ? (settings.providerOrder ?? []).map((provider) => ({
+              provider,
+              apiKey: settings.apiKeys[provider] ?? "",
+            }))
+          : [
+              {
+                provider: settings.activeProvider,
+                apiKey: settings.apiKeys[settings.activeProvider] ?? "",
+              },
+            ]
+      )
+        .filter((a) => a.apiKey.trim())
+        .map((a) => {
+          const provider = getProvider(a.provider);
+          const models = provider.listModels();
+          const configured = settings.models?.[a.provider] || models[0] || "";
+          // ── Free mode: never substitute a fixed model ──────────────────
+          // `openrouter/free` is a ROUTER, not a model. OpenRouter resolves it
+          // per request, so swapping in some other id on failure would defeat
+          // the entire point (and silently pin us to one model again). If the
+          // free router is unavailable the run moves to the NEXT PROVIDER —
+          // the configured fallback policy, not a hidden substitution.
+          //
+          // There is deliberately no per-provider "try these other model ids"
+          // list: with hedging in place the next provider is a faster answer
+          // than retrying the same gateway on a different model.
+          return {
+            provider: a.provider,
+            model:
+              a.provider === "openrouter" && isOpenRouterFreeModel(configured)
+                ? OPENROUTER_FREE_MODEL
+                : configured,
+            apiKey: a.apiKey,
+            maxTokens: 4096,
+          };
+        });
+
+      // Resolved-chain diagnostic. The runtime previously reported OpenRouter as
+      // configured while the interview path actually ran on Groq, so the chain
+      // that will really be used is now printed up front — with the configured
+      // order and the reason every provider is used or skipped. Never a key.
+      if (isInterview) {
+        for (const line of describeProviderChain(settings).lines) {
+          console.log(line);
+        }
+        console.log(
+          `[AI] activeProvider=${settings.activeProvider} lastOpenRouterBackend=${openRouterBackendProvider ?? "(none yet)"}`,
+        );
+      }
+      console.log(
+        `[AI] ${isInterview ? "interview" : "screenshot"} attempts: ${
+          attempts.length
+            ? attempts.map((a) => `${a.provider}(${a.model})`).join(" → ")
+            : "(none — no provider has an API key)"
+        }`,
+      );
+
+      if (attempts.length === 0) {
         setError(
-          `No API key for ${settings.activeProvider}. Open Settings (⚙) to add one.`,
+          isInterview
+            ? "No API key for OpenRouter. Open Settings (⚙) to add one."
+            : `No API key for ${settings.activeProvider}. Open Settings (⚙) to add one.`,
         );
         setIsStreaming(false);
         return;
       }
 
-      // We only strictly require screenshots for the FIRST dsa/code question if no followUp or transcript
-      const isGeneral = settings.interviewType === "general";
-      const isFollowUp = !!followUpQuery;
-
+      // Without a screenshot there is nothing to solve. Previously the code fell
+      // through to the generic "solve the problem on screen" prompt here, which
+      // is what made the model invent a question out of thin air.
       if (
         !isGeneral &&
-        screenshotList.length === 0 &&
-        !transcriptOverride &&
+        !isInterview &&
         !isFollowUp &&
-        sessionMessages.length === 0
+        screenshotList.length === 0
       ) {
         setError(
-          "No screenshots yet. Press Ctrl+H to take a screenshot first.",
+          "No screenshots yet. Press Ctrl+H or Ctrl+Shift+C to capture a screenshot first.",
         );
         setIsStreaming(false);
         return;
+      }
+
+      // Signature of the transcript this run submits (null when not deduped).
+      let submittedSignature: string | null = null;
+
+      // ── End-of-utterance + question detection gate ──────────────────────
+      // Runs locally and BEFORE any network call: incomplete, fragmented,
+      // conversational or question-less input never reaches the LLM.
+      //
+      // There is exactly ONE authoritative result for the current transcript:
+      // either we show the detected question and proceed to answer, or we show
+      // WAIT and return. The two states are mutually exclusive by construction.
+      let questionIndex = 0;
+      let turnId = "";
+      // The final, corrected question this run will answer. The voice path
+      // (useInterviewAudio) has already run the generic ASR repair; here we
+      // apply the candidate repeated-word correction on top of that, but ONLY
+      // once the local gate has confirmed a valid interviewer question exists.
+      let finalQuestion = "";
+      let usedCandidateCorrection = false;
+      if (candidateSignal && isInterview && interviewTurn) {
+        const finals = interviewTurn.finals.filter((u) => u.text?.trim());
+        if (finals.length > 0) {
+          const rawQuestion = finals[finals.length - 1].text.trim();
+          const correction = correctQuestionWithCandidate(
+            rawQuestion,
+            candidateSignal,
+          );
+          if (correction.corrected) {
+            finalQuestion = correction.finalCorrectedQuestion;
+            usedCandidateCorrection = true;
+            console.log(
+              `[AI:${turnId}] candidate correction: "${correction.rawInterviewerText}" → "${finalQuestion}" (candidate: "${correction.candidateCorrection}")`,
+            );
+          } else {
+            finalQuestion = rawQuestion;
+          }
+        }
+      }
+
+      if (isInterview && interviewTurn) {
+        const finals = interviewTurn.finals.filter((u) => u.text?.trim());
+        const gate = evaluateInterviewTurn(interviewTurn);
+        turnId = `turn-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
+        console.log(
+          `[AI:${turnId}] transcript=${logTruncate(
+            finals.map((f) => `${f.source}:${f.text}`).join(" | "),
+            300,
+          )} | gate=${gate.action} ${gate.action === "wait" ? `reason="${gate.reason}"` : `question="${logTruncate(gate.question, 120)}"`}`,
+        );
+
+        if (gate.action === "wait") {
+          const signature = turnSignature(interviewTurn);
+          const previous = lastGateRef.current;
+          const insistingAgain =
+            previous.signature === signature &&
+            Date.now() - previous.ts < 30000;
+
+          if (!insistingAgain) {
+            lastGateRef.current = { signature, ts: Date.now() };
+            // A WAIT result is authoritative: clear any stale detected question
+            // from a previous turn so the UI never shows both a question and WAIT.
+            setDetectedQuestion(null);
+            setAnswerIssue(null);
+            setAgentNotice(gate.reason);
+            setError(null);
+            return;
+          }
+
+          // Second identical trigger = explicit user override. The rules in the
+          // system prompt still apply, so the model may answer WAIT again.
+          questionIndex = Math.max(0, finals.length - 1);
+          setDetectedQuestion({
+            text: finals[questionIndex]?.text.trim() ?? "",
+            mode: displayMode,
+            forced: true,
+          });
+        } else {
+          lastGateRef.current = { signature: "", ts: 0 };
+          questionIndex = gate.questionIndex;
+          // Publish what the gate locked onto (or the corrected question when a
+          // candidate correction was strongly supported) so the UI shows the
+          // question that will actually be answered.
+          const displayedQuestion =
+            usedCandidateCorrection ? finalQuestion : gate.question;
+          // Clear any prior WAIT notice — this turn is proceeding to answer.
+          setAgentNotice(null);
+          setAnswerIssue(null);
+          setDetectedQuestion({ text: displayedQuestion, mode: displayMode });
+        }
+      }
+
+      // ── Duplicate-request guard ─────────────────────────────────────────
+      // The hotkey pressed twice on the same transcript — or auto mode racing
+      // the hotkey — must not fire two requests. `Retry` bypasses this, and a
+      // failed/partial run leaves the transcript re-submittable.
+      if (isInterview && interviewTurn && origin !== "retry") {
+        const signature = turnSignature(interviewTurn);
+        const previous = lastSubmitRef.current;
+        if (isDuplicateSubmit(previous, signature)) {
+          console.log("[AI] duplicate submit ignored (same transcript)");
+          return;
+        }
+        submittedSignature = signature;
+        lastSubmitRef.current = { signature, status: "in-flight" };
+      }
+
+      // A run that is superseded or errors must not leave its transcript locked
+      // as "in-flight" (which would silently swallow the next submit).
+      const clearSubmitLock = () => {
+        if (
+          submittedSignature &&
+          lastSubmitRef.current.signature === submittedSignature
+        ) {
+          lastSubmitRef.current = {
+            signature: submittedSignature,
+            status: "failed",
+          };
+        }
+      };
+
+      if (isInterview && interviewTurn) {
+        // Kept so the Retry action can re-ask exactly the same question.
+        lastInterviewTurnRef.current = interviewTurn;
       }
 
       // Abort any ongoing stream
@@ -97,28 +398,80 @@ export const Home: React.FC = () => {
       const abortController = new AbortController();
       abortControllerRef.current = abortController;
       const signal = abortController.signal;
+      const requestId = ++requestIdRef.current;
+      const isStale = () => signal.aborted || requestId !== requestIdRef.current;
 
       setCurrentSolution("");
       setError(null);
+      setAgentNotice(null);
+      setAnswerIssue(null);
+      // A screenshot / follow-up run has no interviewer question behind it.
+      if (!isInterview) setDetectedQuestion(null);
       setIsStreaming(true);
       setFollowUpText(""); // clear input
 
+      // Behavioural rules live in the provider's SYSTEM slot; the candidate
+      // context is part of it too, so the transcript in the user message stays
+      // the only answerable content.
+      let systemInstruction: string | undefined;
+      // Raw chat history is only used by the screenshot flow. For a live turn the
+      // background is embedded (and explicitly labelled) inside the prompt, so no
+      // old assistant message can act as a continuation prompt.
+      let historyContext: { role: "user" | "assistant"; content: string }[];
+      // What the chat bubble shows/stores. Never the full template.
+      let userMessageContent: string;
       let prompt = "";
-      if (followUpQuery) {
-        prompt = followUpQuery;
-      } else if (transcriptOverride) {
-        prompt = `Here is a live interview transcript. Please provide a brief, excellent answer to the interviewer's most recent question, considering the context of the whole conversation:\n\n${transcriptOverride}`;
+
+      if (isInterview && interviewTurn) {
+        const finals = interviewTurn.finals.filter((u) => u.text?.trim());
+        const latest = finals[questionIndex] ?? finals[finals.length - 1];
+        // The question the AI answers. The raw question is preserved in the
+        // transcript as normal; a candidate correction only changes what the AI
+        // receives (e.g. "What is mango?" + "MongoDB" → "What is MongoDB?").
+        userMessageContent = `🎙️ ${(finalQuestion ?? latest?.text.trim()) ?? "(no audio captured)"}`;
+        systemInstruction = buildInterviewSystemPrompt(settings);
+        prompt = buildInterviewUserPrompt(interviewTurn, {
+          questionIndex,
+          previousAnswers: sessionMessages
+            .filter((m) => m.role === "assistant")
+            .slice(-2)
+            .map((m) => m.content),
+        });
+        // The user prompt's latest-question block must reflect the corrected
+        // question too, so the model cannot confuse the raw transcript for the
+        // current question.
+        historyContext = [];
       } else {
-        prompt =
-          settings.interviewType === "general"
-            ? settings.customInstructions ||
-              "Please answer the general question."
-            : buildPrompt(settings.interviewType, settings.language);
+        // Pre-interview context (resume / company / JD / answer style) is appended
+        // to every prompt so answers are tailored to this specific interview.
+        // The resume is skipped on follow-ups — it is already carried in the first
+        // user message of the session, so re-sending it only wastes tokens.
+        const contextBlock = buildInterviewContext(settings, {
+          includeResume: !isFollowUp,
+        });
+
+        if (followUpQuery) {
+          prompt = followUpQuery;
+        } else {
+          prompt =
+            settings.interviewType === "general"
+              ? settings.customInstructions ||
+                "Please answer the general question."
+              : buildPrompt(settings.interviewType, settings.language);
+        }
+        prompt += contextBlock;
+        userMessageContent = prompt;
+        historyContext = sessionMessages.slice(-6).map((msg) => ({
+          role: msg.role,
+          content: msg.content,
+        }));
       }
 
       try {
-        const provider = getProvider(settings.activeProvider);
         let fullSolution = "";
+        // The exact question this run is answering, used by the output validator
+        // for the question-echo signal only.
+        let answeredQuestion = "";
 
         // Use the latest screenshot for the AI call (if it exists)
         const latestScreenshot =
@@ -126,41 +479,193 @@ export const Home: React.FC = () => {
             ? screenshotList[screenshotList.length - 1]
             : undefined;
 
-        // PERF: Prevent context window token explosion.
-        // 1. Keep only the last 6 messages (3 interactions).
-        // 2. We only send the text. We do NOT re-send historical Base64 images to save tokens and latency.
-        const recentMessages = sessionMessages.slice(-6);
-        const historyContext = recentMessages.map((msg) => ({
-          role: msg.role,
-          content: msg.content,
-        }));
-
-        const stream = provider.streamSolution({
-          base64Image: latestScreenshot,
-          prompt,
-          messages: historyContext,
-          model: settings.activeModel,
-          apiKey,
-          mimeType: latestScreenshot ? "image/png" : undefined,
-        });
-
-        for await (const chunk of stream) {
-          if (signal.aborted) {
-            break;
-          }
-          fullSolution += chunk;
-          appendToSolution(chunk);
+        if (isInterview && interviewTurn) {
+          // A candidate correction can change the raw question (e.g.
+          // "What is mango?" + "MongoDB" → "What is MongoDB?"), so the
+          // corrected question is the single source of truth for the run.
+          const latest =
+            interviewTurn.finals
+              .filter((u) => u.text?.trim())
+              .slice(questionIndex)[0];
+          answeredQuestion = (finalQuestion ?? latest?.text?.trim()) ?? "";
+          console.log(
+            `[AI] question: ${logTruncate(answeredQuestion, 160)}`,
+          );
         }
 
-        if (signal.aborted) {
-          return; // Skip history save if we aborted
+        // ── Answer orchestration ──────────────────────────────────────────────────
+        // OpenRouter Free is attempted immediately. If it has produced no
+        // meaningful text after OPENROUTER_HEDGE_MS, Groq is started alongside
+        // it (max 2 concurrent). The first provider to COMPLETE with an answer
+        // that passes the validator wins; every loser is aborted.
+        //
+        // Nothing is streamed to the screen: the answer is shown only once it is
+        // complete, which is what makes "first VALID COMPLETE answer wins"
+        // meaningful and makes a cross-provider overwrite structurally
+        // impossible.
+        console.log(
+          `[AI:${turnId}] orchestrating — chain=${attempts.map((a) => `${a.provider}(${a.model})`).join(" → ")}`,
+        );
+        const run = await orchestrateAnswer({
+          attempts,
+          prompt,
+          system: systemInstruction,
+          messages: historyContext,
+          base64Image: latestScreenshot,
+          mimeType: latestScreenshot ? "image/png" : undefined,
+          signal,
+          log: (line) => console.log(line),
+          // Only a completed, validated answer may win. This is the same
+          // validator the final UI gate uses, so nothing is weakened.
+          validate: (text) => {
+            if (isWaitResponse(text)) return { ok: false, reason: "wait" };
+            return validateAnswerOutput(text, {
+              question: answeredQuestion,
+              // Only the STATIC rules template — never the assembled system
+              // message, which also carries the candidate resume.
+              promptTemplate: INTERVIEW_SYSTEM_PROMPT,
+            });
+          },
+          onStatus: (status) => {
+            // Stale = superseded or aborted: never touch the UI.
+            if (isStale() || !isInterview) return;
+            const current = useStore.getState().detectedQuestion;
+            if (!current) return;
+            const who =
+              status.provider === "openrouter" &&
+              isOpenRouterFreeModel(status.model ?? "")
+                ? "OpenRouter Free"
+                : providerLabel(status.provider ?? "");
+            const note =
+              status.state === "hedging"
+                ? (status.note ?? `OpenRouter slow → ${who}`)
+                : status.state === "completed"
+                  ? `${who}`
+                  : `ANSWERING… · ${who}`;
+            setDetectedQuestion({ ...current, provider: status.provider, model: status.model, note });
+          },
+        });
+
+        if (isStale()) {
+          clearSubmitLock();
+          return; // Superseded mid-flight: leave the UI to the newer run.
+        }
+
+        // Log the full failover chain result so we can see exactly what each
+        // provider did: Groq's HTTP status / error body / finish_reason / timeout,
+        // and whether Gemini was tried and whether it returned text.
+        if (run.failures.length > 0) {
+          for (const f of run.failures) {
+            console.log(
+              `[AI:${turnId}] ${f.provider.toUpperCase()} did not win (reason=${f.reason}) — "${f.message}"`,
+            );
+          }
+        }
+        console.log(
+          `[AI:${turnId}] summary: attempts=${run.attempts} hedged=${run.hedged} winner=${run.provider ?? "(none)"}`,
+        );
+        if (run.provider) {
+          // Capture the actual backend provider for OpenRouter UI display.
+          if (run.provider === "openrouter" && run.backend) {
+            setOpenRouterBackendProvider(run.backend);
+          }
+          // For `openrouter/free` the resolved model is the interesting fact:
+          // OpenRouter picked a different concrete free model than we asked for.
+          if (
+            run.provider === "openrouter" &&
+            run.resolvedModel &&
+            isOpenRouterFreeModel(run.model) &&
+            !isStale()
+          ) {
+            const current = useStore.getState().detectedQuestion;
+            if (current) {
+              setDetectedQuestion({
+                ...current,
+                note: `OpenRouter Free • ${run.resolvedModel}${
+                  run.backend ? ` via ${run.backend}` : ""
+                }`,
+              });
+            }
+          }
+          console.log(
+            `[AI:${turnId}] WINNER provider=${run.provider} requested=${run.model} resolvedModel=${run.resolvedModel ?? "(same)"} backend=${run.backend ?? "(direct)"} finishReason=${run.finishReason ?? "(none)"} text="${logTruncate(run.text, 120)}"`,
+          );
+        } else {
+          console.log(
+            `[AI:${turnId}] NO WINNER — ${run.attempts} provider(s) tried, ${run.failures.length} failure(s).`,
+          );
+        }
+
+        if (isStale()) {
+          return; // Skip history save if we aborted / were superseded
+        }
+
+        fullSolution = run.text;
+
+        // ── Nothing usable from any provider ──────────────────────────────
+        // Never save "", never render an empty card: report what the providers
+        // actually said and offer Retry.
+        if (!fullSolution.trim()) {
+          const detail =
+            run.error ??
+            (run.aborted
+              ? "Cancelled."
+              : "No provider returned an answer.");
+          console.error(`[AI] no usable answer — ${detail}`);
+          setCurrentSolution("");
+          setAnswerIssue({ kind: "empty", message: detail });
+          lastSubmitRef.current = {
+            signature: lastSubmitRef.current.signature,
+            status: "failed",
+          };
+          return;
+        }
+
+        // The agent refused to answer: no clear question was ever asked, so
+        // nothing is shown, stored in the session, or written to history.
+        // A WAIT result is authoritative: clear the detected question so the UI
+        // never shows both a question banner and a WAIT banner at the same time.
+        if (isInterview && isWaitResponse(fullSolution)) {
+          console.log(
+            `[AI:${turnId}] LLM returned WAIT for a gated question — clearing detected question. LLM text: "${logTruncate(fullSolution, 120)}"`,
+          );
+          setCurrentSolution("");
+          setDetectedQuestion(null);
+          setAnswerIssue(null);
+          setAgentNotice("no clear question was asked");
+          return;
+        }
+
+        // ── Output validation (belt-and-braces) ───────────────────────────────
+        // The orchestrator ALREADY ran this validator before letting a provider
+        // win, so reaching the failure branch here means something is wrong
+        // upstream. Kept as a hard stop so a degenerate answer can never be
+        // saved to history or fed back as `previousAnswers` for the next turn.
+        const validation = validateAnswerOutput(fullSolution, {
+          question: answeredQuestion,
+          promptTemplate: INTERVIEW_SYSTEM_PROMPT,
+        });
+        if (!validation.ok) {
+          console.error(
+            `[AI:${turnId}] output rejected by validator (${validation.reason}) — ${validation.detail} | raw="${logTruncate(fullSolution, 120)}"`,
+          );
+          setCurrentSolution("");
+          setAnswerIssue({
+            kind: "empty",
+            message: `The model returned something that is not an answer (${validation.reason}). Press Retry.`,
+          });
+          lastSubmitRef.current = {
+            signature: lastSubmitRef.current.signature,
+            status: "failed",
+          };
+          return;
         }
 
         // Add User Message to Session
         addSessionMessage({
           id: uuidv4(),
           role: "user",
-          content: prompt,
+          content: userMessageContent,
           screenshotBase64: latestScreenshot,
         });
 
@@ -177,9 +682,9 @@ export const Home: React.FC = () => {
           timestamp: Date.now(),
           screenshotBase64: latestScreenshot,
           solution: fullSolution,
-          provider: settings.activeProvider,
-          model: settings.activeModel,
-          interviewType: transcriptOverride
+          provider: run.provider ?? settings.activeProvider,
+          model: run.resolvedModel ?? run.model,
+          interviewType: isInterview
             ? "live-interview"
             : settings.interviewType,
           language: settings.language,
@@ -192,13 +697,24 @@ export const Home: React.FC = () => {
         } catch {
           /* best-effort */
         }
+
+        // A completed answer means this transcript is done.
+        if (isInterview) {
+          lastSubmitRef.current = {
+            signature: lastSubmitRef.current.signature,
+            status: "ok",
+          };
+        }
       } catch (err) {
-        if (signal.aborted) return;
+        clearSubmitLock();
+        if (isStale()) return;
         const message =
           err instanceof Error ? err.message : "AI streaming failed";
         setError(message);
       } finally {
-        if (!signal.aborted) {
+        // Only the newest run may clear the UI — an older one finishing late
+        // must not wipe the answer that replaced it.
+        if (!isStale()) {
           setIsStreaming(false);
           setCurrentSolution(""); // Clear current (it is now in session messages)
         }
@@ -210,19 +726,51 @@ export const Home: React.FC = () => {
       setCurrentSolution,
       setError,
       setIsStreaming,
-      appendToSolution,
       addToHistory,
       addSessionMessage,
+      updateSettings,
+      setAgentNotice,
+      setDetectedQuestion,
+      setAnswerIssue,
+      setOpenRouterBackendProvider,
     ],
   );
 
   const handleInterviewSubmit = useCallback(
-    async (transcript: string) => {
+    async (
+      turn: InterviewTurn,
+      candidateSignal?: { text: string; timestamp?: number },
+      clearTranscript = true,
+    ) => {
       setInterviewOpen(false);
-      await runAIStream([], transcript);
+      setInterviewCollapsed(false);
+      if (clearTranscript) {
+        clearInterviewMessages();
+      }
+      await runAIStream([], turn, undefined, "manual", candidateSignal);
     },
-    [runAIStream],
+    [runAIStream, clearInterviewMessages],
   );
+
+  const toggleInterview = useCallback(() => {
+    clearInterviewMessages();
+    setInterviewCollapsed(false);
+    setInterviewOpen((prev) => !prev);
+  }, [clearInterviewMessages]);
+
+  const closeInterview = useCallback(() => {
+    clearInterviewMessages();
+    setInterviewCollapsed(false);
+    setInterviewOpen(false);
+  }, [clearInterviewMessages]);
+
+  /** Re-ask the last question (used by the empty / partial answer banner). */
+  const retryAnswer = useCallback(() => {
+    const lastTurn = lastInterviewTurnRef.current;
+    if (!lastTurn) return;
+    setAnswerIssue(null);
+    runAIStream([], lastTurn, undefined, "retry");
+  }, [runAIStream, setAnswerIssue]);
 
   const handleFollowUpSubmit = useCallback(
     (e: React.FormEvent) => {
@@ -233,17 +781,183 @@ export const Home: React.FC = () => {
     [followUpText, isStreaming, runAIStream],
   );
 
+  // ── Auto-answer mode ────────────────────────────────────────────────────
+  // Fires by itself once the interviewer finishes a clear question. Only
+  // *finalized* utterances are considered (the gate ignores mid-sentence
+  // speech), so this can never answer a partial transcript.
+  //
+  // runAIStream is reached through a ref so this effect doesn't re-arm its
+  // settle timer every time settings or session history change.
+  const runStreamRef = useRef(runAIStream);
+  useEffect(() => {
+    runStreamRef.current = runAIStream;
+  }, [runAIStream]);
+
+  // Last *submitted* transcript + how it ended, used to swallow duplicates.
+  const lastSubmitRef = useRef<SubmitRecord>({
+    signature: "",
+    status: "failed",
+  });
+  // Last interview turn, so Retry can re-ask exactly the same question.
+  const lastInterviewTurnRef = useRef<InterviewTurn | null>(null);
+  // Auto-answer mode: the last finalized message we already acted on.
+  const autoAnsweredRef = useRef<string | null>(null);
+  const lastTranscript =
+    interviewMessages[interviewMessages.length - 1] ?? null;
+  const lastTranscriptId = lastTranscript?.id ?? null;
+
+  useEffect(() => {
+    if (!settings.autoAnswer || !interviewOpen) return;
+    if (!lastTranscriptId || lastTranscript?.source !== "system") return;
+    // Already handled this final — the effect also re-runs for other reasons.
+    if (autoAnsweredRef.current === lastTranscriptId) return;
+
+    // Same gate as the manual path — incomplete, fragmented or conversational
+    // speech never even schedules an answer.
+    const preview = normalizeTurn(useStore.getState().getInterviewTurn());
+    const previewGate = evaluateInterviewTurn(preview);
+    if (previewGate.action !== "answer") return;
+
+    // Show what the gate locked onto *before* answering, so it can be seen
+    // during the settle delay as well as while the answer streams.
+    // A detected question and a WAIT notice are mutually exclusive states.
+    setAgentNotice(null);
+    setAnswerIssue(null);
+    setDetectedQuestion({ text: previewGate.question, mode: "auto" });
+    console.log(
+      `[AI:auto] gate=answer question="${logTruncate(previewGate.question, 120)}" — scheduling answer in ${AUTO_ANSWER_SETTLE_MS}ms`,
+    );
+
+    const timer = window.setTimeout(() => {
+      autoAnsweredRef.current = lastTranscriptId;
+      // Re-check against the freshest transcript: the interviewer may have kept
+      // talking during the settle delay.
+      const turn = normalizeTurn(useStore.getState().getInterviewTurn());
+      if (evaluateInterviewTurn(turn).action !== "answer") {
+        console.log(
+          `[AI:auto] re-check at settle time: gate no longer says answer — clearing detected question`,
+        );
+        setDetectedQuestion(null);
+        setAgentNotice(null);
+        return;
+      }
+      runStreamRef.current([], turn, undefined, "auto");
+    }, AUTO_ANSWER_SETTLE_MS);
+
+    return () => window.clearTimeout(timer);
+  }, [
+    settings.autoAnswer,
+    interviewOpen,
+    lastTranscriptId,
+    lastTranscript,
+    setDetectedQuestion,
+  ]);
+
+  /**
+   * Start / Stop Interview shortcut (Ctrl+I).
+   *
+   * Reuses the EXISTING capture lifecycle: it calls the same `startInterview` /
+   * `stopInterview` the panel's Start/Stop buttons call, through the
+   * `lib/interviewControls` bridge. It never opens a second capture stream.
+   * When the panel is closed it opens it first and defers the start until the
+   * ASR model is ready, so a single press is never dropped.
+   */
+  const toggleInterviewShortcut = useCallback(() => {
+    const controls = getInterviewControls();
+    const outcome = planInterviewToggle(
+      controls
+        ? { isRecording: controls.isRecording(), canStart: controls.canStart() }
+        : null,
+    );
+    if (outcome === "stop") {
+      controls?.stop();
+      return;
+    }
+    if (!interviewOpenRef.current) {
+      setInterviewOpen(true);
+      setInterviewCollapsed(false);
+    }
+    if (outcome === "start") {
+      controls?.start();
+      return;
+    }
+    // Panel still mounting, or the ASR model is still loading.
+    requestPendingStart();
+  }, []);
+
+  /**
+   * Next Question shortcut (Ctrl+N).
+   *
+   * Advances/resets the CURRENT question state using the existing reset
+   * primitives (the same `clearInterviewMessages` + gate refs that Ctrl+G and
+   * a fresh session use). It does NOT stop capture, does NOT start another
+   * stream, and does NOT submit the question to the AI.
+   */
+  const nextQuestion = useCallback(() => {
+    if (abortControllerRef.current) abortControllerRef.current.abort();
+    requestIdRef.current++; // invalidate anything still in flight
+    lastGateRef.current = { signature: "", ts: 0 };
+    lastSubmitRef.current = { signature: "", status: "failed" };
+    lastInterviewTurnRef.current = null;
+    autoAnsweredRef.current = null;
+    clearInterviewMessages();
+    setDetectedQuestion(null);
+    setAgentNotice(null);
+    setAnswerIssue(null);
+    setInterviewCollapsed(false);
+  }, [
+    clearInterviewMessages,
+    setDetectedQuestion,
+    setAgentNotice,
+    setAnswerIssue,
+  ]);
+
   // Listen for hotkey events from main process
   useEffect(() => {
+    // Safety guard — window.ghostly only exists inside Electron
+    if (!window.ghostly) {
+      console.error("[Ghostly] window.ghostly is undefined — not running inside Electron?");
+      return;
+    }
+
     // Ctrl+H — screenshot captured (multiple accumulate)
     const offScreenshot = window.ghostly.onScreenshot((b64: string) => {
       addScreenshot(b64);
     });
 
-    // Ctrl+Enter — solve with all accumulated screenshots
+    // Ctrl+Enter — solve. While the interview panel is open, prefer the live
+    // transcript (interviewer's question); otherwise use accumulated screenshots.
+    // Screenshots are still attached when present, so a code question captured
+    // on screen + its spoken explanation both reach the AI.
     const offSolve = window.ghostly.onSolve(async () => {
       const shots = screenshotsRef.current;
-      await runAIStream(shots);
+      let turn: InterviewTurn | undefined;
+      if (interviewOpenRef.current) {
+        // ── Drain barrier ────────────────────────────────────────────────
+        // `getInterviewTurn()` is SYNCHRONOUS, but a final for the phrase the
+        // interviewer just finished is still decoding in the worker at this
+        // instant. Reading the transcript immediately therefore submitted the
+        // question with its last words missing — a confidently wrong answer
+        // rather than a visible failure.
+        //
+        // The barrier is bounded (see `lib/asrDrain.ts`): it waits for the
+        // in-flight final to be committed, and on timeout proceeds anyway with
+        // whatever IS committed, logging that the tail may be missing. It
+        // cannot reject, so this await cannot block or break the hotkey.
+        const drain = await drainInterviewAsr();
+        if (drain.outcome !== "alreadyIdle" && drain.outcome !== "noWorker") {
+          console.log(`[ASR] submit drain: ${describeDrain(drain)}`);
+        }
+        // Read the transcript ONLY after the barrier, so it includes the final
+        // that was in flight.
+        turn = useStore.getState().getInterviewTurn();
+      }
+      if (turn) {
+        // Free the vertical space for the answer: the panel collapses to a
+        // single bar but keeps capturing (closing it would stop the audio).
+        setInterviewCollapsed(true);
+      }
+      await runAIStream(shots, turn);
     });
 
     // Ctrl+G — start over (clear everything)
@@ -251,16 +965,60 @@ export const Home: React.FC = () => {
       if (abortControllerRef.current) {
         abortControllerRef.current.abort();
       }
+      requestIdRef.current++; // invalidate anything still in flight
+      lastGateRef.current = { signature: "", ts: 0 };
+      lastSubmitRef.current = { signature: "", status: "failed" };
+      lastInterviewTurnRef.current = null;
+      setInterviewCollapsed(false);
       setIsStreaming(false);
       clearSolution();
+    });
+
+    // Interview Type Shortcuts — Ctrl+Shift+1/2/3/4/5/6
+    const interviewTypes = [
+      "dsa",
+      "system_design",
+      "frontend",
+      "sql",
+      "behavioral",
+      "general",
+    ] as const;
+    const offInterviewType = interviewTypes.map((type) =>
+      window.ghostly.onInterviewType(type, () => {
+        updateSettings({ interviewType: type });
+      }),
+    );
+
+    // Ctrl+I — Start / Stop Interview. The guard swallows key auto-repeat and
+    // rapid double-fires of the same action.
+    const offToggleInterview = window.ghostly.onToggleInterview(() => {
+      if (!shortcutGuardRef.current.shouldHandle("toggle-interview")) return;
+      toggleInterviewShortcut();
+    });
+
+    // Ctrl+N — Next Question. Never submits an answer and never stops capture.
+    const offNextQuestion = window.ghostly.onNextQuestion(() => {
+      if (!shortcutGuardRef.current.shouldHandle("next-question")) return;
+      nextQuestion();
     });
 
     return () => {
       offScreenshot();
       offSolve();
       offStartOver();
+      offInterviewType.forEach((off) => off());
+      offToggleInterview();
+      offNextQuestion();
     };
-  }, [runAIStream, addScreenshot, clearSolution, setIsStreaming]);
+  }, [
+    runAIStream,
+    addScreenshot,
+    clearSolution,
+    setIsStreaming,
+    updateSettings,
+    toggleInterviewShortcut,
+    nextQuestion,
+  ]);
 
   return (
     <div className="h-screen w-full bg-transparent text-white font-mono pointer-events-none select-none flex flex-col">
@@ -269,7 +1027,7 @@ export const Home: React.FC = () => {
         <TopBar
           onOpenSettings={() => setSettingsOpen(true)}
           settingsOpen={settingsOpen}
-          onStartInterview={() => setInterviewOpen(!interviewOpen)}
+          onStartInterview={toggleInterview}
         />
       </div>
 
@@ -281,6 +1039,7 @@ export const Home: React.FC = () => {
             animate={{ opacity: 1, y: 0 }}
             exit={{ opacity: 0, y: -10 }}
             transition={{ duration: 0.15 }}
+            style={{ pointerEvents: "auto" }}
           >
             <SettingsPanel onClose={() => setSettingsOpen(false)} />
           </motion.div>
@@ -302,9 +1061,91 @@ export const Home: React.FC = () => {
                   transition={{ duration: 0.2 }}
                 >
                   <InterviewModal
-                    onClose={() => setInterviewOpen(false)}
+                    onClose={closeInterview}
                     onSubmit={handleInterviewSubmit}
+                    collapsed={interviewCollapsed}
+                    onToggleCollapse={() =>
+                      setInterviewCollapsed((prev) => !prev)
+                    }
                   />
+                </motion.div>
+              )}
+            </AnimatePresence>
+
+            {/* What the question-detection gate locked onto. Shown before the
+                answer starts (auto mode: during the settle delay) and kept
+                visible while it streams, so a mis-read can be spotted instantly. */}
+            <AnimatePresence>
+              {detectedQuestion && (
+                <motion.div
+                  initial={{ opacity: 0, y: -5 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  exit={{ opacity: 0 }}
+                  className="px-3 py-2 rounded-xl pointer-events-auto flex-shrink-0"
+                  style={{
+                    background: "rgba(255,255,255,0.04)",
+                    border: "1px solid rgba(255,255,255,0.08)",
+                  }}
+                >
+                  <div className="flex items-baseline justify-between gap-2">
+                    <span className="text-[9px] uppercase tracking-wider text-accent/70">
+                      {detectedQuestion.forced
+                        ? "Forced · gate said WAIT"
+                        : detectedQuestion.mode === "auto"
+                          ? "Auto · detected question"
+                          : "Detected question"}
+                    </span>
+                    {/* Active provider / failover state */}
+                    {detectedQuestion.provider && (
+                      <span
+                        className={`text-[9px] font-mono truncate ${
+                          detectedQuestion.note?.includes("→")
+                            ? "text-amber-200/70"
+                            : "text-white/30"
+                        }`}
+                      >
+                        {detectedQuestion.note ??
+                          `Using ${providerLabel(detectedQuestion.provider)}`}
+                      </span>
+                    )}
+                  </div>
+                  <p className="text-[11px] text-white/75 font-mono leading-snug line-clamp-2 mt-0.5">
+                    {detectedQuestion.text || "(no speech captured)"}
+                  </p>
+                </motion.div>
+              )}
+            </AnimatePresence>
+
+            {/* Answer could not be produced (empty) or was cut short. */}
+            <AnimatePresence>
+              {answerIssue && (
+                <motion.div
+                  initial={{ opacity: 0, y: -5 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  exit={{ opacity: 0 }}
+                  className="px-3 py-2 rounded-xl pointer-events-auto flex-shrink-0 flex items-center justify-between gap-3"
+                  style={{
+                    background: "rgba(255, 90, 90, 0.08)",
+                    border: "1px solid rgba(255, 90, 90, 0.20)",
+                  }}
+                >
+                  <div className="min-w-0">
+                    <span className="text-[9px] uppercase tracking-wider text-red-200/70">
+                      {answerIssue.kind === "empty"
+                        ? "No answer received"
+                        : "Answer cut off — partial kept"}
+                    </span>
+                    <p className="text-[10px] text-white/45 font-mono leading-snug line-clamp-2 mt-0.5">
+                      {answerIssue.message}
+                    </p>
+                  </div>
+                  <button
+                    onClick={retryAnswer}
+                    disabled={isStreaming}
+                    className="flex-none px-2.5 py-1 rounded-lg bg-white/10 hover:bg-white/20 disabled:opacity-30 text-[10px] font-mono text-white/80 transition-colors"
+                  >
+                    Retry
+                  </button>
                 </motion.div>
               )}
             </AnimatePresence>
@@ -329,6 +1170,29 @@ export const Home: React.FC = () => {
               )}
             </AnimatePresence>
 
+            {/* Agent declined to answer (no clear question detected) */}
+            <AnimatePresence>
+              {agentNotice && !isStreaming && (
+                <motion.div
+                  initial={{ opacity: 0, y: -5 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  exit={{ opacity: 0 }}
+                  className="px-3 py-2 rounded-xl pointer-events-auto flex-shrink-0 flex items-baseline gap-2"
+                  style={{
+                    background: "rgba(255, 190, 60, 0.08)",
+                    border: "1px solid rgba(255, 190, 60, 0.18)",
+                  }}
+                >
+                  <span className="text-[10px] tracking-wider text-amber-200/80 font-mono">
+                    WAIT
+                  </span>
+                  <span className="text-[10px] text-white/45 font-mono">
+                    · {agentNotice}
+                  </span>
+                </motion.div>
+              )}
+            </AnimatePresence>
+
             {/* Screenshots strip */}
             {screenshots.length > 0 &&
               !currentSolution &&
@@ -339,6 +1203,7 @@ export const Home: React.FC = () => {
                   animate={{ opacity: 1 }}
                   className="pointer-events-auto rounded-xl p-3 flex-shrink-0"
                   style={{
+                    cursor: "default",
                     background: "rgba(20, 20, 23, 0.90)",
                     border: "1px solid rgba(255,255,255,0.06)",
                   }}
@@ -393,10 +1258,11 @@ export const Home: React.FC = () => {
               )}
 
             {/* Chat Container */}
-            {(sessionMessages.length > 0 || currentSolution || isStreaming) && (
+            {(sessionMessages.length > 0 || isStreaming) && (
               <div
                 className="pointer-events-auto rounded-2xl overflow-hidden flex flex-col flex-1"
                 style={{
+                  cursor: "default",
                   background: "rgba(20, 20, 23, 0.65)",
                   backdropFilter: "blur(24px)",
                   WebkitBackdropFilter: "blur(24px)",
@@ -438,13 +1304,14 @@ export const Home: React.FC = () => {
                     </div>
                   ))}
 
-                  {/* Streaming Block */}
-                  {(isStreaming || currentSolution) && (
+                  {/* Completed answer is rendered from `sessionMessages` above. While a run is
+                      in flight there is deliberately NO streaming card: the
+                      answer is shown only once it is complete, so a losing
+                      provider can never overwrite a displayed answer. The
+                      "ANSWERING…" state lives in the detected-question banner. */}
+                  {isStreaming && (
                     <div className="w-full">
-                      <SolutionCard
-                        content={currentSolution}
-                        isStreaming={isStreaming}
-                      />
+                      <SolutionCard content="" isStreaming />
                     </div>
                   )}
                   <div ref={chatEndRef} />

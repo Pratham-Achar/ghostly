@@ -10,7 +10,13 @@ import {
 import path from "path";
 import { registerHotkeys, unregisterHotkeys } from "./hotkeys";
 import { registerIpcHandlers } from "./ipc";
-import { applyStealthMode } from "./stealth";
+import { applyStealthMode, removeStealthMode } from "./stealth";
+import {
+  createVisibilityController,
+  STEALTH_REAPPLY_EVENTS,
+  type VisibilityController,
+  type VisibilityMode,
+} from "./visibilityPolicy";
 
 let mainWindow: BrowserWindow | null = null;
 let tray: Tray | null = null;
@@ -19,23 +25,47 @@ let tray: Tray | null = null;
  * Re-apply stealth mode. Called on every show event to ensure
  * the window stays invisible to screen capture at all times.
  */
+/**
+ * Every registered window gets a visibility controller.
+ *
+ * The controller owns the current mode; the re-apply handlers ask it what to
+ * do rather than calling `applyStealthMode` directly. That is what makes
+ * show/focus/restore respect the mode — while `visible`, a re-assert clears
+ * capture exclusion instead of re-adding it, which is what would otherwise
+ * silently un-hide the window the moment it was shown.
+ */
+const visibilityControllers = new WeakMap<BrowserWindow, VisibilityController>();
+
+function controllerFor(win: BrowserWindow): VisibilityController {
+  const existing = visibilityControllers.get(win);
+  if (existing) return existing;
+  const controller = createVisibilityController({
+    apply: () => applyStealthMode(win),
+    remove: () => removeStealthMode(win),
+    // The single canonical visibility log line. Never any other content.
+    log: (line) => console.log(line),
+  });
+  visibilityControllers.set(win, controller);
+  return controller;
+}
+
 function enforceStealthOnWindow(win: BrowserWindow): void {
-  // Apply on every 'show' event — affinity can be lost on hide/show cycles
-  win.on("show", () => {
-    console.log("[Ghostly] Window shown — re-applying stealth");
-    applyStealthMode(win);
-  });
+  // Assert the current mode immediately, so the window starts in the mode it
+  // is actually in rather than assuming `hidden`.
+  controllerFor(win);
 
-  // Also re-apply on focus (belt-and-suspenders)
-  win.on("focus", () => {
-    applyStealthMode(win);
-  });
-
-  // Apply on restore from minimize
-  win.on("restore", () => {
-    console.log("[Ghostly] Window restored — re-applying stealth");
-    applyStealthMode(win);
-  });
+  // Re-apply on every event that can drop the window affinity. Iterating the
+  // shared list keeps this in step with the tested policy.
+  //
+  // Electron types `BrowserWindow.on` as a long list of per-event overloads
+  // with no generic string fallback, so the literal union from
+  // `STEALTH_REAPPLY_EVENTS` matches none of them individually. The cast is
+  // safe: every value in that list IS a real BrowserWindow event, and the list
+  // is asserted in `verify-stealth.mts`.
+  const reapply = () => controllerFor(win).reapply();
+  for (const event of STEALTH_REAPPLY_EVENTS) {
+    win.on(event as "show", reapply);
+  }
 }
 
 function createMainWindow(): BrowserWindow {
@@ -80,10 +110,27 @@ function createMainWindow(): BrowserWindow {
     win.loadFile(path.join(__dirname, "../renderer/index.html"));
   }
 
-  win.once("ready-to-show", () => {
+  // Forward renderer console/errors to terminal for debugging
+  win.webContents.on("console-message", (_event, level, message, line, sourceId) => {
+    console.log(`[Renderer:${level}] ${message} (${sourceId}:${line})`);
+  });
+
+  win.webContents.on("did-fail-load", (_event, errorCode, errorDescription) => {
+    console.error(`[Renderer] Load FAILED: ${errorCode} - ${errorDescription}`);
+  });
+
+  win.webContents.on("render-process-gone", (_event, details) => {
+    console.error(`[Renderer] Process GONE: ${details.reason} (exitCode=${details.exitCode})`);
+  });
+
+  win.on("ready-to-show", () => {
+    const bounds = win.getBounds();
+    const opacity = win.getOpacity();
+    console.log(`[Ghostly] Window ready — bounds: ${JSON.stringify(bounds)}, opacity: ${opacity}`);
     win.show();
-    // Initial stealth application (also triggers via 'show' event above)
-    applyStealthMode(win);
+    console.log(`[Ghostly] After show — visible: ${win.isVisible()}, opacity: ${win.getOpacity()}`);
+    // Assert the current visibility mode (also re-applied via the show event).
+    controllerFor(win).reapply();
   });
 
   return win;
@@ -175,6 +222,36 @@ app.whenReady().then(() => {
       mainWindow.setIgnoreMouseEvents(true, { forward: true });
       mainWindow.focus();
     }
+  });
+
+  // ── Dev-only screen-visibility toggle ───────────────────────────────────
+  //
+  // RUNTIME-ONLY by design (requirement: persistence is only safe if the
+  // existing architecture allows it, and it does not). Persisting this would
+  // mean a developer could ship a build that is visible in screen capture and
+  // only discover it after restarting. Runtime-only also guarantees the app
+  // comes back `hidden` on every launch, which is the safe default.
+  //
+  // Gated on a dev build so it cannot be driven in production at all. The
+  // renderer toggle is hidden too, but this is the enforcing half: a
+  // tampered renderer cannot flip it in a release build.
+  ipcMain.handle("ghostly:set-visibility", (_event, requested: unknown) => {
+    if (!app.isPackaged && process.env.NODE_ENV !== "production") {
+      const win = BrowserWindow.getAllWindows()[0];
+      if (!win) {
+        return { ok: false as const, mode: "hidden" as VisibilityMode };
+      }
+      // Unknown input normalizes to `hidden` — see visibilityPolicy.
+      const mode = controllerFor(win).set(requested);
+      return { ok: true as const, mode };
+    }
+    // Production: report the current (always hidden) mode, change nothing.
+    return { ok: false as const, mode: "hidden" as VisibilityMode };
+  });
+
+  ipcMain.handle("ghostly:get-visibility", () => {
+    const win = BrowserWindow.getAllWindows()[0];
+    return win ? controllerFor(win).current() : "hidden";
   });
 
   // Move window

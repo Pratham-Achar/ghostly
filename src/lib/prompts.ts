@@ -1,3 +1,52 @@
+/**
+ * Builds the pre-interview context block (resume / company / job description /
+ * answer style) that is appended to every prompt.
+ *
+ * `includeResume` is false for follow-up questions: the resume is large and its
+ * contents are already carried in the first user message of the session, so
+ * re-sending it on every follow-up would waste tokens and add latency.
+ */
+export function buildInterviewContext(
+  settings: {
+    resumeText?: string;
+    companyName?: string;
+    jobDescription?: string;
+    answerInstructions?: string;
+  },
+  opts: { includeResume?: boolean } = {},
+): string {
+  const parts: string[] = [];
+
+  if (settings.companyName?.trim()) {
+    parts.push(`## Company
+${settings.companyName.trim()}`);
+  }
+  if (settings.jobDescription?.trim()) {
+    parts.push(`## Job Description
+${settings.jobDescription.trim()}`);
+  }
+  if (opts.includeResume && settings.resumeText?.trim()) {
+    parts.push(`## Candidate Resume
+${settings.resumeText.trim()}`);
+  }
+  if (settings.answerInstructions?.trim()) {
+    parts.push(
+      `## Answer Style (follow strictly)
+${settings.answerInstructions.trim()}`,
+    );
+  }
+
+  if (parts.length === 0) return "";
+
+  return `
+
+---
+# Interview Context
+Use the following context to tailor your answer. Do not repeat it back to the user.
+
+${parts.join("\n\n")}`;
+}
+
 export function buildPrompt(type: string, language: string): string {
   const base = `You are an expert ${language} developer in a technical interview.
 Analyze the problem in the screenshot and respond EXACTLY in this format:

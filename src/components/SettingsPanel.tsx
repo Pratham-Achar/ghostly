@@ -1,14 +1,42 @@
 import React, { useEffect, useRef, useState } from "react";
 import { useStore } from "../store/useStore";
 import { getProvider, type ProviderName } from "../lib/ai";
+import { INTERVIEW_PROVIDER_ORDER } from "../lib/providerDiagnostics";
+import {
+  findShortcutConflicts,
+  INTERVIEW_SHORTCUTS,
+} from "../lib/interviewShortcuts";
 
-export const INTERVIEW_TYPES = [
-  { id: "dsa", label: "DSA / Algorithms" },
-  { id: "system_design", label: "System Design" },
-  { id: "frontend", label: "Frontend" },
-  { id: "sql", label: "SQL" },
-  { id: "behavioral", label: "Behavioral" },
-  { id: "general", label: "General" },
+/**
+ * Interview types split into two top-level groups. The existing types are never
+ * removed: everything that is not a DSA type lives under "General", and the
+ * existing DSA mode lives under "DSA".
+ */
+export const INTERVIEW_TYPE_GROUPS: readonly {
+  label: string;
+  types: readonly { id: string; label: string }[];
+}[] = [
+  {
+    label: "General",
+    types: [
+      { id: "general", label: "General" },
+      { id: "system_design", label: "System Design" },
+      { id: "frontend", label: "Frontend" },
+      { id: "sql", label: "SQL" },
+      { id: "behavioral", label: "Behavioral" },
+    ],
+  },
+  {
+    label: "DSA",
+    types: [
+      { id: "dsa", label: "DSA / Algorithms" },
+    ],
+  },
+];
+
+/** Flat, backwards-compatible list of every existing interview type. */
+export const INTERVIEW_TYPES: readonly { id: string; label: string }[] = [
+  ...INTERVIEW_TYPE_GROUPS.flatMap((g) => g.types),
 ];
 
 const LANGUAGES = [
@@ -41,18 +69,53 @@ const PROVIDERS = [
     label: "Groq",
     docsUrl: "https://console.groq.com/keys",
   },
+  {
+    id: "openrouter" as ProviderName,
+    label: "OpenRouter (primary gateway)",
+    docsUrl: "https://openrouter.ai/keys",
+  },
+  {
+    id: "nvidia" as ProviderName,
+    label: "NVIDIA (direct NIM)",
+    docsUrl: "https://build.nvidia.com",
+  },
 ];
 
-const WHISPER_MODELS = [
-  { id: "Xenova/whisper-tiny.en", label: "Tiny (English-only, fastest)" },
-  { id: "Xenova/whisper-base.en", label: "Base (English-only, balanced)" },
-  { id: "Xenova/whisper-small.en", label: "Small (English-only, accurate)" },
-  { id: "Xenova/whisper-tiny", label: "Tiny (Multilingual)" },
-  { id: "Xenova/whisper-base", label: "Base (Multilingual)" },
-  { id: "Xenova/whisper-small", label: "Small (Multilingual)" },
+/**
+ * The OpenRouter free router.
+ *
+ * `openrouter/free` is NOT a model — OpenRouter resolves it to a concrete
+ * available free model on every request. It is presented separately so it is
+ * never mistaken for a fixed, selectable model.
+ */
+const OPENROUTER_FREE_OPTION = {
+  value: "openrouter/free",
+  label: "OpenRouter Free (auto-selects a free model)",
+};
+
+// Moonshine ONNX repos (transformers.js v3). Moonshine is purpose-built for
+// real-time / on-device ASR — much faster than Whisper at the short chunks a
+// live interview produces, and it is what powers the live interim transcript.
+/** Shared styling for the dev-only screen-visibility segmented control. */
+const VIS_ACTIVE =
+  "px-4 py-1.5 text-[10px] font-mono transition-colors bg-white/20 text-white";
+const VIS_INACTIVE =
+  "px-4 py-1.5 text-[10px] font-mono transition-colors bg-transparent text-white/40 hover:bg-white/[0.06]";
+
+const ASR_MODELS = [
+  {
+    id: "onnx-community/moonshine-tiny-ONNX",
+    label: "Moonshine Tiny (fastest)",
+  },
+  {
+    id: "onnx-community/moonshine-base-ONNX",
+    label: "Moonshine Base (balanced)",
+  },
 ];
 
 const SHORTCUTS = [
+  { label: "Start / Stop Interview", keys: ["Ctrl", "I"] },
+  { label: "Next Question", keys: ["Ctrl", "N"] },
   { label: "Ask AI", keys: ["Ctrl", "↵"] },
   { label: "Start Over", keys: ["Ctrl", "G"] },
   { label: "Screenshot", keys: ["Ctrl", "H"] },
@@ -63,6 +126,9 @@ const SHORTCUTS = [
   { label: "Move Right", keys: ["Ctrl", "→"] },
 ];
 
+/** Any two global actions sharing a key. Empty in a healthy build. */
+const SHORTCUT_CONFLICTS = findShortcutConflicts(INTERVIEW_SHORTCUTS);
+
 interface SettingsPanelProps {
   onClose: () => void;
 }
@@ -71,9 +137,95 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({ onClose }) => {
   const { settings, updateSettings, setApiKey } = useStore();
   const [showKey, setShowKey] = useState(false);
 
+  // Models for the active provider. Starts from the curated fallback list and
+  // is upgraded to the provider's live list as soon as we have an API key.
+  const [availableModels, setAvailableModels] = useState<string[]>([]);
+  const [modelsLoading, setModelsLoading] = useState(false);
+
+  const activeProviderName = settings.activeProvider;
+  const apiKeyForProvider = settings.apiKeys[activeProviderName] ?? "";
+  // Per-provider model — never a shared one, so failover can't cross models.
+  const activeModelForProvider = settings.models?.[activeProviderName] ?? "";
+  const setModelForProvider = (model: string) =>
+    updateSettings({
+      models: { ...settings.models, [activeProviderName]: model },
+    });
+  const failoverChain = (settings.providerOrder ?? [])
+    .filter((p) => (settings.apiKeys[p] ?? "").trim())
+    .map((p) => PROVIDERS.find((x) => x.id === p)?.label ?? p);
+
+  // ── Interview answer chain (ordered, independently toggleable) ──────────
+  // OpenRouter is the primary gateway; Groq / NVIDIA / Gemini are independent
+  // secondaries that Ghostly calls directly. Toggle a provider off to drop it
+  // from the chain; drag order is not needed because OpenRouter is always
+  // first when it is enabled.
+  const chainOrder = settings.providerOrder ?? [];
+  const isInChain = (p: ProviderName) => chainOrder.includes(p);
+  const hasKey = (p: ProviderName) => Boolean((settings.apiKeys[p] ?? "").trim());
+  const toggleInChain = (p: ProviderName) => {
+    const without = chainOrder.filter((x) => x !== p);
+    const withIt = isInChain(p)
+      ? without
+      : p === "openrouter"
+        ? [p, ...without]
+        : [...without, p];
+    updateSettings({ providerOrder: withIt });
+  };
+
   // Microphone selection state
   const [mics, setMics] = useState<MediaDeviceInfo[]>([]);
   const [micDropdownOpen, setMicDropdownOpen] = useState(false);
+  // ── Dev-only screen visibility ──────────────────────────────────────
+  // Runtime-only: deliberately NOT in the settings store, so nothing is
+  // persisted and a restart always returns to `hidden`.
+  const [visibility, setVisibility] = useState<"visible" | "hidden">("hidden");
+
+  const applyVisibility = async (mode: "visible" | "hidden") => {
+    const res = await window.ghostly.setVisibility(mode);
+    // Adopt the mode the MAIN process says took effect, not the one we asked
+    // for — a packaged build refuses, and the UI must not lie about it.
+    setVisibility(res.mode);
+  };
+
+  // ── Groq Whisper ASR key (dev-only comparison) ──────────────────────
+  // The key is NEVER held in the settings store. It is typed into a local
+  // draft, sent straight to the main process, and only a boolean comes back.
+  const [groqKeyDraft, setGroqKeyDraft] = useState("");
+  const [groqKeyConfigured, setGroqKeyConfigured] = useState(false);
+  const [groqKeySaving, setGroqKeySaving] = useState(false);
+
+  useEffect(() => {
+    let alive = true;
+    void window.ghostly.groqAsrHasKey().then((v) => {
+      if (alive) setGroqKeyConfigured(v);
+    });
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  const saveGroqKey = async () => {
+    if (!groqKeyDraft.trim()) return;
+    setGroqKeySaving(true);
+    try {
+      const res = await window.ghostly.groqSetKey(groqKeyDraft);
+      setGroqKeyConfigured(res.configured);
+      setGroqKeyDraft("");
+    } finally {
+      setGroqKeySaving(false);
+    }
+  };
+
+  const clearGroqKey = async () => {
+    setGroqKeySaving(true);
+    try {
+      const res = await window.ghostly.groqSetKey("");
+      setGroqKeyConfigured(res.configured);
+    } finally {
+      setGroqKeySaving(false);
+    }
+  };
+
   const micDropdownRef = useRef<HTMLDivElement>(null);
 
   // Fetch microphones
@@ -134,13 +286,80 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({ onClose }) => {
     return () => clearTimeout(timer);
   }, [settings]);
 
+  // Resolve the model list whenever the provider or its key changes.
+  useEffect(() => {
+    let cancelled = false;
+    const provider = getProvider(activeProviderName);
+    const fallback = provider ? provider.listModels() : [];
+    setAvailableModels(fallback);
+
+    if (
+      !provider ||
+      typeof provider.fetchModels !== "function" ||
+      !apiKeyForProvider.trim()
+    ) {
+      return;
+    }
+
+    setModelsLoading(true);
+    provider
+      .fetchModels(apiKeyForProvider)
+      .then((models) => {
+        if (cancelled || models.length === 0) return;
+        setAvailableModels(models);
+        // Auto-heal a stale selection (e.g. a model the provider retired) — for
+        // THIS provider only.
+        const current = useStore.getState().settings.models?.[activeProviderName];
+        if (!current || !models.includes(current)) {
+          updateSettings({
+            models: { ...useStore.getState().settings.models, [activeProviderName]: models[0] },
+          });
+        }
+      })
+      .catch((err) => {
+        // Live discovery is best-effort; the fallback list stays in place.
+        console.warn(
+          `[Ghostly] Could not fetch live models for ${activeProviderName}:`,
+          err,
+        );
+      })
+      .finally(() => {
+        if (!cancelled) setModelsLoading(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+    // The stored model is intentionally omitted from the deps: including it
+    // would refetch on every auto-heal. The heal above reads it at fetch time.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeProviderName, apiKeyForProvider, updateSettings]);
+
   const handleProviderChange = (id: ProviderName) => {
     const provider = getProvider(id);
-    const models = provider.listModels();
-    updateSettings({ activeProvider: id, activeModel: models[0] });
+    const models = provider ? provider.listModels() : [];
+    // Only ever fills in this provider's own slot.
+    updateSettings({
+      activeProvider: id,
+      models: {
+        ...settings.models,
+        [id]: settings.models?.[id] || models[0] || "",
+      },
+    });
   };
 
-  const activeModels = getProvider(settings.activeProvider).listModels();
+  const activeModels = availableModels;
+  const isOpenRouterActive = settings.activeProvider === "openrouter";
+  const isOpenRouterFree = isOpenRouterActive && activeModelForProvider === OPENROUTER_FREE_OPTION.value;
+
+  // Live discovery returns the whole catalog; for free mode that list would be
+  // misleading because we never pick from it ourselves — OpenRouter does.
+  const modelOptions = isOpenRouterActive
+    ? [
+        OPENROUTER_FREE_OPTION.value,
+        ...availableModels.filter((m) => m !== OPENROUTER_FREE_OPTION.value),
+      ]
+    : availableModels;
 
   return (
     <div
@@ -165,7 +384,7 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({ onClose }) => {
           shadow-2xl shadow-black/60
         "
         onClick={(e) => e.stopPropagation()}
-        style={{ pointerEvents: "auto" }}
+        style={{ pointerEvents: "auto", WebkitAppRegion: "no-drag" } as React.CSSProperties}
       >
         {/* Header */}
         <div className="flex items-center justify-between mb-5">
@@ -229,20 +448,92 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({ onClose }) => {
         {/* Model */}
         <Section label="Model">
           <select
-            value={settings.activeModel}
-            onChange={(e) => updateSettings({ activeModel: e.target.value })}
+            value={activeModelForProvider}
+            onChange={(e) => setModelForProvider(e.target.value)}
             className="settings-select"
           >
-            {activeModels.map((m) => (
+            {modelOptions.map((m) => (
               <option key={m} value={m}>
-                {m}
+                {m === OPENROUTER_FREE_OPTION.value ? OPENROUTER_FREE_OPTION.label : m}
               </option>
             ))}
           </select>
+          <p className="text-[9px] text-white/30 mt-1">
+            {isOpenRouterFree
+              ? "OpenRouter Free is a ROUTER, not a model — OpenRouter picks whichever free model is available for each request. The live model and backend are shown in the overlay and in the log."
+              : modelsLoading
+                ? "Checking available models…"
+                : apiKeyForProvider.trim()
+                  ? "Models available to your API key."
+                  : "Add an API key to load models available to your account."}
+          </p>
+          <p className="text-[9px] text-white/25 mt-1">
+            Saved per provider — changing provider keeps its own model.
+          </p>
+          <p className="text-[9px] text-white/25 mt-1">
+            Live interview answers try:{" "}
+            {failoverChain.length > 0
+              ? failoverChain.join(" → ")
+              : "add an API key for OpenRouter"}
+            . An error, timeout or empty reply falls back to the next one — but
+            never once answer text is already on screen.
+          </p>
         </Section>
 
-        {/* Output Language (Interview Type) */}
-        <Section label="Output Language">
+        {/* Interview Answer Chain — which providers are eligible, in order */}
+        <Section label="Interview Answer Chain">
+          <div className="flex flex-col gap-1">
+            {INTERVIEW_PROVIDER_ORDER.map((p) => {
+              const on = isInChain(p);
+              const keyed = hasKey(p);
+              const isPrimary = p === "openrouter";
+              return (
+                <button
+                  key={p}
+                  type="button"
+                  role="switch"
+                  aria-checked={on}
+                  onClick={() => toggleInChain(p)}
+                  className="w-full flex items-center justify-between gap-2 bg-white/[0.04] hover:bg-white/[0.08] border border-white/[0.08] rounded-lg px-2.5 py-1.5 text-[10px] font-mono text-white/75 outline-none cursor-pointer transition-colors"
+                >
+                  <span className="flex items-center gap-1.5 truncate text-left">
+                    <span
+                      className={`w-1.5 h-1.5 rounded-full flex-none ${
+                        on && keyed
+                          ? "bg-emerald-400"
+                          : on
+                            ? "bg-amber-400"
+                            : "bg-white/20"
+                      }`}
+                    />
+                    <span className="truncate">
+                      {PROVIDERS.find((x) => x.id === p)?.label ?? p}
+                    </span>
+                    {isPrimary && (
+                      <span className="text-[8px] text-accent/70 flex-none">
+                        primary
+                      </span>
+                    )}
+                  </span>
+                  <span className="flex-none text-[9px] text-white/35">
+                    {!keyed
+                      ? "no key · skipped"
+                      : on
+                        ? "ready"
+                        : "off · skipped"}
+                  </span>
+                </button>
+              );
+            })}
+          </div>
+          <p className="text-[9px] text-white/30 mt-1">
+            Tried top to bottom. A provider is skipped when it has no API key or is
+            switched off here — the startup log prints the reason for each one.
+          </p>
+        </Section>
+
+        {/* Interview Type — top-level General / DSA groups (existing types unchanged). */}
+        <Section label="Interview Type">
           <select
             value={settings.interviewType}
             onChange={(e) =>
@@ -250,12 +541,47 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({ onClose }) => {
             }
             className="settings-select"
           >
-            {INTERVIEW_TYPES.map((t) => (
-              <option key={t.id} value={t.id}>
-                {t.label}
-              </option>
+            {INTERVIEW_TYPE_GROUPS.map((group) => (
+              <optgroup key={group.label} label={group.label}>
+                {group.types.map((t) => (
+                  <option key={t.id} value={t.id}>
+                    {t.label}
+                  </option>
+                ))}
+              </optgroup>
             ))}
           </select>
+        </Section>
+
+        {/* Live Answering */}
+        <Section label="Live Answering">
+          <button
+            type="button"
+            role="switch"
+            aria-checked={!!settings.autoAnswer}
+            onClick={() => updateSettings({ autoAnswer: !settings.autoAnswer })}
+            className="w-full flex items-center justify-between gap-3 bg-white/[0.06] hover:bg-white/[0.12] border border-white/[0.12] rounded-lg px-3 py-2.5 text-[11px] font-mono text-white/80 outline-none cursor-pointer transition-colors"
+          >
+            <span className="truncate text-left">
+              Auto-answer when a question ends
+            </span>
+            <span
+              className={`flex-none w-8 h-4 rounded-full p-0.5 transition-colors ${
+                settings.autoAnswer ? "bg-accent/70" : "bg-white/[0.12]"
+              }`}
+            >
+              <span
+                className={`block w-3 h-3 rounded-full bg-white transition-transform ${
+                  settings.autoAnswer ? "translate-x-4" : "translate-x-0"
+                }`}
+              />
+            </span>
+          </button>
+          <p className="text-[9px] text-white/30 mt-1">
+            Answers fire on their own the moment the interviewer stops talking on
+            a clear question. Incomplete or conversational speech is still
+            ignored (WAIT). Ctrl+Enter / Ask Copilot keep working either way.
+          </p>
         </Section>
 
         {/* Code Language */}
@@ -275,23 +601,169 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({ onClose }) => {
           </select>
         </Section>
 
-        {/* Whisper Model */}
-        <Section label="Whisper Model">
+        {/* Transcription Model */}
+        <Section label="Transcription Model">
           <select
-            value={settings.whisperModel ?? "Xenova/whisper-base.en"}
+            value={settings.whisperModel ?? "onnx-community/moonshine-base-ONNX"}
             onChange={(e) => updateSettings({ whisperModel: e.target.value })}
             className="settings-select"
           >
-            {WHISPER_MODELS.map((m) => (
+            {ASR_MODELS.map((m) => (
               <option key={m.id} value={m.id}>
                 {m.label}
               </option>
             ))}
           </select>
           <p className="text-[9px] text-white/30 mt-1">
-            Changing the model will reload the AI engine.
+            Moonshine runs locally and streams text as the interviewer speaks.
+            Switching reloads the engine (~first run downloads the model).
           </p>
         </Section>
+
+        {/* ── Screen visibility (dev/test only) ────────────────────────── */}
+        {/*
+         * Lets Ghostly be screenshotted and screen-shared while testing.
+         * Dev builds only, and runtime-only: it is not part of the persisted
+         * settings, so a restart always comes back hidden. Both modes route
+         * through the SAME Win32 `SetWindowDisplayAffinity` mechanism — there
+         * is no second capture-exclusion path.
+         */}
+        {import.meta.env.DEV && (
+          <Section label="Screen Visibility (dev only)">
+            <div className="inline-flex rounded-lg overflow-hidden border border-white/[0.12]">
+              <button
+                type="button"
+                onClick={() => void applyVisibility("visible")}
+                aria-pressed={visibility === "visible"}
+                className={visibility === "visible" ? VIS_ACTIVE : VIS_INACTIVE}
+              >
+                Visible
+              </button>
+              <button
+                type="button"
+                onClick={() => void applyVisibility("hidden")}
+                aria-pressed={visibility === "hidden"}
+                className={visibility === "hidden" ? VIS_ACTIVE : VIS_INACTIVE}
+              >
+                Hidden
+              </button>
+            </div>
+            <p className="text-[9px] text-white/30 mt-1">
+              Visible lets Ghostly appear in screen capture. Hidden (default)
+              keeps it excluded. Resets on restart and never affects the
+              interview, audio or AI.
+            </p>
+          </Section>
+        )}
+
+        {/* ── Second ASR engine (optional, Deepgram) ──────────────────── */}
+        {/*
+         * Deepgram is a COMPARISON engine, not a replacement. The default
+         * engine (Moonshine, local) is untouched and fully functional without
+         * any key. Everything here is developer-only and is hidden outside a
+         * dev build.
+         */}
+        {import.meta.env.DEV && (
+          <Section label="ASR Comparison (dev only)">
+            <p className="text-[9px] text-white/30 mb-1">
+              Moonshine (local) is the default and always runs. The engines
+              below are COMPARISON-ONLY: the same captured audio is sent to
+              each, and results are shown side by side. They never reach the
+              AI, and failures never affect the interview.
+            </p>
+
+            <input
+              type="password"
+              value={settings.deepgramKey ?? ""}
+              onChange={(e) => updateSettings({ deepgramKey: e.target.value })}
+              placeholder="Deepgram API key (optional)"
+              className="settings-input w-full"
+              autoComplete="off"
+            />
+            <label className="flex items-center gap-2 mt-2 text-[10px] text-white/50 cursor-pointer select-none">
+              <input
+                type="checkbox"
+                checked={settings.asrCompareMode ?? false}
+                onChange={(e) =>
+                  updateSettings({ asrCompareMode: e.target.checked })
+                }
+              />
+              <span>Compare with Deepgram Nova-3</span>
+            </label>
+            <p className="text-[9px] text-white/30 mt-1">
+              Sends the same captured audio to Deepgram Nova-3. Costs one API
+              call per utterance. The key is stored on disk but is only ever
+              read by the main process, which hands the renderer a 30-second
+              token.
+            </p>
+
+            {/* ── Groq Whisper (comparison only) ─────────────────────── */}
+            <div className="mt-3 pt-3 border-t border-white/[0.06]">
+              <input
+                type="password"
+                value={groqKeyDraft}
+                onChange={(e) => setGroqKeyDraft(e.target.value)}
+                placeholder={
+                  groqKeyConfigured
+                    ? "Groq API key (configured — type to replace)"
+                    : "Groq API key (optional)"
+                }
+                className="settings-input w-full"
+                autoComplete="off"
+              />
+              <div className="flex items-center gap-2 mt-1.5">
+                <button
+                  type="button"
+                  onClick={() => void saveGroqKey()}
+                  disabled={!groqKeyDraft.trim() || groqKeySaving}
+                  className="px-2 py-1 text-[10px] rounded bg-white/10 hover:bg-white/20 disabled:opacity-30 text-white"
+                >
+                  Save key
+                </button>
+                {groqKeyConfigured && (
+                  <button
+                    type="button"
+                    onClick={() => void clearGroqKey()}
+                    disabled={groqKeySaving}
+                    className="px-2 py-1 text-[10px] rounded bg-white/5 hover:bg-white/10 disabled:opacity-30 text-white/70"
+                  >
+                    Clear
+                  </button>
+                )}
+                <span className="text-[9px] text-white/40">
+                  {groqKeyConfigured ? "key configured" : "no key"}
+                </span>
+              </div>
+
+              <label className="flex items-center gap-2 mt-2 text-[10px] text-white/50 cursor-pointer select-none">
+                <input
+                  type="checkbox"
+                  checked={settings.asrCompareGroq ?? false}
+                  onChange={(e) =>
+                    updateSettings({ asrCompareGroq: e.target.checked })
+                  }
+                />
+                <span>Compare with Groq Whisper</span>
+              </label>
+
+              <input
+                type="text"
+                value={settings.groqAsrModel ?? "whisper-large-v3"}
+                onChange={(e) =>
+                  updateSettings({ groqAsrModel: e.target.value })
+                }
+                placeholder="whisper-large-v3"
+                className="settings-input w-full mt-1.5"
+                autoComplete="off"
+              />
+              <p className="text-[9px] text-white/30 mt-1">
+                Sends the same captured audio to Groq Whisper
+                (whisper-large-v3). The key is stored in the main process only
+                and is never exposed to the app UI or bundled JavaScript.
+              </p>
+            </div>
+          </Section>
+        )}
 
         {/* Audio Input (Mic) */}
         <Section label="Audio Input (Mic)">
@@ -372,6 +844,17 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({ onClose }) => {
               <ShortcutRow key={s.label} label={s.label} keys={s.keys} />
             ))}
           </div>
+          {/* Surfaced rather than silently overwritten: if two actions were
+              ever assigned the same key, the user sees it here. */}
+          {SHORTCUT_CONFLICTS.length > 0 && (
+            <div className="mt-2 p-2 rounded-lg bg-red-500/10 border border-red-500/25">
+              {SHORTCUT_CONFLICTS.map((c) => (
+                <p key={c.accelerator} className="text-[10px] text-red-300/90 font-mono">
+                  Shortcut conflict: {c.accelerator} is assigned to {c.ids.join(" and ")}.
+                </p>
+              ))}
+            </div>
+          )}
         </div>
 
         {/* Bottom buttons */}

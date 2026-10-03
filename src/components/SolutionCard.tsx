@@ -148,7 +148,9 @@ export const SolutionCard: React.FC<SolutionCardProps> = ({
     [copiedBlock, isStreaming],
   );
 
-  if (!content) return null;
+  // Never render an empty card: a blank answer used to look like nothing
+  // happened at all. Whitespace-only counts as empty.
+  if (!content || !content.trim()) return null;
 
   return (
     <motion.div
