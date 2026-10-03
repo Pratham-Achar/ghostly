@@ -151,6 +151,14 @@ function rssMb() {
   return Math.round((process.memoryUsage().rss / 1048576) * 10) / 10;
 }
 
+/** Assert and hard-fail, so a broken smoke test can never report success. */
+function checkTrue(condition, label) {
+  if (!condition) {
+    throw new Error(`smoke assertion failed: ${label}`);
+  }
+  console.log(`  assert ok: ${label}`);
+}
+
 /** Report one WAV's format and duration. */
 function describeClip(clip) {
   const seconds = clip.samples.length / clip.sampleRate;
@@ -243,7 +251,80 @@ async function runViaUtilityProcess() {
     console.log(`rtf             : ${rtf.toFixed(3)}`);
   }
 
-  console.log("\n--- 4. teardown ---");
+  console.log("\n--- 4. diagnostics sampler (one real sample) ---");
+  // The production sampler reads SYSTEM memory, which only the main process
+  // can do — that is why it lives in `electron/parakeetDiagnostics.ts` rather
+  // than in the renderer. Exercised here so the numbers are known to emit.
+  //
+  // This file runs in Node and cannot require() a TypeScript source, so the
+  // REAL production module is bundled on the fly with esbuild (already present
+  // as a Vite dependency). Bundling rather than reimplementing matters: a copy
+  // of the sampler here would keep passing after the real one was deleted.
+  let startParakeetDiagnostics = null;
+  try {
+    const esbuild = require("esbuild");
+    const tmp = path.join(os.tmpdir(), "parakeet-diag-smoke.cjs");
+    esbuild.buildSync({
+      entryPoints: [path.join(PROJECT_ROOT, "electron", "parakeetDiagnostics.ts")],
+      bundle: true,
+      platform: "node",
+      format: "cjs",
+      outfile: tmp,
+      external: ["electron"],
+      logLevel: "silent",
+    });
+    ({ startParakeetDiagnostics } = require(tmp));
+  } catch (err) {
+    console.log(`  (could not bundle the diagnostics module: ${err.message})`);
+  }
+  let sample = null;
+  const diagHandle = startParakeetDiagnostics({
+    getHost: () => ({
+      getDiagnostics: () => ({
+        status: "ready",
+        loadMs: loaded.loadMs ?? null,
+        rssMb: decoded.rssMb ?? null,
+        decodeMs: decoded.decodeMs ?? null,
+        // Same computation the host makes: decode seconds / AUDIO seconds,
+        // including the 300 ms padding on each side. Divided by the sample
+        // RATE (16000), not by 1000 — using milliseconds here produced an
+        // RTF of 0.006 instead of the real ~0.09.
+        rtf: decoded.decodeMs
+          ? decoded.decodeMs / 1000 / (padded.length / 16000)
+          : null,
+        queued: 0,
+        inFlight: 0,
+        consecutiveFailures: 0,
+      }),
+    }),
+    log: (line) => {
+      if (line.includes("baseline") === false && sample === null) sample = line;
+      console.log(line);
+    },
+    // Fire once instead of waiting the full 10 s; the cadence itself is
+    // asserted in verify-parakeet-diagnostics.mts with an injected clock.
+    setInterval: (fn) => {
+      setTimeout(fn, 0);
+      return 1;
+    },
+    clearInterval: () => {},
+  });
+  // The stub timer fires on the macrotask queue, so the sample has to be given
+  // a turn before `stop()` is called — otherwise the assertion races the
+  // callback and the run fails even though the sampler is fine.
+  await new Promise((r) => setTimeout(r, 50));
+  diagHandle.stop();
+  if (startParakeetDiagnostics) {
+    checkTrue(sample !== null && sample.includes("childRss="), "diagnostics sample emitted");
+    checkTrue(
+      sample !== null && !/blob:|text=/.test(sample),
+      "diagnostics sample carries no transcript or audio",
+    );
+  } else {
+    console.log("  SKIPPED: diagnostics sampler could not be bundled");
+  }
+
+  console.log("\n--- 5. teardown ---");
   child.kill();
   await new Promise((r) => setTimeout(r, 300));
   console.log("child killed");

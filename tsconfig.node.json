@@ -20,6 +20,7 @@
     "electron/**/*.ts",
     "electron.vite.config.ts",
     "src/lib/groqWhisper.ts",
-    "src/lib/parakeetHost.ts"
+    "src/lib/parakeetHost.ts",
+    "src/lib/systemMemory.ts"
   ]
 }

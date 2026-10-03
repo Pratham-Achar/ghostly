@@ -229,6 +229,15 @@ export class ParakeetHost {
   private idleTimer: unknown = null;
   private lastLoadMs: number | null = null;
   private lastRssMb: number | null = null;
+  /**
+   * Latency of the most recent decode, and its RTF.
+   *
+   * Kept separate from `lastRssMb` because the memory figure is about the
+   * PROCESS while these are about the WORK: for a memory-pressure measurement
+   * you need both, and they answer different questions.
+   */
+  private lastDecodeMs: number | null = null;
+  private lastRtf: number | null = null;
   private disposed = false;
 
   private readonly now: () => number;
@@ -252,6 +261,8 @@ export class ParakeetHost {
       status: this.status,
       loadMs: this.lastLoadMs,
       rssMb: this.lastRssMb,
+      decodeMs: this.lastDecodeMs,
+      rtf: this.lastRtf,
       queued: this.queue.length,
       inFlight: this.pending.size,
       consecutiveFailures: this.consecutiveFailures,
@@ -405,6 +416,12 @@ export class ParakeetHost {
       const result: ParakeetHostResult = r.ok
         ? { ...r, rtf: (r.decodeMs ?? 0) / 1000 / seconds }
         : r;
+      // Record latency only for a real decode, so a failed request cannot
+      // overwrite the last known-good measurement with a meaningless zero.
+      if (result.ok && typeof result.decodeMs === "number") {
+        this.lastDecodeMs = result.decodeMs;
+        this.lastRtf = result.rtf ?? null;
+      }
       next.resolve(result);
       // Start the idle countdown only once nothing is left to do, so an active
       // interview never has the model yanked out from under it.

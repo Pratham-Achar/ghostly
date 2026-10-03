@@ -11,6 +11,10 @@ import {
   type ParakeetHostRequest,
   type ParakeetModelStatus,
 } from "../src/lib/parakeetHost";
+import {
+  startParakeetDiagnostics,
+  type ParakeetDiagnosticsHandle,
+} from "./parakeetDiagnostics";
 
 /**
  * Parakeet comparison host — MAIN PROCESS ONLY.
@@ -99,6 +103,15 @@ export function createParakeetHost(options: {
 let host: ParakeetHost | null = null;
 
 /**
+ * The live memory/latency sampler, started on load and stopped on unload.
+ *
+ * Scoped to the model's lifetime on purpose: a sampler that ran for the whole
+ * app session would keep reporting after the model was gone, which is exactly
+ * when those numbers stop being interpretable.
+ */
+let diagnostics: ParakeetDiagnosticsHandle | null = null;
+
+/**
  * Register the dev-only Parakeet IPC surface.
  *
  * Every handler is wrapped so a failure becomes a value. Nothing in here may
@@ -136,6 +149,13 @@ export function registerParakeetHandlers(options: {
         return { ok: false, code: "disabled", message: "Parakeet comparison is off" };
       }
       const result = await getHost().load();
+      if (result.ok && !diagnostics) {
+        // Sampled every 10 s for the lifetime of the model: system memory
+        // (available, plus the delta since the model loaded), the child's own
+        // RSS, and the latest decode ms / RTF. Numbers only — never a
+        // transcript, never audio.
+        diagnostics = startParakeetDiagnostics({ getHost });
+      }
       return { ...result, status: getHost().getStatus() };
     } catch (err) {
       return {
@@ -149,6 +169,10 @@ export function registerParakeetHandlers(options: {
   // Release the model, called on Stop Interview.
   ipcMain.handle("parakeet:unload", (): ParakeetIpcOutcome => {
     try {
+      // Stop sampling BEFORE releasing the model, so the final line still
+      // reflects a loaded model rather than a just-freed one.
+      diagnostics?.stop();
+      diagnostics = null;
       host?.unload();
       return { ok: true };
     } catch (err) {
@@ -227,6 +251,12 @@ export function registerParakeetHandlers(options: {
 
 /** Test seam: drop the host without leaving a utility process running. */
 export function __resetParakeetHostForTests(): void {
+  try {
+    diagnostics?.stop();
+  } catch {
+    /* already gone */
+  }
+  diagnostics = null;
   try {
     host?.dispose();
   } catch {
