@@ -70,6 +70,23 @@ contextBridge.exposeInMainWorld("ghostly", {
     message?: string;
   }> => ipcRenderer.invoke("asr:write-export", { json }),
 
+  // ── Dev-only: save captured debug clips ─────────────────────────────
+  // Writes the session's WAV clips plus the comparison JSON into a
+  // timestamped folder under `debug-audio/`. Called ONLY by the explicit
+  // "Save all debug clips" button; no capture path triggers it. The folder
+  // name is validated in the main process and cannot be used to write
+  // anywhere else.
+  saveDebugClips: (payload: {
+    session?: string;
+    files: Array<{ name: string; data: Uint8Array }>;
+    exportJson?: string;
+  }): Promise<{
+    ok: boolean;
+    dir?: string;
+    written?: number;
+    message?: string;
+  }> => ipcRenderer.invoke("asr:save-debug-clips", payload),
+
   // ── Parakeet (DEVELOPMENT COMPARISON ENGINE ONLY) ─────────────────────
   //
   // Deliberately narrow: the renderer may ask for the model status, ask for the

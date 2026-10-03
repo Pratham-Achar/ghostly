@@ -112,6 +112,20 @@ interface Window {
       message?: string;
     }>;
 
+    // ── Dev-only: save captured debug clips ───────────────────────────
+    // Writes WAV clips + the comparison JSON to `debug-audio/<session>/`.
+    // User-triggered only; nothing is written automatically or uploaded.
+    saveDebugClips: (payload: {
+      session?: string;
+      files: Array<{ name: string; data: Uint8Array }>;
+      exportJson?: string;
+    }) => Promise<{
+      ok: boolean;
+      dir?: string;
+      written?: number;
+      message?: string;
+    }>;
+
     // ── Parakeet (DEVELOPMENT COMPARISON ENGINE ONLY) ────────────────
     //
     // Mirrors the ASR-engine pattern: the renderer hands over audio it has

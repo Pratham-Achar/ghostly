@@ -4,6 +4,7 @@ import { registerDeepgramHandlers } from "./deepgram";
 import { registerGroqAsrHandlers } from "./groqAsr";
 import { registerParakeetHandlers } from "./parakeetAsr";
 import { registerAsrExportHandlers } from "./asrExport";
+import { registerDebugClipHandlers } from "./debugClipWriter";
 import Store from "electron-store";
 
 const store = new Store({
@@ -134,6 +135,12 @@ export function registerIpcHandlers(): void {
   // Groq Whisper ASR (comparison only). The long-lived key never crosses the
   // IPC boundary — the main process performs the request. See electron/groqAsr.ts.
   registerGroqAsrHandlers(store);
+
+  // Dev-only: write captured debug clips + the comparison JSON into a
+  // timestamped `debug-audio/<session>/` folder (gitignored). Only ever called
+  // by the explicit "Save all debug clips" button — nothing is written
+  // automatically, and nothing is uploaded.
+  registerDebugClipHandlers();
 
   // Dev-only: write the `asrComparisons` export to JSON for offline
   // benchmarking. Moonshine runs in a Web Worker and cannot be driven from the

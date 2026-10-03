@@ -3,6 +3,11 @@ import { useInterviewAudio } from "../hooks/useInterviewAudio";
 import { useStore } from "../store/useStore";
 import { getParakeetStatus, type ParakeetStatus } from "../lib/parakeetClient";
 import { serializeAsrComparisonExport } from "../lib/asrComparisonExport";
+import {
+  debugClipFileName,
+  describeSessionFolder,
+  sessionFolderName,
+} from "../lib/debugClipSave";
 import type { InterviewTurn } from "../lib/interviewAgent";
 
 interface InterviewModalProps {
@@ -596,8 +601,16 @@ export const InterviewModal: React.FC<InterviewModalProps> = ({
                   className="accent-white/60"
                 />
                 <span>
-                  Record debug WAV (local only — never uploaded or written to
-                  disk)
+                  Record debug WAV — kept in memory; written to disk only when
+                  you click &quot;Save all debug clips&quot;
+                  <span className="block text-white/30 mt-0.5">
+                    Files go to{" "}
+                    <span className="text-white/45">
+                      {describeSessionFolder(new Date())}
+                    </span>{" "}
+                    in the project folder. That directory is gitignored.
+                    Nothing is ever uploaded.
+                  </span>
                 </span>
               </label>
 
@@ -606,6 +619,68 @@ export const InterviewModal: React.FC<InterviewModalProps> = ({
                   <div className="text-[9px] text-white/40 uppercase tracking-wider font-semibold">
                     Raw Audio:
                   </div>
+                  {/* ── Save all debug clips ────────────────────────────
+                      The ONLY thing in this feature that writes to disk, and
+                      only when clicked. Each clip is named
+                      `<phraseId>_<audioSeconds>s.wav` so it joins exactly to the
+                      same row in the comparison JSON written beside it — no
+                      duration guessing is needed anywhere. */}
+                  <button
+                    onClick={() => {
+                      const withBytes = debugAudios.filter(
+                        (d) => d.blob && typeof d.phraseId === "number",
+                      );
+                      if (withBytes.length === 0) {
+                        addLog(
+                          "No clips with a phraseId to save. Record with the checkbox ticked, then try again.",
+                        );
+                        return;
+                      }
+                      const skipped = debugAudios.length - withBytes.length;
+                      addLog(`Saving ${withBytes.length} clip(s)…`);
+                      void Promise.all(
+                        withBytes.map(async (clip) => ({
+                          name: debugClipFileName(
+                            clip.phraseId as number,
+                            clip.audioSeconds ?? 0,
+                          ),
+                          data: new Uint8Array(
+                            await (clip.blob as Blob).arrayBuffer(),
+                          ),
+                        })),
+                      )
+                        .then((files) =>
+                          window.ghostly.saveDebugClips({
+                            session: sessionFolderName(),
+                            files,
+                            // The comparison export travels with the clips so
+                            // one folder is self-contained: every WAV and the
+                            // text measured for it share a phraseId.
+                            exportJson: serializeAsrComparisonExport(
+                              useStore.getState().asrComparisons,
+                            ),
+                          }),
+                        )
+                        .then((result) => {
+                          if (result.ok && result.dir) {
+                            addLog(
+                              `Saved ${result.written} clip(s) + comparison-export.json to ${result.dir}` +
+                                (skipped > 0 ? ` (${skipped} skipped: no phraseId)` : ""),
+                            );
+                            console.log(`[ASR-CLIPS] ${result.dir}`);
+                          } else {
+                            addLog(`Save failed: ${result.message ?? "unknown error"}`);
+                          }
+                        })
+                        .catch(() =>
+                          addLog("Save failed: could not reach the main process."),
+                        );
+                    }}
+                    className="px-2 py-1 rounded bg-white/[0.08] hover:bg-white/[0.14] text-white/75 text-[9px] transition-colors"
+                  >
+                    Save all debug clips ({debugAudios.length}) →{" "}
+                    {describeSessionFolder(new Date())}
+                  </button>
                   {debugAudios.map((da, i) => (
                     <div
                       key={i}
@@ -613,6 +688,12 @@ export const InterviewModal: React.FC<InterviewModalProps> = ({
                     >
                       <div className="text-[9px] text-white/60 mb-1">
                         {da.name}
+                        {typeof da.phraseId === "number" && (
+                          <span className="text-white/35">
+                            {" "}
+                            · phraseId {da.phraseId}
+                          </span>
+                        )}
                       </div>
                       <audio
                         controls

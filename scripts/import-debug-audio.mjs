@@ -288,7 +288,7 @@ confident, meaningless WER, which is worse than no measurement.
         skipped++;
         continue;
       }
-      registerStub(stubs, existingIds, id);
+      registerStub(stubs, existingIds, id, phraseIdFromFileName(name));
       imported++;
       continue;
     }
@@ -307,7 +307,7 @@ confident, meaningless WER, which is worse than no measurement.
       mkdirSyncSafe(FIXTURE_DIR);
       copyFileSyncSafe(from, path.join(FIXTURE_DIR, `${id}.wav`));
     }
-    registerStub(stubs, existingIds, id);
+    registerStub(stubs, existingIds, id, phraseIdFromFileName(name));
     imported++;
   }
 
@@ -344,22 +344,37 @@ Then:
  * because that is what the manifest schema requires — using a different name
  * here produced a manifest that failed to parse with a misleading error.
  */
-function registerStub(stubs, existingIds, id) {
+function registerStub(stubs, existingIds, id, phraseId) {
   if (existingIds.has(id)) return;
   stubs.push({
     id,
     file: `${id}.wav`,
     // FILL THIS IN with the exact spoken words.
     reference: "",
-    // FILL THIS IN with the phraseId from the exported comparison JSON, so this
-    // clip is joined to the transcript the live session measured for it. Left
-    // empty, the clip can only be matched by duration, which is ambiguous
-    // whenever two segments round to the same length — and a wrong pairing
-    // produces a confident, meaningless WER.
-    phraseId: null,
+    // Carried over from the filename when the clip came from "Save all debug
+    // clips", which names files `<phraseId>_<audioSeconds>s.wav`. That makes the
+    // join to the exported comparison JSON EXACT, so no duration guessing is
+    // needed. Left null only for clips named some other way — and a null
+    // phraseId means the clip can only be matched by duration later, which is
+    // ambiguous whenever two segments round to the same length.
+    phraseId: phraseId ?? null,
+    ...(phraseId === null || phraseId === undefined
+      ? { notes: "real capture; reference text and phraseId still need filling in" }
+      : { notes: `real capture; phraseId ${phraseId} from filename` }),
     technicalTerms: [],
-    notes: "real capture; reference text and phraseId still need filling in",
   });
+}
+
+/**
+ * Pull the phraseId out of a filename written by "Save all debug clips".
+ *
+ * Returns null for anything else, so a clip saved by hand is imported WITHOUT a
+ * phraseId rather than being given a wrong one — a confidently wrong join key is
+ * worse than no join key.
+ */
+function phraseIdFromFileName(fileName) {
+  const match = /^(\d+)_[\d.]+s\.wav$/i.exec(path.basename(fileName));
+  return match ? Number(match[1]) : null;
 }
 
 function mkdirSyncSafe(dir) {

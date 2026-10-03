@@ -55,6 +55,7 @@ import {
   type DrainResult,
   type FlushTransport,
 } from "../lib/asrDrain";
+import type { DebugClip } from "../lib/debugClipSave";
 
 export type ChatMessage = TranscriptMessage;
 
@@ -156,9 +157,7 @@ export function useInterviewAudio() {
   // We'll store debug audio blobs in logs too, so if text fails, you still get
   // the audio. Populated ONLY while the dev-only WAV dump is explicitly
   // enabled (see `lib/debugWav.ts`) — never in a production build.
-  const [debugAudios, setDebugAudios] = useState<
-    { name: string; url: string }[]
-  >([]);
+  const [debugAudios, setDebugAudios] = useState<DebugClip[]>([]);
   const [debugWavOn, setDebugWavOn] = useState(false);
 
   const workerRef = useRef<Worker | null>(null);
@@ -179,9 +178,23 @@ export function useInterviewAudio() {
     ]);
   }, []);
 
-  const addDebugAudio = useCallback((name: string, url: string) => {
-    setDebugAudios((prev) => [...prev.slice(-9), { name, url }]);
-  }, []);
+  const addDebugAudio = useCallback(
+    (
+      name: string,
+      url: string,
+      blob?: Blob,
+      phraseId?: number,
+      audioSeconds?: number,
+    ) => {
+      setDebugAudios((prev) =>
+        [
+          ...prev.slice(-29),
+          { name, url, blob, phraseId, audioSeconds },
+        ],
+      );
+    },
+    [],
+  );
 
   // Tracks whether non-silent audio is currently reaching us, so we log the
   // transition once (instead of spamming a level reading every frame).
@@ -1101,7 +1114,13 @@ function setupVADWorklet(
   sourceName: "mic" | "system",
   workerRef: React.MutableRefObject<Worker | null>,
   addLog: (msg: string) => void,
-  addDebugAudio: (name: string, url: string) => void,
+  addDebugAudio: (
+    name: string,
+    url: string,
+    blob?: Blob,
+    phraseId?: number,
+    audioSeconds?: number,
+  ) => void,
   onLevel: (sample: { rms: number; peak: number; speaking: boolean }) => void,
   onPhraseEnd: () => void,
   /**
@@ -1268,7 +1287,11 @@ function setupVADWorklet(
         const { blob, clipping } = float32ToWavWithClipping(downsampled, 16000);
         audioUrl = URL.createObjectURL(blob);
         const debugName = `${sourceName} - ${speechSeconds.toFixed(1)}s`;
-        addDebugAudio(debugName, audioUrl);
+        // The blob and the phraseId are carried through, not just the object
+        // URL. "Save all debug clips" has to write real WAV bytes under a name
+        // that joins to the comparison JSON, and a blob URL is neither: it
+        // cannot be recovered once the session ends, and it carries no id.
+        addDebugAudio(debugName, audioUrl, blob, phraseId, speechSeconds);
         const clippingNote = describeClipping(clipping);
         // Amplitude statistics only. Never the audio itself, never a path.
         console.log(
