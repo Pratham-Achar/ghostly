@@ -105,6 +105,12 @@ export interface GroqArgs {
   rounds: number;
   maxTokens: number;
   delayMs: number;
+  /**
+   * Write every answer to this path as JSON, so a later harness can re-measure
+   * REJECTION RULES against real model output instead of against question text.
+   * Measuring a rule on question text measures the wrong population.
+   */
+  dumpAnswers: string | null;
 }
 
 /**
@@ -120,6 +126,7 @@ export function parseArgs(argv: string[]): GroqArgs {
     rounds: 1,
     maxTokens: 1024,
     delayMs: DEFAULT_DELAY_MS,
+    dumpAnswers: null,
   };
   for (let i = 0; i < argv.length; i++) {
     if (argv[i] === "--models") {
@@ -137,6 +144,8 @@ export function parseArgs(argv: string[]): GroqArgs {
       out.maxTokens = Number(argv[++i]) || 1024;
     } else if (argv[i] === "--delay-ms") {
       out.delayMs = Math.max(0, Number(argv[++i]) || 0);
+    } else if (argv[i] === "--dump-answers") {
+      out.dumpAnswers = argv[++i] ?? null;
     }
   }
   return out;
@@ -579,6 +588,37 @@ export async function main(argv: string[]): Promise<number> {
           `${r.valid ? "valid" : `REJECTED ${r.reason}`}`,
       );
     }
+  }
+
+  // ── Answer dump ─────────────────────────────────────────────────────────
+  // Written AFTER the run so a measurement pass can be re-run against the same
+  // output without spending quota twice. Contains model output, which is not a
+  // secret but IS potentially user-visible text, so the path is always explicit
+  // and the file is never written by default.
+  if (args.dumpAnswers) {
+    const payload = {
+      generatedAt: new Date().toISOString(),
+      provider: "groq",
+      questions: QUESTIONS.map((q) => ({ id: q.id, text: q.text })),
+      answers: outcomes.flatMap((o) =>
+        o.rows.map((r) => {
+          const q = QUESTIONS.find((x) => x.id === r.questionId);
+          return {
+            model: o.model,
+            questionId: r.questionId,
+            question: q?.text ?? "",
+            answer: r.text,
+            valid: r.valid,
+            reason: r.reason,
+            firstTokenMs: r.firstTokenMs,
+            totalMs: r.totalMs,
+          };
+        }),
+      ),
+    };
+    const { writeFile } = await import("node:fs/promises");
+    await writeFile(args.dumpAnswers, JSON.stringify(payload, null, 2), "utf8");
+    console.log(`\nAnswers written to ${args.dumpAnswers}`);
   }
 
   console.log("\n=== summary ===");

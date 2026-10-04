@@ -821,6 +821,129 @@ export function detectAnswerArtifact(
 }
 
 /**
+ * ── SHADOW RULE (c): answer/question content-word overlap ───────────────────
+ *
+ * Computed on every answer and reported in the Debug latency report, but it
+ * NEVER REJECTS. It is instrumentation for a decision not yet made, because the
+ * rule is known to be able to reject a CORRECT answer: a good response often
+ * paraphrases rather than reuses the question's words, so
+ *
+ *   question: "What is difference between SQL and NoSQL databases?"
+ *   answer:   "One is relational with a fixed schema and joins, the other is
+ *              document-oriented and schemaless"
+ *
+ * shares ZERO content words and is correct. Shipping it as a rejection would
+ * trade a rare bad answer for a common good one.
+ *
+ * Two minimum-sample guards exist so a degenerate case cannot look like a
+ * finding: a one-content-word question ("What is Redis?" → just `redis`) and a
+ * one-word answer are both excluded from `wouldReject` rather than counted as
+ * zero-overlap evidence.
+ *
+ * Nothing here is a topic list. The word sets are derived from the two strings
+ * being compared, which is what keeps the rule topic-agnostic.
+ */
+export const SHADOW_MIN_QUESTION_WORDS = 2;
+export const SHADOW_MIN_ANSWER_WORDS = 3;
+
+export interface ShadowOverlap {
+  questionContentWords: number;
+  answerContentWords: number;
+  sharedContentWords: number;
+  /** shared / min(questionWords, answerWords), 0..1. Numeric only. */
+  overlapScore: number;
+  /** True when the rule WOULD have rejected. Reported, never acted on. */
+  wouldReject: boolean;
+  /** Why the rule abstained, when it did. Closed vocabulary, no text. */
+  abstained: "no-question" | "too-few-question-words" | "too-few-answer-words" | null;
+}
+
+/** Content words of a string: tokens longer than 2 chars, minus function words. */
+function contentWordSet(text: string): Set<string> {
+  const out = new Set<string>();
+  for (const w of tokenize(text)) {
+    if (w.length > 2 && !SHADOW_FUNCTION_WORDS.has(w)) out.add(w);
+  }
+  return out;
+}
+
+/**
+ * Function words excluded from the overlap comparison.
+ *
+ * Small and linguistic, not topical: every entry is a word that carries no
+ * subject matter. Deliberately does NOT contain technology names, so "redis"
+ * or "sql" count as content on both sides.
+ */
+const SHADOW_FUNCTION_WORDS = new Set([
+  "the", "and", "for", "are", "but", "not", "you", "all", "any", "can",
+  "her", "was", "one", "our", "out", "day", "get", "has", "him", "his",
+  "how", "its", "new", "now", "old", "see", "two", "way", "who", "boy",
+  "did", "man", "men", "put", "say", "she", "too", "use", "that", "this",
+  "with", "have", "from", "they", "would", "there", "their", "what", "about",
+  "which", "when", "make", "like", "time", "just", "know", "take", "into",
+  "your", "some", "them", "than", "then", "only", "come", "over", "such",
+  "also", "back", "after", "other", "many", "most", "well", "even", "want",
+  "because", "these", "give", "does", "done", "being", "having", "where",
+  "while", "should", "could", "might", "must", "shall", "will", "been",
+  "were", "each", "more", "less", "very", "much", "same", "both", "between",
+]);
+
+/**
+ * Evaluate rule (c) without applying it.
+ *
+ * Returns numbers and closed-vocabulary reasons only — no question text, no
+ * answer text, so the result is safe to log and to display.
+ */
+export function shadowOverlapCheck(
+  answer: string,
+  question?: string,
+): ShadowOverlap {
+  const empty: ShadowOverlap = {
+    questionContentWords: 0,
+    answerContentWords: 0,
+    sharedContentWords: 0,
+    overlapScore: 0,
+    wouldReject: false,
+    abstained: "no-question",
+  };
+  if (!question?.trim()) return empty;
+
+  const q = contentWordSet(question);
+  const a = contentWordSet(answer ?? "");
+  if (q.size < SHADOW_MIN_QUESTION_WORDS) {
+    return {
+      ...empty,
+      questionContentWords: q.size,
+      answerContentWords: a.size,
+      abstained: "too-few-question-words",
+    };
+  }
+  if (a.size < SHADOW_MIN_ANSWER_WORDS) {
+    return {
+      ...empty,
+      questionContentWords: q.size,
+      answerContentWords: a.size,
+      abstained: "too-few-answer-words",
+    };
+  }
+
+  let shared = 0;
+  for (const w of a) if (q.has(w)) shared++;
+  const denom = Math.min(q.size, a.size);
+
+  return {
+    questionContentWords: q.size,
+    answerContentWords: a.size,
+    sharedContentWords: shared,
+    overlapScore: denom > 0 ? Math.round((shared / denom) * 1000) / 1000 : 0,
+    // The rule as specified: sharing NO content words with the question.
+    // Guarded above, so it only ever fires on a real comparison.
+    wouldReject: shared === 0,
+    abstained: null,
+  };
+}
+
+/**
  * Validate a completed (or partial) answer.
  *
  * @param text   The answer text as received from the provider.

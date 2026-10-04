@@ -43,6 +43,7 @@ import { validateAnswerOutput } from "../lib/outputValidation";
 import { SessionContextChip } from "../components/SessionContextChip";
 import { describeDrain, drainInterviewAsr } from "../lib/asrDrain";
 import { forceEndpointOnSubmit } from "../lib/forceEndpointRunner";
+import { shadowOverlapCheck, type ShadowOverlap } from "../lib/outputValidation";
 import {
   createStageRecorder,
   type ProviderTiming,
@@ -171,6 +172,11 @@ export const Home: React.FC = () => {
    * declined because a phrase was open), never guessed.
    */
   const truncatedRef = useRef(false);
+  /**
+   * This turn's SHADOW overlap result. Computed for every answer and stored in
+   * the turn record, but read by NOTHING that decides what the user sees.
+   */
+  const shadowOverlapRef = useRef<ShadowOverlap | null>(null);
   const chatEndRef = useRef<HTMLDivElement>(null);
   // Repeat / editable-target guard for the global interview shortcuts. Kept in
   // a ref so it survives re-renders and holds its cooldown state.
@@ -866,6 +872,28 @@ export const Home: React.FC = () => {
           question: answeredQuestion,
           promptTemplate: INTERVIEW_SYSTEM_PROMPT,
         });
+
+        // ── SHADOW RULE (c) — computed, logged, NEVER enforced ─────────────
+        //
+        // Runs on every answer the validator ACCEPTED, which is the only
+        // population where the question "would this rule have helped, and would
+        // it have hurt?" can be answered. Numbers only: a would-reject flag and
+        // an overlap score. No answer text, no question text, no topic list.
+        //
+        // Computed BEFORE the rejection branch and regardless of its outcome,
+        // so the two rules can be compared on the same turns rather than on
+        // whatever survived this one.
+        shadowOverlapRef.current = shadowOverlapCheck(fullSolution, answeredQuestion);
+        {
+          const s = shadowOverlapRef.current;
+          console.log(
+            `[AI:${turnId}] shadow-overlap wouldReject=${s.wouldReject} ` +
+              `score=${s.overlapScore} shared=${s.sharedContentWords} ` +
+              `q=${s.questionContentWords} a=${s.answerContentWords} ` +
+              `abstained=${s.abstained ?? "none"}`,
+          );
+        }
+
         if (!validation.ok) {
           outcomeRef.current = "rejected";
           console.error(
@@ -1042,7 +1070,9 @@ export const Home: React.FC = () => {
           providers: providersRef.current,
           forceEndpoint: forceEndpointTimingsRef.current,
           truncated: truncatedRef.current,
+          shadow: shadowOverlapRef.current ?? undefined,
         });
+        shadowOverlapRef.current = null;
         providersRef.current = [];
         truncatedRef.current = false;
         forceEndpointTimingsRef.current = null;

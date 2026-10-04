@@ -157,6 +157,8 @@ export const FORCE_SKIP_SPEAKING = "interviewer-still-speaking";
 export const FORCE_SKIP_NO_SESSION = "no-capture-session";
 
 /** One turn's timings. Numbers and closed-vocabulary reasons only. */
+import type { ShadowOverlap } from "./outputValidation";
+
 export interface TurnTimings {
   id: string;
   /** `Date.now()` when the submit handler was entered. */
@@ -178,6 +180,14 @@ export interface TurnTimings {
    * did not fire and a phrase was still open. Counted, never acted on.
    */
   truncated: boolean;
+  /**
+   * Result of the SHADOW overlap rule (c), when one was computed. Numbers only.
+   *
+   * Recorded, aggregated in the report, and never consulted by anything that
+   * decides whether an answer is shown — that is the entire point of shadow
+   * mode.
+   */
+  shadow?: ShadowOverlap;
 }
 
 // ── The recorder ────────────────────────────────────────────────────────────
@@ -206,6 +216,7 @@ export interface StageRecorder {
     providers?: ProviderTiming[];
     forceEndpoint?: ForceEndpointTiming | null;
     truncated?: boolean;
+    shadow?: ShadowOverlap;
   }): TurnTimings;
 }
 
@@ -318,6 +329,7 @@ export function createStageRecorder(
         forceEndpoint: input.forceEndpoint ?? null,
         outcome: input.outcome,
         truncated: input.truncated === true,
+        shadow: input.shadow,
       };
     },
   };
@@ -474,6 +486,52 @@ export function formatLatencyReport(turns: TurnTimings[]): string {
   e2eLine("hotkey_pressed -> answer committed", hotkey);
   e2eLine("submit -> committed", committed);
   lines.push("");
+
+  // ── Shadow rule (c) ────────────────────────────────────────────────────
+  //
+  // Instrumentation for a rule that is NOT in force. Reported as counts and
+  // scores only — never as a rejection — because the rule is known to be able
+  // to reject a correct paraphrase. See `shadowOverlapCheck`.
+  {
+    const sampled = kept.filter((t) => t.shadow);
+    const wouldReject = sampled.filter((t) => t.shadow!.wouldReject);
+    const abstained = sampled.filter((t) => t.shadow!.abstained !== null);
+
+    lines.push("SHADOW RULE (c) — overlap, NOT ENFORCED");
+    if (sampled.length === 0) {
+      lines.push("no samples: shadow overlap was not computed on any turn");
+    } else {
+      lines.push(
+        `sampled n=${sampled.length} would-reject=${wouldReject.length} ` +
+          `rate=${FIXED((wouldReject.length / sampled.length) * 100)}% ` +
+          `abstained=${abstained.length}`,
+      );
+      // Every zero-overlap sample is listed individually, because the count
+      // alone cannot tell a real miss from a degenerate short answer.
+      for (const t of wouldReject) {
+        const s = t.shadow!;
+        lines.push(
+          `  would-reject overlaps=${s.sharedContentWords}/` +
+            `${Math.min(s.questionContentWords, s.answerContentWords)} ` +
+            `score=${FIXED(s.overlapScore)} q=${s.questionContentWords} a=${s.answerContentWords}`,
+        );
+      }
+      const reasons = new Map<string, number>();
+      for (const t of abstained) {
+        const r = t.shadow!.abstained as string;
+        reasons.set(r, (reasons.get(r) ?? 0) + 1);
+      }
+      if (reasons.size > 0) {
+        lines.push(
+          `  abstained because: ${[...reasons.entries()]
+            .sort()
+            .map(([r, n]) => `${r} x${n}`)
+            .join(", ")}`,
+        );
+      }
+    }
+    lines.push("");
+  }
 
   // ── Outcomes ───────────────────────────────────────────────────────────
   const outcomeCounts = new Map<RunOutcome, number>();
