@@ -5,6 +5,23 @@
  *   GEMINI_API_KEY=… node scripts/ai-bench.mjs
  *   GEMINI_API_KEY=… node scripts/ai-bench.mjs --model gemini-2.5-flash
  *   GEMINI_API_KEY=… node scripts/ai-bench.mjs --rounds 3
+ *   GROQ_API_KEY=…   node scripts/ai-bench.mjs --provider groq
+ *   GROQ_API_KEY=…   node scripts/ai-bench.mjs --provider groq --list-models
+ *   GROQ_API_KEY=…   node scripts/ai-bench.mjs --provider groq --models a,b
+ *
+ * ── Two providers, two implementations ─────────────────────────────────────
+ * `--provider gemini` (the default) is the original benchmark below and is
+ * UNCHANGED. `--provider groq` delegates to `scripts/ai-bench-groq.mts`, which
+ * drives every chat model Groq's live /models list returns and scores answers
+ * with the SHIPPING validator rather than a copy of it.
+ *
+ * That delegation needs `tsx`, because the Groq axis imports the real
+ * `buildInterviewUserPrompt` and the real `validateAnswerOutput` — a benchmark
+ * that measured a hand-copied prompt and validator would be measuring the copy.
+ * So `--provider groq` re-execs this file under tsx, transparently.
+ *
+ * Keys are read from the environment ONLY (`GEMINI_API_KEY`, `GROQ_API_KEY`).
+ * Neither provider accepts a key as an argument.
  *
  * ── What this measures ──────────────────────────────────────────────────────
  * LATENCY and QUALITY for one provider under two generation configs. Today the
@@ -247,17 +264,74 @@ const mean = (xs) =>
   xs.length ? Math.round(xs.reduce((a, b) => a + b, 0) / xs.length) : null;
 
 function parseArgs(argv) {
-  const out = { model: "gemini-2.5-flash", rounds: 1, maxTokens: 4096 };
+  const out = {
+    model: "gemini-2.5-flash",
+    rounds: 1,
+    maxTokens: 4096,
+    provider: "gemini",
+  };
   for (let i = 0; i < argv.length; i++) {
     if (argv[i] === "--model") out.model = argv[++i];
     else if (argv[i] === "--rounds") out.rounds = Math.max(1, Number(argv[++i]) || 1);
     else if (argv[i] === "--max-tokens") out.maxTokens = Number(argv[++i]) || 4096;
+    else if (argv[i] === "--provider") out.provider = argv[++i] ?? "gemini";
   }
   return out;
 }
 
+/**
+ * Re-exec the Groq axis under tsx and return its exit code.
+ *
+ * Needed because `scripts/ai-bench-groq.mts` imports TypeScript modules. The
+ * guard variable is what stops the child from re-execing itself forever: the
+ * child sees it set and imports the module directly instead.
+ */
+async function delegateToGroq(argv) {
+  if (process.env.GHOSTLY_AI_BENCH_TSX === "1") {
+    const groq = await import("./ai-bench-groq.mts");
+    return groq.main(argv);
+  }
+  const { spawnSync } = await import("node:child_process");
+  // ── Why this is not just `spawnSync("npx", …)` ────────────────────────────
+  // On Windows `npx` is a batch file. Spawning it directly fails (EINVAL with
+  // `shell:false`, ENOENT without the extension), and `shell:true` works but
+  // re-concatenates argv unescaped and prints a DEP0190 warning. Going through
+  // ComSpec explicitly is the documented way to run a .cmd and avoids both.
+  const isWindows = process.platform === "win32";
+  const [cmd, cmdArgs] = isWindows
+    ? [process.env.ComSpec ?? "cmd.exe", ["/d", "/s", "/c", "npx", "--no-install", "tsx", process.argv[1], ...argv]]
+    : ["npx", ["--no-install", "tsx", process.argv[1], ...argv]];
+  const result = spawnSync(cmd, cmdArgs, {
+    stdio: "inherit",
+    env: { ...process.env, GHOSTLY_AI_BENCH_TSX: "1" },
+  });
+  if (result.error) {
+    console.error(
+      "could not start tsx, which --provider groq needs: " +
+        `${result.error.message}\nInstall it with: npm i -D tsx`,
+    );
+    return 1;
+  }
+  return result.status ?? 1;
+}
+
 async function main() {
-  const args = parseArgs(process.argv.slice(2));
+  const argv = process.argv.slice(2);
+  const args = parseArgs(argv);
+
+  // The Groq axis is a different implementation in a different file; the
+  // Gemini path below is untouched.
+  if (args.provider === "groq") {
+    try {
+      process.exitCode = await delegateToGroq(argv);
+    } catch (err) {
+      // A refusal (a key in argv, say) is a message for the user, not a crash.
+      console.error(err instanceof Error ? err.message : String(err));
+      process.exitCode = 2;
+    }
+    return;
+  }
+
   const apiKey = process.env.GEMINI_API_KEY ?? "";
   if (!apiKey.trim()) {
     console.error(
