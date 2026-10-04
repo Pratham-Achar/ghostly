@@ -4,6 +4,7 @@ import { registerDeepgramHandlers } from "./deepgram";
 import { registerGroqAsrHandlers } from "./groqAsr";
 import { registerParakeetHandlers, resolveModelDir } from "./parakeetAsr";
 import { registerAsrExportHandlers } from "./asrExport";
+import { registerNvidiaAiHandlers } from "./nvidiaAi";
 import { registerDebugClipHandlers } from "./debugClipWriter";
 import Store from "electron-store";
 
@@ -135,6 +136,11 @@ export function registerIpcHandlers(): void {
   // Groq Whisper ASR (comparison only). The long-lived key never crosses the
   // IPC boundary — the main process performs the request. See electron/groqAsr.ts.
   registerGroqAsrHandlers(store);
+
+  // NVIDIA NIM, for the same reason as Groq ASR: the renderer's fetch is
+  // blocked by CORS on every turn, so the request runs here, and the key is
+  // read from this store rather than being passed in by the renderer.
+  registerNvidiaAiHandlers(store);
 
   // Dev-only: write captured debug clips + the comparison JSON into a
   // timestamped `debug-audio/<session>/` folder (gitignored). Only ever called

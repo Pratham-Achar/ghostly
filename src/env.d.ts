@@ -206,6 +206,35 @@ interface Window {
       dir: string;
     }>;
 
+    // ── NVIDIA NIM, executed in the MAIN process ──────────────────────
+    //
+    // NVIDIA sends no `Access-Control-Allow-Origin` for this app's origin, so
+    // a renderer-side fetch is blocked before it leaves. The main process has
+    // no origin, so the request runs there.
+    //
+    // Note what is ABSENT, and it is the point: there is no key parameter. The
+    // main process reads the key from its own settings store, so there is no
+    // code path that puts the secret on the wire.
+    nvidiaStreamStart: (payload: {
+      model: string;
+      messages: unknown[];
+      maxTokens?: number;
+    }) => Promise<
+      | { ok: true; id: number }
+      | { ok: false; code: string; message: string }
+    >;
+    nvidiaStreamAbort: (payload: { id: number }) => Promise<{ ok: boolean }>;
+    onNvidiaStream: (
+      cb: (e: {
+        id: number;
+        type: "chunk" | "done" | "error";
+        text?: string;
+        code?: string;
+        status?: number;
+        message?: string;
+      }) => void,
+    ) => () => void;
+
     // ── Dev-only screen visibility ────────────────────────────────────
     // Runtime-only (not persisted) and refused by the main process in a
     // packaged build.

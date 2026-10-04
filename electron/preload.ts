@@ -178,6 +178,44 @@ contextBridge.exposeInMainWorld("ghostly", {
     mode?: "primary" | "comparison";
   }> => ipcRenderer.invoke("parakeet:diagnostics"),
 
+  // ── NVIDIA NIM, executed in the MAIN process ─────────────────────────
+  //
+  // NVIDIA's API sends no `Access-Control-Allow-Origin` for this app's origin,
+  // so every renderer-side request failed with `TypeError: Failed to fetch`. The
+  // main process has no origin and is not subject to CORS, so the request runs
+  // there — and the API key is read from the main-process store, which is why
+  // there is no key parameter anywhere in this surface.
+  //
+  // Streaming is preserved deliberately: the orchestrator's hedge decision
+  // depends on seeing the first text arrive early, so buffering the answer in
+  // main would remove the very signal it needs.
+  nvidiaStreamStart: (payload: {
+    model: string;
+    messages: unknown[];
+    maxTokens?: number;
+  }): Promise<
+    | { ok: true; id: number }
+    | { ok: false; code: string; message: string }
+  > => ipcRenderer.invoke("nvidia:stream-start", payload),
+
+  nvidiaStreamAbort: (payload: { id: number }): Promise<{ ok: boolean }> =>
+    ipcRenderer.invoke("nvidia:stream-abort", payload),
+
+  onNvidiaStream: (
+    cb: (e: {
+      id: number;
+      type: "chunk" | "done" | "error";
+      text?: string;
+      code?: string;
+      status?: number;
+      message?: string;
+    }) => void,
+  ): (() => void) => {
+    const listener = (_: any, e: any): void => cb(e);
+    ipcRenderer.on("nvidia:stream-event", listener);
+    return () => ipcRenderer.removeListener("nvidia:stream-event", listener);
+  },
+
   // ── Dev-only screen visibility ───────────────────────────────────────
   // Runtime-only and dev-gated in the main process. Returns the mode that
   // actually took effect, which may differ from the request if it was

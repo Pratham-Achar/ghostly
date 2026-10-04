@@ -3,6 +3,10 @@ import {
   fetchWithDiagnostics,
   withModelHint,
 } from "./fetchWithDiagnostics";
+import {
+  isNvidiaMainBridgeAvailable,
+  streamNvidiaViaMain,
+} from "./nvidiaBridge";
 
 /**
  * Direct NVIDIA NIM provider (build.nvidia.com).
@@ -24,6 +28,19 @@ import {
  *
  * The curated model ids below are all documented NIM endpoints on the free
  * developer tier.
+ *
+ * ── WHERE the request runs ──────────────────────────────────────────────────
+ * `streamSolution` now prefers the ELECTRON MAIN PROCESS
+ * (`electron/nvidiaAi.ts`), because every renderer-side request failed with
+ * `TypeError: Failed to fetch`: NVIDIA sends no `Access-Control-Allow-Origin` for
+ * the app's origin, so the request was blocked before it left. The main process
+ * has no origin and is therefore not subject to the policy, and the key is read
+ * from the settings store there so it never crosses the boundary.
+ *
+ * The renderer `fetch` below is retained as a fallback for runtimes where the
+ * bridge is absent (the browser, unit tests). It is the SAME request, byte for
+ * byte — only the transport differs — so the SSE parsing, telemetry and error
+ * wording below are shared by both paths and cannot drift.
  */
 export interface NvidiaChunk {
   text: string;
@@ -124,10 +141,41 @@ export class NvidiaProvider implements AIProvider {
       currentContent.push({ type: "image_url", image_url: { url: imageUrl } });
     }
     currentContent.push({ type: "text", text: prompt });
-
     apiMessages.push({ role: "user", content: currentContent as any });
 
+    // One clock for the whole attempt, main process or renderer, so the
+    // telemetry a caller sees covers whichever transport actually ran.
     const startedAt = performance.now();
+
+    // ── Preferred path: main process (no CORS) ──────────────────────────────
+    // Tried BEFORE any renderer fetch, because from a web context that fetch
+    // cannot succeed at all. An empty stream means the bridge declined to start
+    // the request (no key in the main store, or no bridge in this runtime), in
+    // which case the original renderer path below runs unchanged.
+    if (isNvidiaMainBridgeAvailable()) {
+      const viaMain = streamNvidiaViaMain(
+        { model, messages: apiMessages, maxTokens },
+        signal,
+      );
+      let produced = false;
+      for await (const chunk of viaMain) {
+        produced = true;
+        yield chunk;
+      }
+      if (produced) {
+        if (meta) meta.httpMs = Math.round(performance.now() - startedAt);
+        console.log(
+          `[NVIDIA] completed via main process in ${Math.round(
+            performance.now() - startedAt,
+          )}ms`,
+        );
+        return;
+      }
+      console.warn(
+        "[NVIDIA] main process declined the request — retrying from the renderer (a CORS block is likely).",
+      );
+    }
+
     // `apiKeyPresent` only — the key itself is never logged.
     console.log(
       `[NVIDIA] request started — model=${model} maxTokens=${maxTokens} apiKeyPresent=${!!apiKey}`,
