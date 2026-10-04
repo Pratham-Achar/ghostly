@@ -45,7 +45,7 @@ import type { ConversationThread } from "./conversationThread";
 export type ProblemKind = "coding" | "system_design" | "other";
 
 /** Where the problem statement came from. Never auto-set from the AI's output. */
-export type ProblemSource = "spoken" | "screenshot" | "manual";
+export type ProblemSource = "spoken" | "screenshot" | "live-screen" | "manual";
 
 export interface ActiveProblem {
   id: string;
@@ -181,6 +181,27 @@ const DEFINITION_CUES = new RegExp(
  */
 const ASKS_FOR_WORK = /\b(?:design|implement|write|code|build|solve|create|refactor|compute|find)\b/i;
 
+/**
+ * A sentence that ENDS on a bare deictic object refers back to work already in
+ * context rather than posing new work.
+ *
+ * ── Why this is a veto rather than another cue ──────────────────────────────
+ * `NEW_PROBLEM_CUES` matches "how would you solve ..." on its verb alone, so
+ * "How would you solve it?" looked like the opening of a fresh problem. Under
+ * Live Screen that is the single most damaging mistake available: the question
+ * arrives while the screen still shows the problem, the match fires, and the
+ * active problem is REPLACED by a sentence that contains no problem at all. The
+ * next turn then answers "Why did you choose HashMap?" with no problem in the
+ * prompt.
+ *
+ * The distinction is grammatical and already stated above: a new problem states
+ * its object ("find the duplicate numbers"); a follow-up points at one ("solve
+ * it", "optimize this"). Anchored to the END of the sentence so that "write a
+ * function that returns it" is still a new problem.
+ */
+const REFERENTIAL_OBJECT =
+  /\b(?:it|this|that|them|the\s+above|the\s+same)\b[\s?.!]*$/i;
+
 export function detectProblemStart(
   question: string,
 ): { isProblemStart: boolean; kind: ProblemKind; reason: string } {
@@ -209,6 +230,16 @@ export function detectProblemStart(
       isProblemStart: false,
       kind: "other",
       reason: "no structural cue for a new problem",
+    };
+  }
+
+  // Verb matched, but the sentence points at the existing work instead of
+  // stating new work. See REFERENTIAL_OBJECT.
+  if (REFERENTIAL_OBJECT.test(text)) {
+    return {
+      isProblemStart: false,
+      kind: "other",
+      reason: "refers back to the existing work, not a new problem",
     };
   }
 
