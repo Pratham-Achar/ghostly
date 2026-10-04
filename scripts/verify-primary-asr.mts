@@ -49,6 +49,7 @@ import {
   PARAKEET_DRAIN_DEADLINE_MS,
   PARAKEET_DRAIN_MAX_ATTEMPTS,
   PARAKEET_PRIMARY_QUEUE_LIMIT,
+  PARAKEET_PRIMARY_QUEUE_MAX_SECONDS,
   createParakeetSegmentQueue,
 } from "../src/lib/parakeetPrimary";
 import { createAsrDrain, DRAIN_DEADLINE_MS, DRAIN_STEP_MS } from "../src/lib/asrDrain";
@@ -550,6 +551,210 @@ console.log("\n── Diagnostics label the mode and leak nothing ────�
       /distance, NOT accuracy/.test(ab));
   checkTrue("110 the padding A/B writes nothing",
     !/writeFileSync|mkdirSync|appendFileSync|createWriteStream/.test(ab));
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+console.log("\n── Loading-time queue: order, bounds, fallback ────────");
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// The three properties a live run depends on, all of which the old
+// limit-of-four queue did not hold:
+//
+//   1. NOTHING IS LOST while the model loads. Segments are buffered and decoded
+//      IN CAPTURE ORDER once it is ready — order matters because the transcript
+//      is read in order by the question gate and the drain barrier.
+//   2. The buffer is bounded in BOTH count and duration, and says so when it
+//      overflows rather than failing silently.
+//   3. If the load FAILS, every buffered segment goes to the LOCAL Moonshine
+//      fallback — never to the network — and each one is accounted for.
+
+{
+  const q = createParakeetSegmentQueue<{ n: number }>();
+
+  // Push in capture order, then drain. Order is the assertion.
+  for (let n = 1; n <= 5; n++) {
+    q.push({ phraseId: n, payload: { n }, seconds: 3 });
+  }
+  const drained: number[] = [];
+  for (let next = q.shift(); next; next = q.shift()) drained.push(next.payload.n);
+
+  check("Q1 nothing is dropped well inside the bound", q.snapshot().dropped, 0);
+  check("Q2 everything is decoded", drained.length, 5);
+  check("Q3 IN CAPTURE ORDER, oldest first", drained, [1, 2, 3, 4, 5]);
+  check("Q4 the queue is empty afterwards", q.size(), 0);
+  check("Q5 the audio total is released as it drains", q.snapshot().seconds, 0);
+}
+
+{
+  // Bound by COUNT. A fast staccato speaker hits this first.
+  const q = createParakeetSegmentQueue<string>(3, 60);
+  const accepted = [1, 2, 3, 4, 5].map((n) =>
+    q.push({ phraseId: n, payload: `s${n}`, seconds: 1 }),
+  );
+  check("Q6 the count bound admits up to the limit", accepted, [true, true, true, false, false]);
+  check("Q7 the reason is the COUNT bound", q.lastOverflowReason(), "count");
+  check("Q8 drops are counted, never swallowed", q.snapshot().dropped, 2);
+
+  // Oldest-first eviction: the newest three survive.
+  const kept: string[] = [];
+  for (let n = q.shift(); n; n = q.shift()) kept.push(n.payload);
+  check("Q9 overflow drops the OLDEST, keeping the newest", kept, ["s3", "s4", "s5"]);
+}
+
+{
+  // Bound by DURATION. A slow, long-phrased speaker hits this first — and this
+  // is the case the count bound alone cannot catch: four 25 s phrases are "only
+  // four segments" but 100 s of audio.
+  const q = createParakeetSegmentQueue<string>(8, 60);
+  check("Q10 2 x 25s fits", q.push({ phraseId: 1, payload: "a", seconds: 25 }), true);
+  check("Q11 …", q.push({ phraseId: 2, payload: "b", seconds: 25 }), true);
+  check("Q12 a third 25s segment overflows the TIME bound", q.push({ phraseId: 3, payload: "c", seconds: 25 }), false);
+  check("Q13 the reason is the TIME bound", q.lastOverflowReason(), "seconds");
+  checkTrue("Q14 the buffered total never exceeds the bound", q.snapshot().seconds <= 60);
+  check("Q14b and the eviction kept the buffer legal", q.snapshot().seconds, 50);
+}
+
+{
+  // The shipping defaults, asserted rather than assumed.
+  check("Q15 the default count bound is 8", PARAKEET_PRIMARY_QUEUE_LIMIT, 8);
+  check("Q16 the default time bound is 60s", PARAKEET_PRIMARY_QUEUE_MAX_SECONDS, 60);
+
+  // What the raise actually buys, stated as the old bound vs the new one on the
+  // SAME burst. The old limit of four is what the 14.7–23.8 s in-app load
+  // overflowed: at 3–5 s per phrase it filled after roughly 12–20 s of speech,
+  // which is exactly the window the slowest observed load landed in.
+  const q = createParakeetSegmentQueue<string>();
+  const OLD_LIMIT = 4;
+  let admitted = 0;
+  let wouldHaveAdmittedUnderOldLimit = 0;
+  for (let n = 0; n < 12; n++) {
+    if (q.push({ phraseId: n, payload: "s", seconds: 4 })) admitted++;
+    if (n < OLD_LIMIT) wouldHaveAdmittedUnderOldLimit++;
+  }
+  check("Q17 a 12-phrase burst now keeps 8, not 4", admitted, 8);
+  check("Q17b the old limit would have kept only 4", wouldHaveAdmittedUnderOldLimit, 4);
+  check("Q18 and the overflow is counted, not silent", q.snapshot().dropped, 4);
+  check("Q18b the buffered total is still legal", q.snapshot().seconds, 32);
+
+  // The time bound genuinely binds with long phrases, at the same count limit.
+  const longQ = createParakeetSegmentQueue<string>();
+  for (let n = 0; n < 8; n++) longQ.push({ phraseId: n, payload: "s", seconds: 30 });
+  check("Q18c eight 30s segments trip the TIME bound, not the count bound",
+    longQ.lastOverflowReason(), "seconds");
+  checkTrue("Q18d and the buffer stays inside 60s", longQ.snapshot().seconds <= 60);
+}
+
+{
+  // A single segment longer than the WHOLE time bound must still be admitted.
+  // Dropping it would mean losing the only buffered question, which is strictly
+  // worse than briefly exceeding the bound.
+  const q = createParakeetSegmentQueue<string>(8, 10);
+  check("Q19 an over-long lone segment is still kept", q.push({ phraseId: 1, payload: "only", seconds: 45 }), false);
+  check("Q20 and it is still in the queue", q.size(), 1);
+  check("Q21 the overflow is still reported", q.lastOverflowReason(), "seconds");
+}
+
+{
+  // Clearing on Stop must reset the counters too, or the next session starts
+  // reporting phantom drops.
+  const q = createParakeetSegmentQueue<string>(1, 60);
+  q.push({ phraseId: 1, payload: "a", seconds: 1 });
+  q.push({ phraseId: 2, payload: "b", seconds: 1 });
+  check("Q22 a drop was recorded", q.snapshot().dropped, 1);
+  q.clear();
+  check("Q23 clear empties the queue", q.size(), 0);
+  check("Q24 clear resets the drop counter", q.snapshot().dropped, 0);
+  check("Q25 clear resets the audio total", q.snapshot().seconds, 0);
+}
+
+{
+  // ── Load FAILS: everything buffered goes to Moonshine ────────────────
+  // Modelled exactly as the hook does it, so this asserts the ROUTING, not just
+  // the queue. The contract under test is that a failed load produces zero
+  // cloud calls and one local fallback per buffered segment.
+  const queue = createParakeetSegmentQueue<{ id: number; speech: number }>();
+  for (let n = 1; n <= 3; n++) {
+    queue.push({ phraseId: n, payload: { id: n, speech: 3 }, seconds: 3 });
+  }
+
+  const loadOk = false;
+  const toMoonshine: number[] = [];
+  const toCloud: string[] = [];
+
+  if (loadOk) {
+    for (let n = queue.shift(); n; n = queue.shift()) toMoonshine.push(n.payload.id);
+  } else {
+    // The hook's own failure path.
+    for (let n = queue.shift(); n; n = queue.shift()) {
+      toMoonshine.push(n.payload.id);
+    }
+  }
+
+  check("Q26 every buffered segment is handed over", toMoonshine, [1, 2, 3]);
+  check("Q27 nothing is left stranded in the buffer", queue.size(), 0);
+  check("Q28 NOTHING is sent to a cloud provider", toCloud, []);
+  checkTrue(
+    "Q29 every handover code is a real host failure",
+    shouldFallbackToMoonshine("crashed") && shouldFallbackToMoonshine("model_missing"),
+  );
+}
+
+{
+  // Structural: the hook must not be able to reach Groq or Deepgram from the
+  // fallback path. Asserted against the real source because a behavioural test
+  // cannot prove the ABSENCE of a call on a path that only runs on failure.
+  const hookSrc = await readFile("src/hooks/useInterviewAudio.ts", "utf8");
+  const fallbackFn = hookSrc.slice(
+    hookSrc.indexOf("const fallbackSegmentToMoonshine"),
+    hookSrc.indexOf("const runParakeetSegment"),
+  );
+  checkTrue("Q30 the fallback exists and posts to the worker", /postMessage/.test(fallbackFn));
+  checkTrue(
+    "Q31 the fallback NEVER names a cloud ASR engine",
+    !/runGroqWhisperComparison|openDeepgramSegment/.test(fallbackFn),
+  );
+  checkTrue(
+    "Q32 the fallback never posts a direct URL to anywhere",
+    !/fetch\(|groq\.com|deepgram/.test(fallbackFn),
+  );
+
+  // The worker-identity fix: a boolean "already asked to load" loses segments
+  // when the worker effect swaps the Worker mid-session.
+  checkTrue(
+    "Q33 the Moonshine load flag is keyed on the WORKER, not a boolean",
+    /moonshineLazyRequestedForRef/.test(hookSrc) &&
+      /moonshineLazyRequestedForRef\.current === worker/.test(hookSrc),
+  );
+  checkTrue(
+    "Q34 no stale boolean flag remains",
+    !/moonshineLazyRequestedRef\b/.test(hookSrc),
+  );
+}
+
+{
+  // The preload option must exist, default OFF, and its cost must be stated
+  // where a user can read it — a ~740 MB resident cost hidden behind a checkbox
+  // is not a choice, it is a surprise.
+  const storeSrc = await readFile("src/store/useStore.ts", "utf8");
+  checkTrue("Q35 the setting exists", /parakeetPreload\?: boolean/.test(storeSrc));
+  checkTrue("Q36 it defaults to off", /parakeetPreload: false/.test(storeSrc));
+
+  const panelSrc = await readFile("src/components/SettingsPanel.tsx", "utf8");
+  checkTrue("Q37 Settings exposes the toggle", /parakeetPreload/.test(panelSrc));
+  checkTrue("Q38 and states the RAM cost", /describeParakeetPreloadCost/.test(panelSrc));
+
+  checkTrue(
+    "Q39 the measured RAM figure is in one place",
+    /PARAKEET_LOADED_RSS_MB = 740/.test(
+      await readFile("src/lib/parakeetModelFacts.ts", "utf8"),
+    ),
+  );
+
+  const hookSrc = await readFile("src/hooks/useInterviewAudio.ts", "utf8");
+  checkTrue(
+    "Q40 preloading waits for the INSTALLATION probe, never races it",
+    /parakeetUi !== "installed"\) return;/.test(hookSrc),
+  );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

@@ -23,6 +23,7 @@ import {
   PARAKEET_ARCHIVE_BYTES,
   PARAKEET_UNPACKED_BYTES,
 } from "../lib/parakeetModelFacts";
+import { describeParakeetPreloadCost } from "../lib/parakeetModelFacts";
 
 /**
  * Interview types split into two top-level groups. The existing types are never
@@ -189,6 +190,64 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({ onClose }) => {
     updateSettings({ providerOrder: withIt });
   };
 
+  // ── Per-chain-provider model lists ───────────────────────────────────────
+  //
+  // ── Why this is separate from the single "Model" picker above ─────────────
+  // The interview path runs EVERY provider in the chain, each with its own
+  // `settings.models[p]`. The picker above is bound to `activeProvider`, which
+  // only governs the screenshot / follow-up flow — so before this, the ONLY way
+  // to change the model an interview would use on Groq was to make Groq the
+  // active provider, configure it, and switch back. Everything else in the chain
+  // was pinned to whatever the defaults said.
+  //
+  // That is how `groq/allam-2-7b` ended up being used at all: it was a stale
+  // default, not a choice anybody could see or change.
+  //
+  // Each list is fetched LIVE from the provider (never hard-coded), and only
+  // when that provider has a key — exactly the same rule the main picker uses,
+  // so the two cannot disagree about where a model name comes from.
+  const [chainModels, setChainModels] = useState<
+    Partial<Record<ProviderName, string[]>>
+  >({});
+  const [chainModelsLoading, setChainModelsLoading] = useState<
+    Partial<Record<ProviderName, boolean>>
+  >({});
+
+  const setChainModel = (provider: ProviderName, model: string) =>
+    updateSettings({
+      models: { ...settings.models, [provider]: model },
+    });
+
+  useEffect(() => {
+    let cancelled = false;
+    for (const p of INTERVIEW_PROVIDER_ORDER) {
+      const key = (settings.apiKeys[p] ?? "").trim();
+      if (!key) continue;
+      const provider = getProvider(p);
+      if (typeof provider?.fetchModels !== "function") continue;
+
+      setChainModelsLoading((s) => ({ ...s, [p]: true }));
+      provider
+        .fetchModels(key)
+        .then((models) => {
+          if (cancelled || models.length === 0) return;
+          setChainModels((s) => ({ ...s, [p]: models }));
+        })
+        .catch((err) => {
+          // Best-effort: the curated list below stays usable offline, and a
+          // live-list failure must never block Settings.
+          console.warn(`[Ghostly] live model list failed for ${p}:`, err);
+        })
+        .finally(() => {
+          if (!cancelled) setChainModelsLoading((s) => ({ ...s, [p]: false }));
+        });
+    }
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [settings.apiKeys]);
+
   // Microphone selection state
   const [mics, setMics] = useState<MediaDeviceInfo[]>([]);
   const [micDropdownOpen, setMicDropdownOpen] = useState(false);
@@ -250,6 +309,13 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({ onClose }) => {
   // hand-edited settings file with a nonsense value cannot reach a branch that
   // expects two engines.
   const primaryAsr = normalizePrimaryAsr(useStore((s) => s.settings.primaryAsr));
+  const parakeetPreload = useStore((s) => s.settings.parakeetPreload === true);
+  // `!== false`, not `=== true`: a settings blob written before this key existed
+  // must get the intended default (ON) rather than silently keeping the old
+  // truncating behaviour. See the `forceEndpointOnHotkey` doc comment.
+  const forceEndpointOnHotkey = useStore(
+    (s) => s.settings.forceEndpointOnHotkey !== false,
+  );
   /** One-line confirmation of the last engine change, shown under the picker. */
   const [engineNote, setEngineNote] = useState<string | null>(null);
 
@@ -661,9 +727,68 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({ onClose }) => {
               );
             })}
           </div>
+          {/* ── The model each provider will actually use ──────────────────
+              Rendered per provider rather than once for "the active provider",
+              because the interview runs ALL of them and each has its own saved
+              model. The list is fetched live from the provider and only falls
+              back to its curated defaults when there is no key or the request
+              fails — no model name is ever hard-coded as if it were the only
+              option. */}
+          {INTERVIEW_PROVIDER_ORDER.filter(hasKey).length > 0 && (
+            <div className="mt-2 space-y-1.5">
+              {INTERVIEW_PROVIDER_ORDER.filter((p) => hasKey(p)).map((p) => {
+                const live = chainModels[p];
+                const curated = getProvider(p)?.listModels() ?? [];
+                const options =
+                  live && live.length > 0 ? live : curated;
+                const current = settings.models?.[p] ?? "";
+                // A saved model that has left the live list would silently stay
+                // selected and produce "model does not exist" every turn, so it
+                // is surfaced rather than hidden.
+                const stale =
+                  !!current && options.length > 0 && !options.includes(current);
+                return (
+                  <div key={p} className="flex items-center gap-2">
+                    <span className="text-[9px] text-white/35 w-20 flex-none truncate">
+                      {PROVIDERS.find((x) => x.id === p)?.label ?? p}
+                    </span>
+                    <select
+                      value={current}
+                      onChange={(e) => setChainModel(p, e.target.value)}
+                      className="settings-select flex-1 text-[10px] py-1"
+                    >
+                      {!current && <option value="">unset</option>}
+                      {stale && (
+                        <option value={current}>
+                          {current} (not in the live list)
+                        </option>
+                      )}
+                      {options.map((m) => (
+                        <option key={m} value={m}>
+                          {m}
+                        </option>
+                      ))}
+                    </select>
+                    <span className="text-[8px] text-white/25 w-14 flex-none text-right">
+                      {chainModelsLoading[p]
+                        ? "loading…"
+                        : live
+                          ? `${live.length} live`
+                          : "default list"}
+                    </span>
+                  </div>
+                );
+              })}
+            </div>
+          )}
           <p className="text-[9px] text-white/30 mt-1">
             Tried top to bottom. A provider is skipped when it has no API key or is
             switched off here — the startup log prints the reason for each one.
+          </p>
+          <p className="text-[9px] text-white/30 mt-1">
+            Each provider keeps its own model, listed live from that provider. A
+            name shown as &ldquo;not in the live list&rdquo; has been retired —
+            pick another one, because it will fail on every turn.
           </p>
         </Section>
 
@@ -890,6 +1015,77 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({ onClose }) => {
               <p className="text-[9px] text-white/20 mt-1 break-all">
                 Installed in {modelState.dir}
               </p>
+            )}
+
+            {/* ── Preload ──────────────────────────────────────────────────
+                Only meaningful once the model is INSTALLED: preloading a
+                missing model would show a red banner the moment the panel
+                opens, which is a worse first impression than the slow load it
+                was meant to hide. */}
+            {modelState.status === "ready" && (
+              <label className="flex items-start gap-2 mt-3 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={forceEndpointOnHotkey}
+                  onChange={(e) => {
+                    const on = e.target.checked;
+                    updateSettings({ forceEndpointOnHotkey: on });
+                    // Written straight through, like the preload toggle: the
+                    // submit path reads this from the store, so a debounced save
+                    // would leave the first hotkey press on the old behaviour.
+                    void window.ghostly.saveSettings({
+                      ...useStore.getState().settings,
+                      forceEndpointOnHotkey: on,
+                    });
+                  }}
+                  className="mt-0.5 accent-white/70"
+                />
+                <span>
+                  <span className="text-[10px] text-white/75">
+                    Close the open phrase when I press Ctrl+Enter
+                  </span>
+                  <span className="block text-[9px] text-white/40 mt-0.5">
+                    The drain barrier can only wait for phrases the VAD has already
+                    closed, so pressing the hotkey within 1.5s of the last word
+                    used to submit the question with its tail missing. This closes
+                    the open phrase first. Applies only when the local speech model
+                    is primary
+                    {primaryAsr !== "parakeet"
+                      ? " — it is not primary right now, so this has no effect"
+                      : ""}
+                    .
+                  </span>
+                </span>
+              </label>
+            )}
+
+            {modelState.status === "ready" && (
+              <label className="flex items-start gap-2 mt-3 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={parakeetPreload}
+                  onChange={(e) => {
+                    const on = e.target.checked;
+                    updateSettings({ parakeetPreload: on });
+                    // Written straight through, like the engine switch: the
+                    // main process owns the model, and a debounced save would
+                    // leave the load racing a stale setting.
+                    void window.ghostly.saveSettings({
+                      ...useStore.getState().settings,
+                      parakeetPreload: on,
+                    });
+                  }}
+                  className="mt-0.5 accent-white/70"
+                />
+                <span>
+                  <span className="text-[10px] text-white/75">
+                    Preload the speech model when this panel opens
+                  </span>
+                  <span className="block text-[9px] text-white/40 mt-0.5">
+                    {describeParakeetPreloadCost()}
+                  </span>
+                </span>
+              </label>
             )}
           </Section>
         )}

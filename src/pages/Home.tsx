@@ -42,6 +42,15 @@ import {
 import { validateAnswerOutput } from "../lib/outputValidation";
 import { SessionContextChip } from "../components/SessionContextChip";
 import { describeDrain, drainInterviewAsr } from "../lib/asrDrain";
+import { forceEndpointOnSubmit } from "../lib/forceEndpointRunner";
+import {
+  createStageRecorder,
+  type ProviderTiming,
+  type RunOutcome,
+  type StageRecorder,
+  type TurnTimings,
+} from "../lib/stageTiming";
+import type { ForceEndpointTiming } from "../lib/stageTiming";
 import { createShortcutGuard } from "../lib/interviewShortcuts";
 import { correctQuestionWithCandidate } from "../lib/candidateCorrection";
 import {
@@ -95,6 +104,7 @@ export const Home: React.FC = () => {
     setSessionContext,
     clearSessionContext,
     addScreenshot,
+    addLatencyTurn,
     removeScreenshot,
     setCurrentSolution,
     setIsStreaming,
@@ -132,6 +142,35 @@ export const Home: React.FC = () => {
     signature: "",
     ts: 0,
   });
+  // ── Latency instrumentation ────────────────────────────────────────────────
+  //
+  // The hotkey lives in the MAIN process, so its press instant arrives as a
+  // `Date.now()` value; `performance.now()` origins differ between processes and
+  // a renderer-side duration cannot reach back to it. Everything after this is a
+  // renderer-local `performance.now()` delta. `submitEnteredAt` is the
+  // renderer-local handoff instant, so `hotkey_pressed -> hotkey_to_submit`
+  // isolates the IPC cost from the rest of the turn.
+  const hotkeyPressedAtRef = useRef<number | null>(null);
+  const hotkeyTranscriptReadyAtRef = useRef<number | null>(null);
+  const forceEndpointTimingsRef = useRef<ForceEndpointTiming | null>(null);
+  // Set by the wrapper `runAIStream`, read by the inner function for every
+  // stage mark. A ref rather than a parameter because the inner function already
+  // has a long signature and this must not change its identity.
+  const recorderRef = useRef<StageRecorder | null>(null);
+  /**
+   * The recorder the hotkey handler created BEFORE the drain, adopted by the
+   * measured `runAIStream` wrapper so the turn is measured end to end rather
+   * than from the point the AI call is made.
+   */
+  const pendingRecorderRef = useRef<StageRecorder | null>(null);
+  const outcomeRef = useRef<RunOutcome>("answered");
+  const providersRef = useRef<ProviderTiming[]>([]);
+  /**
+   * True when this turn's question was submitted with a phrase still open in the
+   * VAD, i.e. the tail may be missing. Set only when we KNOW it (the force
+   * declined because a phrase was open), never guessed.
+   */
+  const truncatedRef = useRef(false);
   const chatEndRef = useRef<HTMLDivElement>(null);
   // Repeat / editable-target guard for the global interview shortcuts. Kept in
   // a ref so it survives re-renders and holds its cooldown state.
@@ -191,7 +230,13 @@ export const Home: React.FC = () => {
   }, []);
 
   // AI streaming function
-  const runAIStream = useCallback(
+  //
+  // `runAIStreamInner` is the whole original function, untouched. It is wrapped
+  // by `runAIStream` below purely to own the latency recorder: the wrapper
+  // guarantees a record is published for EVERY outcome — answered, gated WAIT,
+  // duplicate submit, no provider, rejection, supersession, or a throw — which
+  // is exactly the set of exits that would be easy to miss by hand.
+  const runAIStreamInner = useCallback(
     async (
       screenshotList: string[],
       turn?: InterviewTurn,
@@ -294,6 +339,7 @@ export const Home: React.FC = () => {
             : `No API key for ${settings.activeProvider}. Open Settings (⚙) to add one.`,
         );
         setIsStreaming(false);
+        outcomeRef.current = "no-provider";
         return;
       }
 
@@ -364,6 +410,7 @@ export const Home: React.FC = () => {
         );
 
         if (gate.action === "wait") {
+          outcomeRef.current = "wait";
           const signature = turnSignature(interviewTurn);
           const previous = lastGateRef.current;
           const insistingAgain =
@@ -413,6 +460,7 @@ export const Home: React.FC = () => {
         const previous = lastSubmitRef.current;
         if (isDuplicateSubmit(previous, signature)) {
           console.log("[AI] duplicate submit ignored (same transcript)");
+          outcomeRef.current = "duplicate";
           return;
         }
         submittedSignature = signature;
@@ -472,6 +520,8 @@ export const Home: React.FC = () => {
       if (isInterview && interviewTurn) {
         const finals = interviewTurn.finals.filter((u) => u.text?.trim());
         const latest = finals[questionIndex] ?? finals[finals.length - 1];
+        // The gate has decided; this stage ends here.
+        recorderRef.current?.since("submit", "gate");
         // The question the AI answers. The raw question is preserved in the
         // transcript as normal; a candidate correction only changes what the AI
         // receives (e.g. "What is mango?" + "MongoDB" → "What is MongoDB?").
@@ -561,6 +611,9 @@ export const Home: React.FC = () => {
         }
         prompt += contextBlock;
         userMessageContent = prompt;
+        // Prompt assembled. The system message is built above this line and is
+        // excluded from the user-side assembly time on purpose.
+        recorderRef.current?.since("submit", "prompt_built");
         historyContext = sessionMessages.slice(-6).map((msg) => ({
           role: msg.role,
           content: msg.content,
@@ -606,6 +659,7 @@ export const Home: React.FC = () => {
         console.log(
           `[AI:${turnId}] orchestrating — chain=${attempts.map((a) => `${a.provider}(${a.model})`).join(" → ")}`,
         );
+        recorderRef.current?.since("submit", "orchestration_start");
         const run = await orchestrateAnswer({
           attempts,
           prompt,
@@ -653,6 +707,7 @@ export const Home: React.FC = () => {
 
         if (isStale()) {
           clearSubmitLock();
+          outcomeRef.current = "superseded";
           return; // Superseded mid-flight: leave the UI to the newer run.
         }
 
@@ -669,6 +724,36 @@ export const Home: React.FC = () => {
         console.log(
           `[AI:${turnId}] summary: attempts=${run.attempts} hedged=${run.hedged} winner=${run.provider ?? "(none)"}`,
         );
+        // ── Per-provider timings, straight from the orchestrator's own ────────
+        // telemetry. Nothing is recomputed here: these are already
+        // renderer-local `performance.now()` deltas measured from each attempt's
+        // start, so they need no cross-process handling.
+        //
+        // `verdict` is a closed vocabulary (accepted / failed / aborted / the
+        // orchestrator's own failure reasons) so the report never has to quote
+        // model output to explain why a provider lost.
+        providersRef.current = run.attemptsStarted.map((t) => ({
+          provider: t.provider,
+          model: t.resolvedModel ?? t.model,
+          httpMs: t.httpMs,
+          firstChunkMs: t.firstChunkMs,
+          firstTextMs: t.firstTextMs,
+          completeMs: t.completeMs,
+          totalMs: t.totalMs,
+          winner: t.winner,
+          hedged: t.hedged,
+          verdict: t.winner
+            ? "accepted"
+            : t.failureReason ??
+              (t.outcome === "cancelled" || t.outcome === "cancelled_by_winner"
+                ? "aborted"
+                : t.outcome),
+        }));
+        if (run.provider) {
+          recorderRef.current?.since("submit", "provider_accepted");
+        } else {
+          outcomeRef.current = "empty";
+        }
         if (run.provider) {
           // Capture the actual backend provider for OpenRouter UI display.
           if (run.provider === "openrouter" && run.backend) {
@@ -711,6 +796,7 @@ export const Home: React.FC = () => {
         // Never save "", never render an empty card: report what the providers
         // actually said and offer Retry.
         if (!fullSolution.trim()) {
+          outcomeRef.current = "empty";
           // ── Say WHAT is wrong, not what the provider said ───────────────
           // The raw text here is `Groq API error: Rate limit reached…` or a
           // Chromium CORS message. It names a condition the user cannot act on
@@ -760,6 +846,7 @@ export const Home: React.FC = () => {
         // A WAIT result is authoritative: clear the detected question so the UI
         // never shows both a question banner and a WAIT banner at the same time.
         if (isInterview && isWaitResponse(fullSolution)) {
+          outcomeRef.current = "wait";
           console.log(
             `[AI:${turnId}] LLM returned WAIT for a gated question — clearing detected question. LLM text: "${logTruncate(fullSolution, 120)}"`,
           );
@@ -780,6 +867,7 @@ export const Home: React.FC = () => {
           promptTemplate: INTERVIEW_SYSTEM_PROMPT,
         });
         if (!validation.ok) {
+          outcomeRef.current = "rejected";
           console.error(
             `[AI:${turnId}] output rejected by validator (${validation.reason}) — ${validation.detail} | raw="${logTruncate(fullSolution, 120)}"`,
           );
@@ -824,6 +912,16 @@ export const Home: React.FC = () => {
           language: settings.language,
         };
         addToHistory(entry);
+        // The answer is committed: in the store, in the session, in history.
+        // This is the end of the cross-process metric — `Date.now()` at this
+        // instant minus the main process' press instant.
+        recorderRef.current?.since("submit", "committed");
+        // `rendered` is the next task after the commit, which is as close to
+        // "painted" as a synchronous React 18 update can be measured without
+        // instrumenting the reconciler. Stated in the report as an upper bound.
+        setTimeout(() => {
+          recorderRef.current?.since("submit", "rendered");
+        }, 0);
 
         try {
           const currentHistory = await window.ghostly.getHistory();
@@ -894,6 +992,64 @@ export const Home: React.FC = () => {
       setAnswerIssue,
       setOpenRouterBackendProvider,
     ],
+  );
+
+  // ── The measured entry point ───────────────────────────────────────────────
+  //
+  // Starts the recorder, stamps the cross-process hotkey anchor, runs the
+  // original function, and publishes exactly one `TurnTimings` per call. A
+  // throw still publishes (as `aborted`), because a stage that never recorded is
+  // precisely the one worth seeing in the report.
+  const runAIStream = useCallback(
+    async (
+      screenshotList: string[],
+      turn?: InterviewTurn,
+      followUpQuery?: string,
+      origin: "auto" | "manual" | "retry" = "manual",
+      candidateSignal?: { text: string; timestamp?: number },
+    ) => {
+      // Adopt the hotkey's recorder when there is one — the drain and the
+      // force-endpoint are stages that happened before this call, and they would
+      // be missing from the report if a fresh recorder started here.
+      const recorder =
+        pendingRecorderRef.current ??
+        (() => {
+          const fresh = createStageRecorder();
+          fresh.start(
+            `lat-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
+          );
+          fresh.press(hotkeyPressedAtRef.current);
+          return fresh;
+        })();
+      pendingRecorderRef.current = null;
+      recorderRef.current = recorder;
+      outcomeRef.current = "answered";
+      try {
+        await runAIStreamInner(
+          screenshotList,
+          turn,
+          followUpQuery,
+          origin,
+          candidateSignal,
+        );
+      } catch (err) {
+        outcomeRef.current = "aborted";
+        console.error(`[AI] run failed: ${err}`);
+      } finally {
+        recorderRef.current = null;
+        const record: TurnTimings = recorder.finish({
+          outcome: outcomeRef.current,
+          providers: providersRef.current,
+          forceEndpoint: forceEndpointTimingsRef.current,
+          truncated: truncatedRef.current,
+        });
+        providersRef.current = [];
+        truncatedRef.current = false;
+        forceEndpointTimingsRef.current = null;
+        addLatencyTurn(record);
+      }
+    },
+    [runAIStreamInner, addLatencyTurn],
   );
 
   const handleInterviewSubmit = useCallback(
@@ -1089,10 +1245,41 @@ export const Home: React.FC = () => {
     // transcript (interviewer's question); otherwise use accumulated screenshots.
     // Screenshots are still attached when present, so a code question captured
     // on screen + its spoken explanation both reach the AI.
-    const offSolve = window.ghostly.onSolve(async () => {
+    const offSolve = window.ghostly.onSolve(async (payload) => {
       const shots = screenshotsRef.current;
+      // The recorder is created HERE, not in `runAIStream`, because the drain
+      // and the force-endpoint happen before that call and both are stages the
+      // report must contain. `runAIStream` adopts this recorder rather than
+      // creating its own, so the turn is one continuous measurement.
+      const pressedAt = payload?.pressedAt ?? null;
+      hotkeyPressedAtRef.current = pressedAt;
+      const recorder = createStageRecorder();
+      recorder.start(
+        `lat-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
+      );
+      recorder.press(pressedAt);
+      // The ONLY cross-process duration in the report: two `Date.now()` values,
+      // one from the main process and one from here. Quoted as
+      // +/-CROSS_PROCESS_ACCURACY_MS, not as a monotonic figure.
+      if (pressedAt !== null) {
+        recorder.mark("hotkey_to_submit", Date.now() - pressedAt);
+      }
+      pendingRecorderRef.current = recorder;
+      recorderRef.current = recorder;
       let turn: InterviewTurn | undefined;
+      let forceEndpoint = null as Awaited<ReturnType<typeof forceEndpointOnSubmit>> | null;
       if (interviewOpenRef.current) {
+        const tDrainStart = performance.now();
+        // ── Force endpoint ────────────────────────────────────────────────
+        // MUST run before the drain: the drain can only wait for finals that
+        // already exist, and a phrase the VAD has not closed is not one. When a
+        // phrase is open and the interviewer is silent, this asks the live
+        // worklet to close it so the tail of the question is decoded and
+        // committed before the transcript is read. When it declines, the reason
+        // is one of a closed set — numbers only, never text.
+        forceEndpoint = await forceEndpointOnSubmit({
+          log: (line) => console.log(`[ASR] ${line}`),
+        });
         // ── Drain barrier ────────────────────────────────────────────────
         // `getInterviewTurn()` is SYNCHRONOUS, but a final for the phrase the
         // interviewer just finished is still decoding in the worker at this
@@ -1108,9 +1295,29 @@ export const Home: React.FC = () => {
         if (drain.outcome !== "alreadyIdle" && drain.outcome !== "noWorker") {
           console.log(`[ASR] submit drain: ${describeDrain(drain)}`);
         }
+        forceEndpointTimingsRef.current = {
+          fired: forceEndpoint?.fired ?? false,
+          skipped: forceEndpoint?.fired ? undefined : forceEndpoint?.reason,
+          bufferedMs: forceEndpoint?.bufferedMs ?? 0,
+          decodeMs: forceEndpoint?.decodeMs ?? null,
+        };
+        // A phrase was open and we did NOT close it, so the submitted question
+        // may be missing its tail. Recorded, never acted on.
+        truncatedRef.current =
+          forceEndpoint?.reason === "no-phrase-open" ||
+          forceEndpoint?.reason === "interviewer-still-speaking";
         // Read the transcript ONLY after the barrier, so it includes the final
         // that was in flight.
         turn = useStore.getState().getInterviewTurn();
+        hotkeyTranscriptReadyAtRef.current = Date.now();
+        // Renderer-local `performance.now()` delta, so this one claims +/-1ms.
+        recorderRef.current?.mark("drain", performance.now() - tDrainStart);
+        if (forceEndpoint?.decodeMs != null) {
+          recorderRef.current?.mark(
+            "force_endpoint_decode",
+            forceEndpoint.decodeMs,
+          );
+        }
       }
       if (turn) {
         // Free the vertical space for the answer: the panel collapses to a
@@ -1118,6 +1325,11 @@ export const Home: React.FC = () => {
         setInterviewCollapsed(true);
       }
       await runAIStream(shots, turn);
+      // The turn's own timings are published by `runAIStream`; this only has to
+      // stop the next hotkey press inheriting this one's instants.
+      hotkeyPressedAtRef.current = null;
+      hotkeyTranscriptReadyAtRef.current = null;
+      recorderRef.current = null;
     });
 
     // Ctrl+G — start over (clear everything)

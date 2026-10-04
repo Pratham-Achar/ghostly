@@ -1,5 +1,7 @@
-import React, { useState, useEffect, useRef } from "react";
+import React, { useState, useEffect, useRef, useMemo } from "react";
 import { useInterviewAudio } from "../hooks/useInterviewAudio";
+import { formatLatencyReport } from "../lib/stageTiming";
+import { formatLoadBreakdown } from "../lib/parakeetHost";
 import { useStore } from "../store/useStore";
 import { getParakeetStatus, type ParakeetStatus } from "../lib/parakeetClient";
 import { PARAKEET_PADDING_MS } from "../lib/parakeetHost";
@@ -53,6 +55,7 @@ export const InterviewModal: React.FC<InterviewModalProps> = ({
     primaryAsr,
     parakeetStatus,
     parakeetMessage,
+    parakeetBreakdown,
     parakeetUiState,
     parakeetUiMessage,
     downloadParakeet,
@@ -61,6 +64,15 @@ export const InterviewModal: React.FC<InterviewModalProps> = ({
     retryParakeet,
   } = useInterviewAudio();
   const [showLogs, setShowLogs] = useState(false);
+  // ── Latency report ──────────────────────────────────────────────────────
+  // Derived, never stateful: the store owns the records and this recomputes the
+  // text from them, so the report cannot drift out of sync with the data.
+  const latencyTurns = useStore((s) => s.latencyTurns);
+  const clearLatencyTurns = useStore((s) => s.clearLatencyTurns);
+  const latencyReport = useMemo(
+    () => formatLatencyReport(latencyTurns),
+    [latencyTurns],
+  );
   // Developer-only engine comparison, read straight from the store.
   const asrComparisons = useStore((s) => s.asrComparisons);
   const asrCompareParakeet = useStore((s) => s.settings.asrCompareParakeet);
@@ -605,6 +617,49 @@ export const InterviewModal: React.FC<InterviewModalProps> = ({
                 </button>
               )}
 
+              {/* ── Latency report ────────────────────────────────────────
+                  Numbers only, no styling work, no charts. Plain text with a
+                  Copy button, because a latency report is only useful once it
+                  has left the app and reached an issue, and a screenshot of a
+                  chart cannot be pasted into a terminal.
+
+                  Contains no transcript, no prompt, no answer and no key, so it
+                  is safe to share as-is. */}
+              <div className="space-y-1">
+                <div className="text-[9px] text-white/40 uppercase tracking-wider font-semibold">
+                  Latency report ({latencyTurns.length} turn
+                  {latencyTurns.length === 1 ? "" : "s"})
+                </div>
+                <pre className="text-[9px] text-white/50 bg-black/30 rounded border border-white/[0.05] p-2 max-h-64 overflow-auto whitespace-pre leading-relaxed">
+                  {latencyReport}
+                </pre>
+                <div className="flex gap-1.5">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      void navigator.clipboard
+                        .writeText(latencyReport)
+                        .then(() => addLog("Latency report copied to the clipboard."))
+                        .catch(() =>
+                          addLog(
+                            "Could not reach the clipboard — select the text and copy it manually.",
+                          ),
+                        );
+                    }}
+                    className="px-2 py-1 rounded bg-white/[0.05] hover:bg-white/[0.1] text-white/60 text-[9px] transition-colors"
+                  >
+                    Copy report
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => clearLatencyTurns()}
+                    className="px-2 py-1 rounded bg-white/[0.05] hover:bg-white/[0.1] text-white/60 text-[9px] transition-colors"
+                  >
+                    Clear
+                  </button>
+                </div>
+              </div>
+
               {/* ── Primary engine + model state ─────────────────────── */}
               {/*
                * Always visible, not dev-gated: which engine is transcribing is
@@ -640,6 +695,16 @@ export const InterviewModal: React.FC<InterviewModalProps> = ({
                 )}
                 {parakeetMessage && (
                   <div className="text-amber-200/80">{parakeetMessage}</div>
+                )}
+                {/* Where the load actually went. Shown here because the standing
+                    question "why is it 15s in the app and 6s in the smoke test"
+                    is answerable only from these four numbers, and the log panel
+                    is the one place a developer is already looking. */}
+                {parakeetBreakdown && (
+                  <div className="text-white/30">
+                    Load:{" "}
+                    {formatLoadBreakdown(parakeetBreakdown)}
+                  </div>
                 )}
                 {primaryAsr === "parakeet" && parakeetStatus === "error" && (
                   <button

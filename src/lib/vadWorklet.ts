@@ -390,9 +390,48 @@ class VADProcessor extends AudioWorkletProcessor {
     this.levelSeconds = 0;
     this.peak = 0;
     this.reportedChannels = 0;
+    // Whether the MOST RECENT frame was below the silence threshold.
+    //
+    // 'speaking' on the level message is 'speechSeconds > 0', which stays true
+    // for the whole trailing pause, so it cannot distinguish "interviewer is
+    // mid-word" from "interviewer finished and the phrase is waiting for its
+    // endpoint". This flag can, and that distinction is the whole basis of the
+    // force-endpoint decision.
+    this.lastFrameSilent = true;
     // Level reporting cadence for the live UI meter. ~20/s is smooth enough to
     // look continuous and cheap enough not to flood the main thread.
     this.LEVEL_INTERVAL_SECONDS = ${config.levelIntervalSeconds};
+
+    // ── Force-endpoint ────────────────────────────────────────────────
+    // INERT unless the renderer asks. Nothing about segmentation, buffering or
+    // thresholds changes: this only lets the EXISTING endPhrase() run early,
+    // once, on request.
+    this.port.onmessage = (e) => {
+      if (!e.data || e.data.type !== 'force-endpoint') return;
+      const speechSeconds = this.speechSeconds;
+      const phraseOpen = this.audioBuffer.length > 0 && speechSeconds > 0;
+      // Authoritative re-check: the renderer decides first, but only the
+      // worklet knows the state of the last frame it actually processed.
+      const speakingNow = !this.lastFrameSilent;
+      if (!phraseOpen || speakingNow || speechSeconds < this.MIN_SPEECH_SECONDS) {
+        this.port.postMessage({
+          type: 'forceEndpointResult',
+          fired: false,
+          bufferedSeconds: speechSeconds,
+          speakingNow: speakingNow,
+        });
+        return;
+      }
+      // Same code path as a silence endpoint or the phrase cap. One call, one
+      // 'speech' message, one 'phraseClosed' message — identical to normal.
+      this.endPhrase();
+      this.port.postMessage({
+        type: 'forceEndpointResult',
+        fired: true,
+        bufferedSeconds: speechSeconds,
+        speakingNow: false,
+      });
+    };
   }
 
   merge() {
@@ -479,6 +518,10 @@ class VADProcessor extends AudioWorkletProcessor {
     }
     const rms = Math.sqrt(sum / channelData.length);
 
+    // Every frame updates this, so the force-endpoint handler always reads the
+    // state of the frame that was actually processed rather than a stale one.
+    this.lastFrameSilent = rms <= this.SILENCE_THRESHOLD;
+
     // Report a level reading ~20x/second for the live meter, plus whether the
     // VAD is currently inside a speech run. This is the SAME signal that is
     // segmented and sent to the ASR — not the microphone — so the meter tells
@@ -491,6 +534,10 @@ class VADProcessor extends AudioWorkletProcessor {
         rms: rms,
         peak: this.peak,
         speaking: this.speechSeconds > 0,
+        // Additive fields. Existing consumers ignore them.
+        phraseOpen: this.audioBuffer.length > 0 && this.speechSeconds > 0,
+        speechSeconds: this.speechSeconds,
+        silentNow: this.lastFrameSilent,
       });
       this.levelSeconds = 0;
       this.peak = 0;

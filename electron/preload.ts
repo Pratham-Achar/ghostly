@@ -1,5 +1,17 @@
 import { contextBridge, ipcRenderer } from "electron";
 
+/**
+ * What the main process sends with the solve hotkey.
+ *
+ * `pressedAt` is a `Date.now()` instant in the MAIN process. It is the only
+ * value that crosses the process boundary for latency purposes, precisely
+ * because `performance.now()` origins differ between main and renderer and can
+ * never be subtracted across them.
+ */
+export interface SolveHotkeyPayload {
+  pressedAt: number | null;
+}
+
 contextBridge.exposeInMainWorld("ghostly", {
   // System Audio source fetcher
   getDesktopSources: (): Promise<{id: string, name: string}[]> =>
@@ -144,6 +156,15 @@ contextBridge.exposeInMainWorld("ghostly", {
   parakeetLoad: (): Promise<{
     ok: boolean;
     loadMs?: number;
+    breakdown?: {
+      spawn: number | null;
+      require: number | null;
+      read: number | null;
+      construct: number | null;
+      total: number;
+      endToEnd: number;
+      modelBytes: number | null;
+    };
     rssMb?: number;
     code?: string;
     message?: string;
@@ -171,6 +192,15 @@ contextBridge.exposeInMainWorld("ghostly", {
   parakeetDiagnostics: (): Promise<{
     status: string;
     loadMs: number | null;
+    breakdown?: {
+      spawn: number | null;
+      require: number | null;
+      read: number | null;
+      construct: number | null;
+      total: number;
+      endToEnd: number;
+      modelBytes: number | null;
+    } | null;
     rssMb: number | null;
     queued: number;
     inFlight: number;
@@ -235,8 +265,12 @@ contextBridge.exposeInMainWorld("ghostly", {
     return () => ipcRenderer.removeListener("ghostly:screenshot", listener);
   },
 
-  onSolve: (cb: () => void): (() => void) => {
-    const listener = (): void => cb();
+  onSolve: (cb: (payload: SolveHotkeyPayload) => void): (() => void) => {
+    // The payload carries the MAIN process' wall-clock press instant, because
+    // `performance.now()` origins differ across processes and the renderer
+    // cannot otherwise know when the key was actually pressed.
+    const listener = (_e: unknown, payload: SolveHotkeyPayload): void =>
+      cb(payload ?? { pressedAt: null });
     ipcRenderer.on("ghostly:solve", listener);
     return () => ipcRenderer.removeListener("ghostly:solve", listener);
   },

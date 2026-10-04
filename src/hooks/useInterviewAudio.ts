@@ -27,6 +27,14 @@ import {
   buildVadWorkletCode,
   DEFAULT_VAD_CONFIG,
 } from "../lib/vadWorklet";
+import {
+  decideForceEndpoint,
+  type ForceEndpointReply,
+} from "../lib/forceEndpoint";
+import {
+  registerForceEndpoint,
+  type ForceEndpointOutcome,
+} from "../lib/forceEndpointRunner";
 import { openDeepgramSegment } from "../lib/deepgramClient";
 import {
   buildKeyterms,
@@ -88,9 +96,12 @@ import {
   PARAKEET_DRAIN_DEADLINE_MS,
   PARAKEET_DRAIN_MAX_ATTEMPTS,
   PARAKEET_PRIMARY_QUEUE_LIMIT,
+  PARAKEET_PRIMARY_QUEUE_MAX_SECONDS,
   createParakeetSegmentQueue,
 } from "../lib/parakeetPrimary";
 import { transcribeWithParakeet } from "../lib/parakeetClient";
+import type { ParakeetLoadBreakdown } from "../lib/parakeetClient";
+import { formatLoadBreakdown } from "../lib/parakeetHost";
 import { isDecodableLength } from "../lib/asrTokenBudget";
 
 /**
@@ -277,8 +288,15 @@ export function useInterviewAudio() {
   const parakeetDrainingRef = useRef(false);
   /** True while a Parakeet load is in flight, so it is never requested twice. */
   const parakeetLoadInFlightRef = useRef(false);
-  /** True once Moonshine has been asked to load lazily as a fallback. */
-  const moonshineLazyRequestedRef = useRef(false);
+  /**
+   * The Moonshine worker that has already been asked to load its model.
+   *
+   * Deliberately holds the WORKER, not a boolean: the worker-creation effect can
+   * replace the worker mid-session, and a boolean would carry "already loaded"
+   * across the swap — which silently sent the first fallback segments into an
+   * unloaded worker and lost them. See `ensureMoonshineLoaded`.
+   */
+  const moonshineLazyRequestedForRef = useRef<Worker | null>(null);
   const asrModel = useStore(
     (s) => s.settings.whisperModel ?? "onnx-community/moonshine-base-ONNX",
   );
@@ -291,11 +309,31 @@ export function useInterviewAudio() {
   const primaryAsr = normalizePrimaryAsr(useStore((s) => s.settings.primaryAsr));
   const primaryAsrRef = useRef<PrimaryAsr>(primaryAsr);
   primaryAsrRef.current = primaryAsr;
+  // The live interviewer VAD, published so the `Ctrl+Enter` path can close its
+  // open phrase before the drain. Null whenever there is no capture session.
+  const vadHandleRef = useRef<VadHandle | null>(null);
+
+  /**
+   * Load the local model as soon as this panel is open, rather than on Start.
+   *
+   * Off by default; see the `parakeetPreload` doc comment in `useStore` for why
+   * a ~740 MB resident cost must be opted into rather than assumed.
+   */
+  const preloadParakeet = useStore((s) => s.settings.parakeetPreload === true);
 
   /** Live model state, surfaced so the panel can say "Loading speech model…". */
   const [parakeetStatus, setParakeetStatus] =
     useState<ParakeetStatus>("disabled");
   const [parakeetMessage, setParakeetMessage] = useState<string | null>(null);
+  /**
+   * Where the last load spent its time.
+   *
+   * Kept in state rather than only in the log because it is the answer to the
+   * standing question "why is the model slow in the app but fast in the smoke
+   * test", and the panel is where someone reads the answer. Numbers only.
+   */
+  const [parakeetBreakdown, setParakeetBreakdown] =
+    useState<ParakeetLoadBreakdown | null>(null);
   /**
    * What the UI knows about the Parakeet MODEL — installed, missing, corrupt,
    * loading, ready, failed.
@@ -932,18 +970,43 @@ export function useInterviewAudio() {
    * decode is attempted. No second round-trip, no "is it ready yet" polling, and
    * no risk of sending audio into an unloaded model.
    *
-   * Idempotent: a second fallback does not restart the download/compile.
+   * ── WHY IT IS KEYED ON THE WORKER, NOT A BOOLEAN ──────────────────────────
+   * This was the cause of the reported "[ASR] No model loaded — dropping audio"
+   * on the first segments of three sessions.
+   *
+   * The worker-creation effect depends on `handleFinalEvent`, so any identity
+   * change in it (a settings write, a store action that is not referentially
+   * stable) terminates the worker and constructs a NEW one. The old flag said
+   * "Moonshine has been asked to load" and stayed true across that swap, so
+   * `ensureMoonshineLoaded` short-circuited and the fallback posted a bare
+   * `transcribe` to a worker that had never received a `load`. The worker's own
+   * guard then logged "No model loaded — dropping audio" and returned, and the
+   * segment was gone.
+   *
+   * The flag is therefore recorded AGAINST THE WORKER it applies to. A new
+   * worker is a new target, so the load is re-requested for it — which is
+   * exactly right, because the new worker starts with no model either.
+   *
+   * Idempotent per worker: a second fallback does not restart the
+   * download/compile on the same worker.
    */
   const ensureMoonshineLoaded = useCallback(() => {
-    if (moonshineLazyRequestedRef.current) return;
-    moonshineLazyRequestedRef.current = true;
+    const worker = workerRef.current;
+    if (!worker) {
+      console.warn(
+        "[ASR] Moonshine fallback requested with no worker — segment lost.",
+      );
+      return;
+    }
+    if (moonshineLazyRequestedForRef.current === worker) return;
+    moonshineLazyRequestedForRef.current = worker;
     const model =
       useStore.getState().settings.whisperModel ??
       "onnx-community/moonshine-base-ONNX";
     addLog(
       "Loading the Moonshine fallback (~22s). This happens once, and only because Parakeet could not handle a segment.",
     );
-    workerRef.current?.postMessage({ type: "load", model });
+    worker.postMessage({ type: "load", model });
   }, [addLog]);
 
   /**
@@ -1100,11 +1163,16 @@ export function useInterviewAudio() {
       const accepted = parakeetQueueRef.current.push({
         phraseId: segment.phraseId,
         payload: segment,
+        seconds: segment.speechSeconds,
       });
       if (!accepted) {
-        const dropped = parakeetQueueRef.current.snapshot().dropped;
+        const snapshot = parakeetQueueRef.current.snapshot();
+        const bound =
+          parakeetQueueRef.current.lastOverflowReason() === "seconds"
+            ? `more than ${PARAKEET_PRIMARY_QUEUE_MAX_SECONDS}s of speech`
+            : `more than ${PARAKEET_PRIMARY_QUEUE_LIMIT} segments`;
         addLog(
-          `The speech model is still loading and more than ${PARAKEET_PRIMARY_QUEUE_LIMIT} segments are waiting — the oldest one was dropped (${dropped} dropped so far). Nothing has reached the network; this is entirely local.`,
+          `The speech model is still loading and ${bound} are waiting — the oldest one was dropped (${snapshot.dropped} dropped so far, ${snapshot.seconds.toFixed(1)}s buffered). Nothing has reached the network; this is entirely local.`,
         );
       }
     },
@@ -1137,9 +1205,28 @@ export function useInterviewAudio() {
         setParakeetStatus("ready");
         setParakeetUi("ready");
         setParakeetMessage(null);
+        setParakeetBreakdown(result.breakdown ?? null);
         addLog(
-          `Speech model ready (${result.loadMs ?? "?"} ms, ${result.rssMb ?? "?"} MB in the worker process).`,
+          `Speech model ready (${result.loadMs ?? "?"} ms, ${result.rssMb ?? "?"} MB in the worker process).` +
+            (result.breakdown ? ` Load breakdown: ${formatLoadBreakdown(result.breakdown)}` : ""),
         );
+        // Numbers only, and they are the ones that explain a slow cold start.
+        // `endToEnd` rather than `loadMs` because that is what the user waited.
+        console.log(
+          `[Parakeet] load breakdown endToEnd=${result.breakdown?.endToEnd ?? "?"}ms ` +
+            `spawn=${result.breakdown?.spawn ?? "?"}ms require=${result.breakdown?.require ?? "?"}ms ` +
+            `read=${result.breakdown?.read ?? "?"}ms construct=${result.breakdown?.construct ?? "?"}ms ` +
+            `rssMb=${result.rssMb ?? "?"}`,
+        );
+        // Everything buffered while the model was loading now decodes, in the
+        // order it was captured. Logged so "the first questions were missing" is
+        // distinguishable from "the first questions arrived late".
+        const queued = parakeetQueueRef.current.size();
+        if (queued > 0) {
+          addLog(
+            `Decoding ${queued} segment${queued === 1 ? "" : "s"} that arrived while the model was loading.`,
+          );
+        }
         await drainParakeetQueue();
         return;
       }
@@ -1199,6 +1286,30 @@ export function useInterviewAudio() {
     void refreshParakeetModelState();
   }, [primaryAsr, refreshParakeetModelState]);
 
+  /**
+   * Optional PRELOAD, driven by `settings.parakeetPreload` (default off).
+   *
+   * This hook is mounted by the Live Interview panel, so "mounted" IS "the panel
+   * is open" — there is no separate open event to subscribe to and no second
+   * definition of when preloading happens.
+   *
+   * It waits for the INSTALLATION probe to finish first. Loading on top of an
+   * unfinished probe would mean the recogniser starts reading files while
+   * `ensureModelInPlace` may still be deciding whether to move them, which is a
+   * race between two code paths that both touch the model directory.
+   *
+   * Guarded twice: by `isParakeetStartAllowed` (never preload a model that is
+   * missing, corrupt or already failed — that would only produce a confusing
+   * error banner on a panel the user just opened), and by `ensureParakeetLoaded`
+   * itself, which is a no-op when a load is already in flight.
+   */
+  useEffect(() => {
+    if (primaryAsr !== "parakeet") return;
+    if (!preloadParakeet) return;
+    if (parakeetUi !== "installed") return;
+    void ensureParakeetLoaded();
+  }, [primaryAsr, preloadParakeet, parakeetUi, ensureParakeetLoaded]);
+
   /** Download the model in-app, then re-probe. Progress is polled by the UI. */
   const downloadParakeet = useCallback(async () => {
     setParakeetUi("downloading");
@@ -1242,7 +1353,8 @@ export function useInterviewAudio() {
     runningRef.current = true;
     parakeetQueueRef.current.clear();
     parakeetReadyRef.current = false;
-    moonshineLazyRequestedRef.current = primaryAsrRef.current === "moonshine";
+    moonshineLazyRequestedForRef.current =
+      primaryAsrRef.current === "moonshine" ? workerRef.current : null;
     setFallbackNotice(null);
 
     // Fresh transcript for each new session.
@@ -1384,7 +1496,9 @@ export function useInterviewAudio() {
       // stream stored below so the capture session stays alive.
       const audioOnly = new MediaStream([audioTrack]);
       const sysSource = ctx.createMediaStreamSource(audioOnly);
-      setupVADWorklet(
+      // The handle is kept so the hotkey path can ask THIS worklet to close its
+      // open phrase. Cleared on stop below so a dead session is never published.
+      vadHandleRef.current = setupVADWorklet(
         ctx,
         sysSource,
         "system",
@@ -1494,6 +1608,9 @@ export function useInterviewAudio() {
       setIsRecording(false);
       // Route through the single owner instead of closing the context here.
       closeContext?.();
+      // The VAD is going away with its AudioContext; a published handle would
+      // post to a dead message port.
+      vadHandleRef.current = null;
       try {
         displayStream?.getTracks().forEach((t) => t.stop());
       } catch {
@@ -1597,6 +1714,62 @@ export function useInterviewAudio() {
     return () => registerAsrDrain(null);
   }, [drainAsr]);
 
+  // ── The force-endpoint the hotkey asks for BEFORE the drain ──────────────
+  //
+  // The drain can only wait for finals that already exist; a phrase the VAD has
+  // not closed is not one. So the hotkey path asks the live worklet to close its
+  // open phrase first, and this is that request. `enabled` is read lazily from
+  // the store so flipping the setting takes effect on the next press without
+  // re-registering (and without this callback changing identity).
+  //
+  // Unregistered on unmount, exactly like the drain, so a closed panel can never
+  // leave a force-endpoint pointing at a dead AudioContext.
+  useEffect(() => {
+    registerForceEndpoint({
+      enabled: useStore.getState().settings.forceEndpointOnHotkey !== false,
+      parakeetPrimary: primaryAsrRef.current === "parakeet",
+      forceEndpoint: async () => {
+        const handle = vadHandleRef.current;
+        if (!handle) {
+          return {
+            type: "forceEndpointResult" as const,
+            fired: false,
+            bufferedSeconds: 0,
+            speakingNow: false,
+          };
+        }
+        return handle.forceEndpoint();
+      },
+      state: () =>
+        vadHandleRef.current?.state() ?? {
+          phraseOpen: false,
+          speechSeconds: 0,
+          silentNow: true,
+        },
+      // The forced phrase is already counted in `pendingFinalsRef` by the time
+      // this runs, so waiting for that counter to return to zero IS waiting for
+      // the decode — the same fact the Parakeet drain branch above relies on,
+      // bounded by the same deadline so the hotkey gains no unbounded time.
+      waitForForcedDecode: async (capMs?: number) => {
+        const started = performance.now();
+        const cap =
+          typeof capMs === "number" && Number.isFinite(capMs) && capMs > 0
+            ? capMs
+            : PARAKEET_DRAIN_DEADLINE_MS;
+        while (performance.now() - started < cap) {
+          if (pendingFinalsRef.current === 0) {
+            return performance.now() - started;
+          }
+          await new Promise<void>((resolve) =>
+            setTimeout(resolve, DRAIN_STEP_MS),
+          );
+        }
+        return null;
+      },
+    });
+    return () => registerForceEndpoint(null);
+  }, []);
+
   // Never leave a capture session (tracks + AudioContext) running on unmount.
   useEffect(
     () => () => {
@@ -1690,6 +1863,8 @@ export function useInterviewAudio() {
     parakeetStatus,
     /** Human-readable reason the model is unavailable, or null while fine. */
     parakeetMessage,
+    /** Per-phase timings from the last load, or null before the first one. */
+    parakeetBreakdown,
     /** What is known about the Parakeet MODEL, as opposed to the loaded host. */
     parakeetUiState: parakeetUi,
     /** The "Download model / Use Moonshine" explanation, or null when fine. */
@@ -1710,7 +1885,7 @@ export function useInterviewAudio() {
     /** Reload the model after a failure, without restarting the interview. */
     retryParakeet: () => void ensureParakeetLoaded(),
     /** Whether Moonshine has been pulled in as a fallback this session. */
-    moonshineFallbackActive: () => moonshineLazyRequestedRef.current,
+    moonshineFallbackActive: () => moonshineLazyRequestedForRef.current != null,
     debugAudios,
     /** Whether the dev-only WAV dump is currently recording. */
     debugWavOn,
@@ -1775,6 +1950,37 @@ async function resampleTo16k(
 }
 
 // AudioWorklet VAD Implementation
+/** What the worklet knows about its own open phrase, mirrored in the renderer. */
+export interface VadState {
+  /** A phrase is accumulating (buffer non-empty and speech seen). */
+  phraseOpen: boolean;
+  /** Speech seconds accumulated in the open phrase. */
+  speechSeconds: number;
+  /** The most recent frame was below the silence threshold. */
+  silentNow: boolean;
+}
+
+/** The control surface `setupVADWorklet` hands back to its caller. */
+export interface VadHandle {
+  /**
+   * Ask the worklet to close its open phrase now. Resolves with what it did.
+   * Never rejects and never hangs: bounded by `FORCE_ENDPOINT_TIMEOUT_MS`.
+   */
+  forceEndpoint: () => Promise<ForceEndpointReply>;
+  /** Current mirror of the worklet's phrase state. */
+  state: () => VadState;
+}
+
+/**
+ * How long the renderer waits for the worklet's `forceEndpointResult`.
+ *
+ * Short on purpose. The point of the force is to remove up to
+ * `MAX_SILENCE_SECONDS` (1.5 s) of waiting; spending a second waiting for the
+ * force itself would give most of it back. A round trip on the message port is
+ * sub-millisecond in practice, so this only covers a wedged worklet.
+ */
+export const FORCE_ENDPOINT_TIMEOUT_MS = 250;
+
 function setupVADWorklet(
   audioCtx: AudioContext,
   sourceNode: AudioNode,
@@ -1831,7 +2037,7 @@ function setupVADWorklet(
    * above are byte-for-byte what they were.
    */
   onPrimarySegment: (segment: CapturedSegment) => void,
-) {
+): VadHandle {
   const workletNode = new AudioWorkletNode(audioCtx, "vad-processor");
 
   sourceNode.connect(workletNode);
@@ -1847,6 +2053,21 @@ function setupVADWorklet(
   // phrase ended must not resurrect a stale interim line.
   let lastClosedPhraseId = -1;
 
+  // ── Force-endpoint state ──────────────────────────────────────────────────
+  // Mirrors what the worklet knows, refreshed ~20x/s from the level messages.
+  // The worklet still re-checks authoritatively before it closes anything; this
+  // is here so the RENDERER can decide cheaply and report a real reason instead
+  // of firing a request that is certain to be refused.
+  const vadState: VadState = {
+    phraseOpen: false,
+    speechSeconds: 0,
+    silentNow: true,
+  };
+
+  // One request at a time. The hotkey path is the only caller, and two
+  // concurrent requests would race on the same phrase.
+  const forceWaiters = new Map<number, (r: ForceEndpointReply) => void>();
+
   workletNode.port.onmessage = async (e) => {
     if (e.data.type === "log") {
       addLog(e.data.message);
@@ -1858,6 +2079,36 @@ function setupVADWorklet(
         peak: (e.data.peak as number) ?? 0,
         speaking: !!e.data.speaking,
       });
+      // Additive fields; absent on an older worklet build, hence the guards.
+      vadState.phraseOpen = e.data.phraseOpen === true;
+      vadState.silentNow = e.data.silentNow !== false;
+      vadState.speechSeconds =
+        typeof e.data.speechSeconds === "number" && e.data.speechSeconds > 0
+          ? e.data.speechSeconds
+          : 0;
+      return;
+    }
+
+    // ── Force-endpoint reply ────────────────────────────────────────────
+    // The worklet has closed the open phrase (or refused). When it fired, the
+    // normal `speech` handler above has already run on this same message, so
+    // `onFinalQueued()` has been called and the drain barrier will see the
+    // phrase as pending — which is the entire point of asking.
+    if (e.data.type === "forceEndpointResult") {
+      const reply: ForceEndpointReply = {
+        type: "forceEndpointResult",
+        fired: !!e.data.fired,
+        bufferedSeconds:
+          typeof e.data.bufferedSeconds === "number" ? e.data.bufferedSeconds : 0,
+        speakingNow: !!e.data.speakingNow,
+      };
+      vadState.phraseOpen = false;
+      vadState.speechSeconds = 0;
+      const waiter = forceWaiters.get(0);
+      if (waiter) {
+        forceWaiters.delete(0);
+        waiter(reply);
+      }
       return;
     }
 
@@ -2010,5 +2261,40 @@ function setupVADWorklet(
     } catch (err) {
       addLog(`Resample failed: ${err}`);
     }
+  };
+
+  // ── The handle ─────────────────────────────────────────────────────────
+  // `forceEndpoint` asks THIS worklet to close ITS open phrase. It resolves
+  // with what the worklet actually did, and always resolves: a worklet that
+  // never answers must not be able to hang the hotkey, so the wait is bounded
+  // by `FORCE_ENDPOINT_TIMEOUT_MS` and a timeout reports `fired: false`.
+  return {
+    forceEndpoint: () =>
+      new Promise<ForceEndpointReply>((resolve) => {
+        if (forceWaiters.size > 0) {
+          // A request is already in flight; do not queue a second one.
+          resolve({
+            type: "forceEndpointResult",
+            fired: false,
+            bufferedSeconds: vadState.speechSeconds,
+            speakingNow: !vadState.silentNow,
+          });
+          return;
+        }
+        forceWaiters.set(0, resolve);
+        workletNode.port.postMessage({ type: "force-endpoint" });
+        setTimeout(() => {
+          const waiter = forceWaiters.get(0);
+          if (!waiter) return;
+          forceWaiters.delete(0);
+          waiter({
+            type: "forceEndpointResult",
+            fired: false,
+            bufferedSeconds: vadState.speechSeconds,
+            speakingNow: false,
+          });
+        }, FORCE_ENDPOINT_TIMEOUT_MS);
+      }),
+    state: () => ({ ...vadState }),
   };
 }

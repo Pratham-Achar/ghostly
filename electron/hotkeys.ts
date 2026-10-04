@@ -72,7 +72,17 @@ export function registerHotkeys(win: BrowserWindow): void {
       showWindow();
     }
     win.focus();
-    win.webContents.send("ghostly:solve");
+    // `pressedAt` is the wall-clock instant of the keypress in THIS process.
+    //
+    // It exists because `performance.now()` has a different origin in the main
+    // process than in the renderer, so a renderer-side duration can never reach
+    // back to the press. `Date.now()` is the same clock on both sides of an IPC
+    // hop, so the one cross-process metric —
+    // `hotkey_pressed -> final transcript committed` — can be computed by
+    // subtracting two `Date.now()` values. The accuracy of that subtraction is
+    // the system clock's, not `performance.now()`'s, and the Latency report says
+    // so rather than quoting a sub-millisecond figure it cannot deliver.
+    win.webContents.send("ghostly:solve", { pressedAt: Date.now() });
   });
 
   // Show / Hide — Ctrl+B

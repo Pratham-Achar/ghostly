@@ -19,12 +19,20 @@
  * is strictly faster here, and it keeps a single decode path.
  *
  * ── Why a bound is still needed ─────────────────────────────────────────────
- * The load is ~7 s and a phrase is ~2-3 s, so at most two or three segments can
- * plausibly arrive first. But "plausibly" is not a guarantee: a cold model on a
- * loaded machine can take far longer, and an unbounded queue holding 16 kHz
- * `Float32Array`s is unbounded memory in the renderer. Four is generous enough
- * to cover the normal cold start and small enough that the worst case is a few
- * seconds of audio.
+ * An unbounded queue holding 16 kHz `Float32Array`s is unbounded memory in the
+ * renderer. The bound is stated in TWO units because one is not sufficient:
+ * eight very short segments is a fraction of a second of audio, while three
+ * long ones is nearly the whole cap. Whichever is reached first drops, so the
+ * worst case is bounded in BOTH count and duration.
+ *
+ * ── Why eight and 60 s ──────────────────────────────────────────────────────
+ * The load was measured at 6.5 s standalone but 14.7–23.8 s in the app on a
+ * machine already running the renderer, the capture pipeline and the ASR
+ * comparison columns. At ~3–5 s per phrase, 60 s of cover is twelve to twenty
+ * phrases — comfortably past the worst observed load, which is the entire point
+ * of raising it from four. The old limit of four overflowed after roughly
+ * 12–20 s of speech, which is exactly the window the slowest observed load
+ * landed in.
  *
  * ── Which end overflow drops ────────────────────────────────────────────────
  * The OLDEST. A segment's job is to carry the question; the newest one is the
@@ -32,29 +40,63 @@
  * barrier is designed to protect. Dropping the newest would discard exactly what
  * the user is about to submit.
  */
-export const PARAKEET_PRIMARY_QUEUE_LIMIT = 4;
+export const PARAKEET_PRIMARY_QUEUE_LIMIT = 8;
+
+/**
+ * Ceiling on buffered AUDIO, in seconds.
+ *
+ * Derived from the measurement above rather than from the segment count, because
+ * the two are genuinely different failure modes: a long-phrased speaker
+ * overflows the count bound in seconds and a staccato one overflows the time
+ * bound in a minute, and only the second bound describes how much audio — and
+ * therefore how much memory — is actually at stake.
+ *
+ * 16 kHz mono `Float32Array` costs 64 KB per second, so the absolute worst case
+ * here is under 4 MB.
+ */
+export const PARAKEET_PRIMARY_QUEUE_MAX_SECONDS = 60;
 
 /** A segment waiting for the model to finish loading. */
 export interface QueuedParakeetSegment<T> {
   /** Monotonic, supplied by the caller — the VAD phraseId. */
   phraseId: number;
   payload: T;
+  /**
+   * Speech duration of the segment, in seconds.
+   *
+   * Required because the queue's second bound is expressed in seconds and the
+   * queue has no way to measure audio itself. The caller knows this from the
+   * VAD; passing it in keeps the queue pure and testable with plain numbers.
+   */
+  seconds: number;
 }
 
 export interface SegmentQueueSnapshot {
   /** Segments currently buffered. */
   size: number;
-  /** Segments discarded because the queue was full. Never silently forgotten. */
+  /**
+   * Segments discarded because the queue was full, SINCE THE LAST `clear()`.
+   *
+   * Scoped to a session rather than to the object's lifetime on purpose: the
+   * hook calls `clear()` on Start Interview, and a cumulative counter would make
+   * the second session of a morning announce "14 dropped so far" from a session
+   * that has dropped nothing yet.
+   */
   dropped: number;
+  /** Buffered audio, in seconds. */
+  seconds: number;
 }
+
+/** Why a push returned `false`. */
+export type QueueOverflowReason = "count" | "seconds";
 
 export interface ParakeetSegmentQueue<T> {
   /**
    * Buffer a segment.
    *
-   * Returns `true` if it was accepted, `false` if the queue was full and this
-   * segment displaced an older one. A `false` return is a real loss and must be
-   * surfaced to the user, never swallowed.
+   * Returns `true` if it was accepted. `false` means the queue was full and
+   * this segment DISPLACED an older one — a real loss that must be surfaced to
+   * the user, never swallowed.
    */
   push(segment: QueuedParakeetSegment<T>): boolean;
   /** Remove and return the oldest segment, or `null` when empty. */
@@ -63,38 +105,83 @@ export interface ParakeetSegmentQueue<T> {
   size(): number;
   /** Counters, for the diagnostics line and the on-screen log. */
   snapshot(): SegmentQueueSnapshot;
-  /** Forget everything, e.g. on Stop Interview. */
+  /** Why the most recent push overflowed, or `null` when it did not. */
+  lastOverflowReason(): QueueOverflowReason | null;
+  /**
+   * Forget everything, e.g. on Stop Interview / Start Interview.
+   *
+   * Resets the drop counter as well as the buffer: the queue is scoped to ONE
+   * interview, and a counter carried across sessions reports losses that did not
+   * happen in the session being described.
+   */
   clear(): void;
 }
 
 export function createParakeetSegmentQueue<T>(
   limit: number = PARAKEET_PRIMARY_QUEUE_LIMIT,
+  maxSeconds: number = PARAKEET_PRIMARY_QUEUE_MAX_SECONDS,
 ): ParakeetSegmentQueue<T> {
   const items: QueuedParakeetSegment<T>[] = [];
   let dropped = 0;
+  let bufferedSeconds = 0;
+  let overflow: QueueOverflowReason | null = null;
 
   return {
     push(segment) {
-      if (items.length >= limit) {
-        items.shift();
+      const seconds =
+        Number.isFinite(segment.seconds) && segment.seconds > 0
+          ? segment.seconds
+          : 0;
+
+      // Whether this push overflows, and WHY, decided before anything is
+      // evicted so the reported reason names the bound that actually broke.
+      const countOverflow = items.length >= limit;
+      const secondsOverflow = bufferedSeconds + seconds > maxSeconds;
+      overflow = countOverflow ? "count" : secondsOverflow ? "seconds" : null;
+      const accepted = overflow === null;
+
+      // Evict from the OLDEST end until BOTH bounds have room.
+      //
+      // Re-checking both bounds after every removal is what makes the
+      // invariant "buffered <= maxSeconds" actually hold at all times. Testing
+      // only the incoming segment's own length would let the queue hold eight
+      // 40 s segments — 320 s — which defeats the point of a time bound.
+      while (items.length >= limit || bufferedSeconds + seconds > maxSeconds) {
+        const evicted = items.shift();
+        // Nothing left to evict. A single segment longer than the whole time
+        // bound is still admitted: dropping the only buffered question means
+        // losing it outright, which is strictly worse than briefly exceeding
+        // the bound. `overflow` still reports it so the caller can log it.
+        if (!evicted) break;
+        bufferedSeconds -= evicted.seconds;
         dropped++;
-        items.push(segment);
-        return false;
       }
+
       items.push(segment);
-      return true;
+      bufferedSeconds += seconds;
+      return accepted;
     },
     shift() {
-      return items.shift() ?? null;
+      const next = items.shift() ?? null;
+      if (next) bufferedSeconds -= next.seconds;
+      return next;
     },
     size() {
       return items.length;
     },
     snapshot() {
-      return { size: items.length, dropped };
+      return { size: items.length, dropped, seconds: bufferedSeconds };
+    },
+    lastOverflowReason() {
+      return overflow;
     },
     clear() {
       items.length = 0;
+      bufferedSeconds = 0;
+      overflow = null;
+      // Reset, not carried. See the `dropped` doc comment: the counter describes
+      // THIS session, and `clear()` is how a session begins.
+      dropped = 0;
     },
   };
 }

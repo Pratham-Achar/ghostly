@@ -19,7 +19,15 @@ interface Window {
 
     // Events
     onScreenshot: (cb: (b64: string) => void) => () => void;
-    onSolve: (cb: () => void) => () => void;
+    /**
+     * The main process' wall-clock instant of the `Ctrl+Enter` press.
+     *
+     * Sent because `performance.now()` origins differ between processes: the
+     * renderer cannot otherwise measure `hotkey_pressed -> committed`. Both ends
+     * are `Date.now()` on one machine, so the difference is meaningful to within
+     * the system clock rather than to `performance.now()`'s resolution.
+     */
+    onSolve: (cb: (payload: { pressedAt: number | null }) => void) => () => void;
     onStartOver: (cb: () => void) => () => void;
     onInterviewType: (type: string, cb: () => void) => () => void;
 
@@ -140,6 +148,15 @@ interface Window {
     parakeetLoad: () => Promise<{
       ok: boolean;
       loadMs?: number;
+      breakdown?: {
+        spawn: number | null;
+        require: number | null;
+        read: number | null;
+        construct: number | null;
+        total: number;
+        endToEnd: number;
+        modelBytes: number | null;
+      };
       rssMb?: number;
       code?: string;
       message?: string;
@@ -162,6 +179,15 @@ interface Window {
     parakeetDiagnostics: () => Promise<{
       status: string;
       loadMs: number | null;
+      breakdown?: {
+        spawn: number | null;
+        require: number | null;
+        read: number | null;
+        construct: number | null;
+        total: number;
+        endToEnd: number;
+        modelBytes: number | null;
+      } | null;
       rssMb: number | null;
       decodeMs?: number | null;
       rtf?: number | null;

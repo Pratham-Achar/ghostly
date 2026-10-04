@@ -309,9 +309,19 @@ console.log("\n── The wiring: probe on open, load on Start ─────�
   checkTrue("57 the probe effect is gated on the primary engine",
     /if \(!shouldProbeParakeetModel\(primaryAsr\)\) return;/.test(hook));
   const loads = hook.match(/void ensureParakeetLoaded\(\);/g) ?? [];
-  check("58 the model is loaded from exactly ONE place: Start Interview",
-    loads.length, 1);
-  checkTrue("59 that place is inside startInterview",
+  // There are now TWO call sites, and both are deliberate:
+  //   1. Start Interview — the default path, unchanged.
+  //   2. Panel open, ONLY when the opt-in `parakeetPreload` setting is on.
+  // What must stay true is the property this test was originally written for:
+  // the model is never loaded as a side effect of a STATUS check, and
+  // preloading is impossible unless the user explicitly asked for it.
+  check("58 the model is loaded from exactly TWO places: Start, and the opt-in preload",
+    loads.length, 2);
+  checkTrue("58b the preload call site is guarded by the opt-in setting",
+    /if \(primaryAsr !== "parakeet"\) return;\s*if \(!preloadParakeet\) return;/.test(hook));
+  checkTrue("58c and by a model that is actually INSTALLED",
+    /if \(parakeetUi !== "installed"\) return;/.test(hook));
+  checkTrue("59 the Start path is unchanged",
     /const needsParakeet[\s\S]*?if \(needsParakeet\) \{\s*void ensureParakeetLoaded\(\);/.test(hook));
   checkFalse("60 the probe effect does not load the model",
     /shouldProbeParakeetModel\(primaryAsr\)\) return;\s*void ensureParakeetLoaded/.test(hook));
