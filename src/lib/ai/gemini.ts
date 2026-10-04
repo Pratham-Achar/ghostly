@@ -50,13 +50,46 @@ export function parseGeminiEvent(data: any): GeminiChunk {
  * there) so it gets the documented minimum of 128. Gemini 1.5/2.0 reject the
  * field outright, hence the version check.
  */
-export function geminiGenerationConfig(model: string, maxTokens: number) {
+export function geminiGenerationConfig(
+  model: string,
+  maxTokens: number,
+  /**
+   * Overrides for the thinking budget.
+   *
+   * ── Why an override exists ────────────────────────────────────────────────
+   * The default below is the shipping policy: Flash thinks 0, Pro thinks the
+   * documented minimum of 128. That is right for an interview answer and wrong
+   * for a MEASUREMENT, because Phase 8.3 needs to compare the two on latency and
+   * quality — which is impossible if only one of them is reachable.
+   *
+   * `thinkingBudget` is therefore overridable, and `undefined` (the default)
+   * means "use the shipping policy exactly as before". Nothing about the live
+   * path changes; the benchmark passes a number.
+   *
+   * The string `"provider-default"` is the third state and it is the one the
+   * benchmark actually needs. For Flash the shipping policy IS `thinkingBudget:
+   * 0`, so "compare against the default" is impossible unless the field can be
+   * omitted entirely — which is how you ask for the API's own default
+   * (dynamic thinking on 2.5 Flash). Sending `0` twice would produce a benchmark
+   * that reports a real-looking delta of zero and teaches the wrong lesson.
+   */
+  opts: { thinkingBudget?: number | "provider-default" } = {},
+) {
   const config: any = { maxOutputTokens: maxTokens, temperature: 0.3 };
 
   if (/^gemini-(?:2\.5|3)/i.test(model)) {
-    config.thinkingConfig = {
-      thinkingBudget: /pro/i.test(model) ? 128 : 0,
-    };
+    if (opts.thinkingBudget === "provider-default") {
+      // Field omitted entirely: the provider applies its own default.
+      return config;
+    }
+    const budget =
+      typeof opts.thinkingBudget === "number"
+        ? Math.max(0, Math.floor(opts.thinkingBudget))
+        : // Pro cannot take 0 (it is a 400), so it gets the documented floor.
+          /pro/i.test(model)
+          ? 128
+          : 0;
+    config.thinkingConfig = { thinkingBudget: budget };
   }
 
   return config;
@@ -106,10 +139,18 @@ export class GeminiProvider implements AIProvider {
       messages = [],
       model,
       apiKey,
-      maxTokens = 4096,
-      signal,
-      meta,
-    } = options;
+    maxTokens = 4096,
+    signal,
+    meta,
+    /**
+     * Phase 8.3 benchmark seam. Not part of `AIRequestOptions` on purpose —
+     * adding it there would put a measurement knob on the live request path,
+     * where it could be set by accident.
+     */
+    thinkingBudget,
+  } = options as AIRequestOptions & {
+    thinkingBudget?: number | "provider-default";
+  };
 
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:streamGenerateContent?alt=sse&key=${apiKey}`;
 
@@ -147,7 +188,7 @@ export class GeminiProvider implements AIProvider {
 
     const body: any = {
       contents,
-      generationConfig: geminiGenerationConfig(model, maxTokens),
+      generationConfig: geminiGenerationConfig(model, maxTokens, { thinkingBudget }),
     };
 
     // Behavioural rules live in Gemini's native system slot so a user-role

@@ -1,5 +1,9 @@
 import { getProvider, type ProviderName } from "./index";
-import { isModelUnavailableError } from "./fetchWithDiagnostics";
+import {
+  isModelUnavailableError,
+  takeRecordedResponseHeaders,
+} from "./fetchWithDiagnostics";
+import { decideCooldown } from "../providerCooldown";
 import { isWaitResponse } from "../interviewAgent";
 import { validateAnswerOutput } from "../outputValidation";
 import type { AIProvider, AIRequestOptions, AIStreamMeta } from "./types";
@@ -140,6 +144,13 @@ export interface OrchestratorResult {
   }>;
   aborted: boolean;
   error?: string;
+  /**
+   * Providers that were in the chain but never attempted because they were on
+   * cooldown. Reported to the user as "back in 2h 15m" rather than as a raw
+   * provider error, so a dead provider is visibly parked rather than silently
+   * missing.
+   */
+  skipped: Array<{ provider: ProviderName; detail: string }>;
 }
 
 export interface OrchestrateOptions {
@@ -160,6 +171,34 @@ export interface OrchestrateOptions {
    * has to know about prompts, WAIT or artefacts.
    */
   validate?: (text: string) => { ok: boolean; reason?: string };
+  /**
+   * Cooldown gate, consulted ONCE per provider before it is scheduled.
+   *
+   * Supplied by the caller (`lib/providerCooldown.ts`) rather than owned here so
+   * the orchestrator stays free of clock and state: it asks "may this provider
+   * run?" and records the answer. A provider that is parked is REMOVED from the
+   * queue, so it costs no latency at all — which matters, because a 429 that
+   * waits for a timeout is exactly the failure mode this replaces.
+   */
+  cooldown?: {
+    /** Whether the provider is currently parked. */
+    isBlocked: (provider: ProviderName) => { blocked: boolean; detail?: string };
+    /**
+     * Called after a provider FAILS, so the caller can park it. Returning
+     * nothing keeps this module in charge of nothing at all.
+     */
+    reportFailure?: (
+      provider: ProviderName,
+      info: {
+        message: string;
+        status?: number;
+        /** Best-effort header bag from the last response; may be undefined. */
+        headers?: Record<string, string>;
+      },
+    ) => void;
+  };
+  /** Injected clock; the cooldown caller's business, exposed for symmetry. */
+  now?: () => number;
   onStatus?: (status: StatusUpdate) => void;
   log?: (line: string) => void;
   /** Test seam; defaults to the real provider registry. */
@@ -211,9 +250,33 @@ export async function orchestrateAnswer(
   const hedgeMs = opts.hedgeMs ?? OPENROUTER_HEDGE_MS;
   const maxConcurrent = opts.maxConcurrent ?? MAX_CONCURRENT_PROVIDERS;
 
-  const queue = opts.attempts.filter((a) => a.apiKey?.trim());
+  let queue = opts.attempts.filter((a) => a.apiKey?.trim());
   const attemptsStarted: AttemptTelemetry[] = [];
   const failures: OrchestratorResult["failures"] = [];
+  const skipped: OrchestratorResult["skipped"] = [];
+  const now = opts.now ?? (() => Date.now());
+
+  // Parked providers are removed from the queue up front, not retried and
+  // skipped later. Removing them is the point: a provider that is known to be
+  // out of quota must not consume a slot, a timeout, or the user's attention.
+  if (opts.cooldown) {
+    const runnable: AttemptSpec[] = [];
+    for (const spec of queue) {
+      const gate = opts.cooldown.isBlocked(spec.provider);
+      if (gate.blocked) {
+        skipped.push({
+          provider: spec.provider,
+          detail: gate.detail ?? "on cooldown",
+        });
+        log(
+          `[AI] provider=${spec.provider} SKIPPED — ${gate.detail ?? "on cooldown"}`,
+        );
+        continue;
+      }
+      runnable.push(spec);
+    }
+    queue = runnable;
+  }
 
   const inFlight = new Map<ProviderName, InFlight>();
   let cursor = 0;
@@ -368,6 +431,27 @@ export async function orchestrateAnswer(
         const reason = classify(err);
         telemetry.outcome = "failed";
         telemetry.failureReason = reason;
+
+        // ── Cooldown report ─────────────────────────────────────────────
+        // Called for EVERY hard failure, including the first one. The caller
+        // decides what is worth parking (see `lib/providerCooldown.ts`); the
+        // orchestrator just supplies the facts it has. Headers come from the
+        // fetch choke point because the provider threw away the response.
+        //
+        // Guarded because it runs in a `finally`-adjacent path: an exception
+        // here must never turn a provider failure into a crashed interview.
+        try {
+          opts.cooldown?.reportFailure?.(spec.provider, {
+            message: err instanceof Error ? err.message : String(err),
+            // The provider threw a bare Error, so the status is recovered from
+            // the message by the cooldown module rather than invented here.
+            status: undefined,
+            headers: takeRecordedResponseHeaders(spec.provider),
+          });
+        } catch {
+          /* cooldown bookkeeping must never break a run */
+        }
+
         failures.push({
           provider: spec.provider,
           model: spec.model,
@@ -448,8 +532,17 @@ export async function orchestrateAnswer(
       attempts: 0,
       attemptsStarted,
       failures,
+      skipped,
       aborted: false,
-      error: "No provider has an API key.",
+      // Distinguish the two reasons the queue can be empty, because they need
+      // different fixes and the raw message used to hide the difference.
+      error: skipped.length
+        ? `Every provider in the chain is on cooldown: ${skipped
+            .map((s) => `${s.provider} (${s.detail})`)
+            .join("; ")}.`
+        : opts.attempts.every((a) => !a.apiKey?.trim())
+          ? "No provider has an API key."
+          : "No provider in the chain is available.",
     };
   }
 
@@ -531,6 +624,7 @@ export async function orchestrateAnswer(
     attempts: attemptsStarted.length,
     attemptsStarted,
     failures,
+    skipped,
     aborted,
     error: winner
       ? undefined
