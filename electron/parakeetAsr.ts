@@ -12,6 +12,7 @@ import {
   type ParakeetHostRequest,
   type ParakeetHostMode,
   type ParakeetModelStatus,
+  type ParakeetLoadBreakdown,
 } from "../src/lib/parakeetHost";
 import {
   startParakeetDiagnostics,
@@ -62,6 +63,8 @@ export interface ParakeetIpcOutcome {
   text?: string;
   decodeMs?: number;
   loadMs?: number;
+  /** Per-phase load timings from the child. See `ParakeetLoadBreakdown`. */
+  breakdown?: ParakeetLoadBreakdown;
   rssMb?: number;
   rtf?: number;
   code?: string;
@@ -116,7 +119,16 @@ function adaptUtilityProcess(child: Electron.UtilityProcess): ParakeetChildLike 
     paddingMs: options.paddingMs,
     log: options.log ?? ((line) => console.log(line)),
     spawnChild: () =>
-      adaptUtilityProcess(utilityProcess.fork(workerPath, [], { stdio: "pipe" })),
+      adaptUtilityProcess(
+        utilityProcess.fork(workerPath, [], {
+          stdio: "pipe",
+          // The child cannot know when it was forked, so the fork instant is
+          // stamped into its environment. This is what makes the `spawn` phase
+          // of the load breakdown measurable at all — without it the child can
+          // only time itself from its own first line, which is always ~0.
+          env: { ...process.env, PARAKEET_SPAWN_ORIGIN_MS: String(Date.now()) },
+        }),
+      ),
   };
   return new ParakeetHost(deps);
 }

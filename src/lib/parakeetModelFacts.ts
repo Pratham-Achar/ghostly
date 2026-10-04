@@ -61,3 +61,43 @@ export const PARAKEET_UNPACKED_BYTES = PARAKEET_REQUIRED_FILES.reduce(
   (n, f) => n + f.bytes,
   0,
 );
+
+/**
+ * Resident memory the loaded model costs, in MB, and where that number comes
+ * from.
+ *
+ * ── MEASURED, not estimated ──────────────────────────────────────────────────
+ * Taken from three consecutive real loads through the production
+ * `utilityProcess` path (`npx electron scripts/smoke-parakeet-host.cjs` on this
+ * machine, 7.8 GB total RAM):
+ *
+ *   child RSS immediately after load      725.5 / 736.6 / —  MB
+ *   child RSS after one 7.4 s decode      783.6 / — / —    MB
+ *
+ * So ~740 MB is the honest number to quote for "the model is loaded", and ~785
+ * MB once it has decoded something. The extra ~45 MB is decoder scratch space,
+ * not weights, and it is not returned between segments.
+ *
+ * ── Why this is a separate constant ─────────────────────────────────────────
+ * It appears in three places that cannot import each other (Settings copy, the
+ * interview panel caption, and the doc comment on the setting itself), and a
+ * figure that drifts between them is worse than no figure.
+ */
+export const PARAKEET_LOADED_RSS_MB = 740;
+
+/** RSS after the first decode, when decoder scratch has been allocated. */
+export const PARAKEET_DECODED_RSS_MB = 785;
+
+/**
+ * One-line statement of what preloading costs, for the Settings toggle.
+ *
+ * Deliberately names both the RAM and the time it buys, so the choice is an
+ * informed one rather than a preference between "on" and "off".
+ */
+export function describeParakeetPreloadCost(): string {
+  return (
+    `Loads the model (~${PARAKEET_LOADED_RSS_MB} MB of memory, ~7s) as soon as ` +
+    `you open the Live Interview panel instead of when you press Start. ` +
+    `It stays in memory until Stop Interview or 5 minutes of no speech.`
+  );
+}

@@ -195,6 +195,11 @@ async function runViaUtilityProcess() {
   const child = utilityProcess.fork(WORKER, [], {
     stdio: "pipe",
     serviceName: "parakeet-smoke",
+    // Same stamp the app uses, so the `spawn` phase of the load breakdown is
+    // measured the SAME way here and in `electron/parakeetAsr.ts`. Without it
+    // the standalone number and the in-app number are not comparable, which is
+    // the entire question this harness exists to answer.
+    env: { ...process.env, PARAKEET_SPAWN_ORIGIN_MS: String(Date.now()) },
   });
   console.log(`worker          : ${path.relative(PROJECT_ROOT, WORKER)}`);
   console.log(`child pid       : ${child.pid}`);
@@ -217,6 +222,20 @@ async function runViaUtilityProcess() {
   console.log(`message         : ${loaded.message ?? "-"}`);
   console.log(`child loadMs    : ${loaded.loadMs ?? "-"} ms`);
   console.log(`host wall clock : ${loadWall} ms`);
+  if (loaded.breakdown) {
+    const b = loaded.breakdown;
+    const show = (v) => (v == null ? "-" : `${v} ms`);
+    console.log("load breakdown  :");
+    console.log(`   spawn        : ${show(b.spawn)}   (fork -> first line of child)`);
+    console.log(`   require      : ${show(b.require)}   (sherpa-onnx-node native addon)`);
+    console.log(`   read         : ${show(b.read)}   (stat + page-cache warm)`);
+    console.log(`   construct    : ${show(b.construct)}   (ONNX session creation)`);
+    console.log(`   total        : ${show(b.total)}   (read + require + construct)`);
+    console.log(`   endToEnd     : ${show(b.endToEnd)}   (spawn + total)`);
+    console.log(
+      `   modelBytes   : ${b.modelBytes == null ? "-" : `${(b.modelBytes / 1048576).toFixed(0)} MB`}`,
+    );
+  }
   console.log(`child rssMb     : ${loaded.rssMb ?? "-"} MB`);
   console.log(`host rss        : ${rssBefore} MB -> ${rssMb()} MB`);
 

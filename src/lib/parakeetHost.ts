@@ -174,6 +174,46 @@ export interface ParakeetHostReply {
   rssMb?: number;
   code?: string;
   message?: string;
+  /**
+   * Per-phase load timings, produced by the child (see
+   * `electron/parakeetWorker.cjs`). Nulls mean the phase was never reached.
+   *
+   * Exists because "the load took 15s" is not actionable: this is what
+   * separates a slow process spawn from a slow native-addon require from a
+   * cold page cache from genuinely expensive session construction.
+   */
+  breakdown?: ParakeetLoadBreakdown;
+}
+
+/**
+ * Where a model load spends its time, in milliseconds.
+ *
+ *  • spawn    — process fork → first line of the child executing.
+ *  • require  — loading the sherpa-onnx native addon.
+ *  • read     — stat + page-cache warm of the model files.
+ *  • construct — ONNX session creation and weight init.
+ *  • total    — the child's own `load`: read + require + construct.
+ *  • endToEnd — what the user waited for: spawn + total.
+ */
+export interface ParakeetLoadBreakdown {
+  spawn: number | null;
+  require: number | null;
+  read: number | null;
+  construct: number | null;
+  total: number;
+  endToEnd: number;
+  modelBytes: number | null;
+}
+
+/** One-line rendering for the log. Never contains audio or model contents. */
+export function formatLoadBreakdown(b: ParakeetLoadBreakdown): string {
+  const ms = (v: number | null) => (v == null ? "?" : `${v}ms`);
+  const mb = (b.modelBytes ?? 0) / 1048576;
+  return (
+    `spawn=${ms(b.spawn)} require=${ms(b.require)} read=${ms(b.read)} ` +
+    `construct=${ms(b.construct)} total=${ms(b.total)} endToEnd=${ms(b.endToEnd)} ` +
+    `modelMb=${mb.toFixed(0)}`
+  );
 }
 
 /** The minimal surface the host needs from a child. */
@@ -232,6 +272,8 @@ export interface ParakeetHostResult {
   text?: string;
   decodeMs?: number;
   loadMs?: number;
+  /** Per-phase load timings, when the child reported them. */
+  breakdown?: ParakeetLoadBreakdown;
   rssMb?: number;
   /** decode time / audio duration. Present on successful decodes only. */
   rtf?: number;
@@ -261,6 +303,7 @@ export class ParakeetHost {
   private consecutiveFailures = 0;
   private idleTimer: unknown = null;
   private lastLoadMs: number | null = null;
+  private lastLoadBreakdown: ParakeetLoadBreakdown | null = null;
   private lastRssMb: number | null = null;
   /**
    * Latency of the most recent decode, and its RTF.
@@ -313,6 +356,7 @@ export class ParakeetHost {
     return {
       status: this.status,
       loadMs: this.lastLoadMs,
+      breakdown: this.lastLoadBreakdown,
       rssMb: this.lastRssMb,
       decodeMs: this.lastDecodeMs,
       rtf: this.lastRtf,
@@ -360,6 +404,7 @@ export class ParakeetHost {
     if (outcome.ok) {
       this.status = "ready";
       this.lastLoadMs = outcome.loadMs ?? null;
+      this.lastLoadBreakdown = outcome.breakdown ?? null;
       this.lastRssMb = outcome.rssMb ?? null;
       // Deliberately NOT resetting `consecutiveFailures` here.
       //
@@ -369,7 +414,12 @@ export class ParakeetHost {
       // but crashed on every single decode reset the budget each time — so the
       // host would respawn forever, which is precisely the restart loop
       // {@link PARAKEET_MAX_RESTARTS} exists to prevent.
-      this.log(`[Parakeet] model ready loadMs=${outcome.loadMs ?? "?"} rssMb=${outcome.rssMb ?? "?"}`);
+      this.log(
+        `[Parakeet] model ready loadMs=${outcome.loadMs ?? "?"} rssMb=${outcome.rssMb ?? "?"}` +
+          (outcome.breakdown
+            ? ` breakdown: ${formatLoadBreakdown(outcome.breakdown)}`
+            : ""),
+      );
     } else {
       this.status = outcome.code === "model_missing" ? "missing" : "error";
       this.log(`[Parakeet] model load failed code=${outcome.code ?? "?"} message=${outcome.message ?? ""}`);
@@ -536,6 +586,7 @@ export class ParakeetHost {
             text: reply.text ?? "",
             decodeMs: reply.decodeMs,
             loadMs: reply.loadMs,
+            breakdown: reply.breakdown,
             rssMb: reply.rssMb,
           }
         : {

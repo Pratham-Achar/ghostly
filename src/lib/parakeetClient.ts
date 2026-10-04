@@ -37,11 +37,35 @@ export type ParakeetStatus =
   | "ready"
   | "error";
 
+/**
+ * Per-phase model-load timings, measured in the utility process.
+ *
+ * Present so "the load took 15s" can be split into spawn / native-addon require
+ * / page-cache warm / ONNX session construction — four problems with four very
+ * different fixes, all of which look identical from the outside.
+ */
+export interface ParakeetLoadBreakdown {
+  /** Process fork → first line of the child executing. */
+  spawn: number | null;
+  /** `require("sherpa-onnx-node")` — the native addon off disk. */
+  require: number | null;
+  /** Stat + page-cache warm of the model files. */
+  read: number | null;
+  /** ONNX session creation and weight init. */
+  construct: number | null;
+  /** The child's own load: read + require + construct. */
+  total: number;
+  /** What the user actually waited for: spawn + total. */
+  endToEnd: number;
+  modelBytes: number | null;
+}
+
 export interface ParakeetTranscript {
   ok: boolean;
   text?: string;
   decodeMs?: number;
   loadMs?: number;
+  breakdown?: ParakeetLoadBreakdown;
   rssMb?: number;
   rtf?: number;
   code?: string;
@@ -147,6 +171,7 @@ export async function unloadParakeetModel(): Promise<void> {
 export async function getParakeetDiagnostics(): Promise<{
   status: string;
   loadMs: number | null;
+  breakdown?: ParakeetLoadBreakdown | null;
   rssMb: number | null;
   decodeMs?: number | null;
   rtf?: number | null;
