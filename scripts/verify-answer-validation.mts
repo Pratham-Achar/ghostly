@@ -398,6 +398,147 @@ async function run(scripts: Record<string, Script>, hedgeMs = 40) {
   check("5g answer text preserved", res.text, DEFAULT_ANSWER);
 }
 
+// ── 5i. REGRESSION: "and Answer that text" must never win ────────────────
+//
+// Observed in the live run as turn 1791060167441-w9zhux, provider
+// groq/allam-2-7b. The exact string is asserted, character for character,
+// because a near-miss proves nothing about the bug that actually happened.
+//
+// Why every OTHER check missed it, recorded so the test is not "fixed" back:
+//   • META_RESPONSE_RE only catches ASKING for the question; this ORDERS.
+//   • TEMPLATE_LEAK_PHRASES holds the full Groq directive wording; the model
+//     echoed a mangled fragment, so the exact-substring test missed.
+//   • readsAsLabel is defeated by the word "that", which is a sentence marker,
+//     so the label test correctly declines to fire.
+{
+  const OBSERVED = "and Answer that text";
+
+  check(
+    "5i REGRESSION: the exact observed string is rejected",
+    interviewValidate(OBSERVED).ok,
+    false,
+  );
+  check(
+    "5i REGRESSION: rejected as a bare directive, not by accident",
+    interviewValidate(OBSERVED).reason,
+    "artifact-directive",
+  );
+  check(
+    "5i REGRESSION: detectAnswerArtifact agrees",
+    detectAnswerArtifact(OBSERVED).reason,
+    "artifact-directive",
+  );
+
+  // Same rule, case and whitespace insensitively — the model is not going to
+  // reproduce casing reliably.
+  for (const variant of [
+    "Answer that text",
+    "and answer that text",
+    "and Answer that Text.",
+    "and  Answer   that   text",
+  ]) {
+    check(
+      `5i variant rejected: ${JSON.stringify(variant)}`,
+      validateAnswerOutput(variant).ok,
+      false,
+    );
+  }
+
+  // The rule generalises to the whole class: any bare imperative at the model
+  // whose object is the conversation itself.
+  for (const directive of [
+    "Repeat the prompt",
+    "Translate this text",
+    "Summarize the passage",
+    "Please answer that question",
+    "Rewrite the above message",
+  ]) {
+    check(
+      `5i directive rejected: ${JSON.stringify(directive)}`,
+      validateAnswerOutput(directive).ok,
+      false,
+    );
+  }
+
+  // ── The other direction, which is the one that matters ───────────────
+  // A STRUCTURAL rule is only acceptable if it cannot reject a real answer.
+  // Every one of these contains a content word that is neither a speech-act verb
+  // nor a conversation-reference noun, which is what makes them pass.
+  for (const legit of [
+    "I would answer that question by explaining how the parser works.",
+    "Answer the question in the simplest way you can: it usually means the state is local to the request.",
+    "We use an index to avoid a full table scan on every read.",
+    "Yes.",
+    "It's mainly used for dependency injection.",
+    "That question is really about cache invalidation, so I'd start there.",
+    "A hash map gives O(1) average lookup because it buckets keys by hash.",
+    "And that is the only reason it fails.",
+  ]) {
+    check(
+      `5i legitimate answer accepted: ${JSON.stringify(legit.slice(0, 40))}`,
+      validateAnswerOutput(legit, {
+        question: "Why do they use Java as their backend language?",
+      }).ok,
+      true,
+    );
+  }
+
+  // It must not have become a topic blacklist: interview vocabulary has to
+  // survive, including the words the rule itself keys on.
+  for (const topical of [
+    "The index question you asked about is exactly where a B-tree beats a hash map.",
+    "We would repeat the migration on a staging cluster first.",
+    "The answer is a queue with backpressure, not a bigger pool.",
+  ]) {
+    check(
+      `5i topical answer accepted: ${JSON.stringify(topical.slice(0, 40))}`,
+      validateAnswerOutput(topical).ok,
+      true,
+    );
+  }
+
+  // Through the REAL orchestrator: a provider returning the observed string must
+  // not win, and the run must still be able to produce a valid answer.
+  checkTrue(
+    "5i orchestrator: the observed string never wins",
+    await (async () => {
+      const { registry } = buildRegistry({
+        groq: { chunks: [OBSERVED] },
+        gemini: {
+          chunks: [
+            "A hash map gives O(1) average lookup because it buckets keys by hash.",
+          ],
+        },
+      });
+      const run = await orchestrateAnswer({
+        attempts: specs("groq", "gemini"),
+        prompt: "p",
+        signal: new AbortController().signal,
+        validate: interviewValidate,
+        resolveProvider: (name) => registry[name],
+        log: () => {},
+      });
+      return run.provider === "gemini" && run.winner;
+    })(),
+  );
+
+  checkTrue(
+    "5i orchestrator: the observed string alone produces NO winner",
+    await (async () => {
+      const { registry } = buildRegistry({ groq: { chunks: [OBSERVED] } });
+      const run = await orchestrateAnswer({
+        attempts: specs("groq"),
+        prompt: "p",
+        signal: new AbortController().signal,
+        validate: interviewValidate,
+        resolveProvider: (name) => registry[name],
+        log: () => {},
+      });
+      return !run.winner && run.text === "";
+    })(),
+  );
+}
+
 // ── 5h. The Groq-only answer directive is applied, and ONLY to Groq ───────
 {
   const directive = groqAnswerDirective();
