@@ -39,6 +39,8 @@
  *   having no context.
  */
 
+import type { ConversationThread } from "./conversationThread";
+
 /** What kind of problem is active. Affects labelling only, never the decision. */
 export type ProblemKind = "coding" | "system_design" | "other";
 
@@ -59,6 +61,18 @@ export interface ActiveProblem {
 export interface SessionContext {
   activeProblem: ActiveProblem | null;
   /**
+   * The drill-down layer: a technical / project discussion, carried across
+   * questions.
+   *
+   * Kept INSIDE this object rather than in a parallel slice on purpose. The two
+   * layers are related but not interchangeable, and "one context system, not two
+   * independent ones" is only true if they are stored, cleared and reasoned
+   * about together. See `conversationThread.ts` for the layer itself.
+   *
+   * Cleared by Reset Interview, NOT by Clear Chat or Next Question.
+   */
+  conversationThread: ConversationThread | null;
+  /**
    * A short deterministic excerpt of a VALIDATED answer.
    *
    * Phrased as what GHOSTLY suggested, never as what the candidate did. This is
@@ -72,6 +86,7 @@ export interface SessionContext {
 
 export const EMPTY_SESSION_CONTEXT: SessionContext = {
   activeProblem: null,
+  conversationThread: null,
   approachSummary: null,
   userNotes: null,
 };
@@ -414,8 +429,15 @@ export function pruneSessionContext(
     now - ctx.activeProblem.lastUsedAt > SESSION_CONTEXT_TTL_MS
   ) {
     // The approach summary and user notes are tied to the problem; keeping them
-    // would leave a half-context that attaches to nothing.
-    return { activeProblem: null, approachSummary: null, userNotes: null };
+    // would leave a half-context that attaches to nothing. The THREAD is pruned
+    // on its own clock (`THREAD_TTL_MS`) by the caller via `continueThread`,
+    // because its lifecycle is deliberately shorter.
+    return {
+      ...ctx,
+      activeProblem: null,
+      approachSummary: null,
+      userNotes: null,
+    };
   }
   return ctx;
 }
@@ -442,6 +464,11 @@ export function startProblem(
     // for a different problem. User notes survive, because they are pasted
     // material about the new problem too.
     approachSummary: null,
+    // The THREAD survives: a new coding problem does not end the technical
+    // discussion that was running alongside it. Part 18 requires the two layers
+    // to coexist, and clearing one because the other changed would break exactly
+    // the screen-plus-project scenario.
+    conversationThread: ctx.conversationThread,
     userNotes: ctx.userNotes,
   };
 }

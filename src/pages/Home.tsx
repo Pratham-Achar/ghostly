@@ -44,6 +44,12 @@ import { SessionContextChip } from "../components/SessionContextChip";
 import { describeDrain, drainInterviewAsr } from "../lib/asrDrain";
 import { forceEndpointOnSubmit } from "../lib/forceEndpointRunner";
 import { shadowOverlapCheck, type ShadowOverlap } from "../lib/outputValidation";
+import { selectContextBlock } from "../lib/contextSelection";
+import {
+  appendThreadTurn,
+  extractAnswerHead,
+  startThread,
+} from "../lib/conversationThread";
 import {
   createStageRecorder,
   type ProviderTiming,
@@ -579,11 +585,48 @@ export const Home: React.FC = () => {
           }
         }
 
-        // Empty string when nothing applies, which keeps the prompt byte-identical
-        // to the previous output on every non-follow-up turn.
-        const ctxBlock = verdict.attach
-          ? buildContextBlock(activeCtx)
-          : "";
+        // ── Which ONE block goes in the prompt ────────────────────────────
+        //
+        // `activeProblem` and `conversationThread` can both be live at once, and
+        // exactly one may be attached. `selectContextBlock` owns that choice, so
+        // the precedence rule lives in one tested function rather than in this
+        // component.
+        //
+        // Empty string when nothing applies, which is what keeps the prompt
+        // byte-identical to the previous output on every non-follow-up turn.
+        const selection = selectContextBlock({
+          question: resolvedQuestion,
+          problem: verdict,
+          context: activeCtx,
+          thread: activeCtx.conversationThread,
+          now: ctxNow,
+        });
+        const ctxBlock = selection.block;
+
+        // The thread turn is appended AFTER the answer is validated, because the
+        // excerpt must come from a validated answer — see below. What is decided
+        // HERE is only whether this question continues the thread or opens a new
+        // subject, since that depends on the question alone.
+        const threadVerdict = selection.threadVerdict;
+        if (resolvedQuestion) {
+          if (threadVerdict.attach) {
+            console.log(
+              `[CTX] thread attached overlap=${threadVerdict.overlap} turns=${activeCtx.conversationThread?.turns.length ?? 0}`,
+            );
+          } else if (
+            threadVerdict.reason === "new subject: does not attach" ||
+            threadVerdict.reason === "thread expired (older than the TTL)"
+          ) {
+            // A fresh subject REPLACES the thread. Never a silent revive of
+            // expired context, and never two subjects in one thread.
+            const fresh = startThread(resolvedQuestion, ctxNow);
+            activeCtx = { ...activeCtx, conversationThread: fresh };
+            setSessionContext(activeCtx);
+            console.log(
+              `[CTX] thread started — ${threadVerdict.reason}`,
+            );
+          }
+        }
 
         prompt = buildInterviewUserPrompt(interviewTurn, {
           questionIndex,
@@ -872,6 +915,36 @@ export const Home: React.FC = () => {
           question: answeredQuestion,
           promptTemplate: INTERVIEW_SYSTEM_PROMPT,
         });
+
+        // ── Record this turn on the conversation thread ───────────────────
+        //
+        // ONLY a VALIDATED answer is excerpted. An answer that failed the gate
+        // is by definition a refusal or a prompt artefact, and storing an
+        // excerpt of one would feed garbage into every later turn's prompt.
+        //
+        // The question is recorded either way, because it was genuinely asked
+        // — it is the answer that must be trustworthy, and a turn with a null
+        // answerHead omits the line rather than printing a bare label.
+        if (answeredQuestion) {
+          const head = validation.ok
+            ? extractAnswerHead(fullSolution)
+            : null;
+          const prior = useStore.getState().sessionContext;
+          // The thread may have been replaced by the selection step above; read
+          // it back rather than using the stale local copy.
+          if (prior.conversationThread) {
+            const next = appendThreadTurn(
+              prior.conversationThread,
+              answeredQuestion,
+              head,
+              Date.now(),
+            );
+            setSessionContext({ ...prior, conversationThread: next });
+            console.log(
+              `[CTX] thread turn recorded turns=${next.turns.length} answerHead=${head ? "yes" : "none"}`,
+            );
+          }
+        }
 
         // ── SHADOW RULE (c) — computed, logged, NEVER enforced ─────────────
         //

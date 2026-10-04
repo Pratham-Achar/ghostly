@@ -8,6 +8,7 @@ import {
   type ProblemSource,
   type SessionContext,
 } from "../lib/sessionContext";
+import { describeThread } from "../lib/conversationThread";
 
 /**
  * The session-context chip.
@@ -64,6 +65,38 @@ export const SessionContextChip: React.FC<SessionContextChipProps> = ({
   const [draftNotes, setDraftNotes] = useState("");
 
   const problem = context.activeProblem;
+  const thread = context.conversationThread;
+
+  // ── Thread-only chip ────────────────────────────────────────────────────
+  // A drill-down discussion is a context in its own right, so it must be
+  // visible when there is no coding problem. Rendering nothing here would make
+  // "Ghostly attached the wrong context" impossible to notice, which is the one
+  // job the chip exists for.
+  if (!problem && thread) {
+    return (
+      <div
+        className="flex items-center gap-2 px-2 py-1.5 rounded-lg"
+        style={{
+          background: "rgba(120, 140, 200, 0.08)",
+          border: "1px solid rgba(140, 160, 220, 0.18)",
+        }}
+      >
+        <span className="text-[9px] uppercase tracking-wider text-white/35 flex-none">
+          Thread
+        </span>
+        <span className="text-[10px] text-white/70 font-mono flex-1 truncate">
+          {describeThread(thread)}
+        </span>
+        <button
+          type="button"
+          onClick={onClear}
+          className="flex-none px-1.5 py-0.5 rounded bg-white/[0.06] hover:bg-white/[0.12] text-[9px] font-mono text-white/50"
+        >
+          Clear
+        </button>
+      </div>
+    );
+  }
 
   if (!problem) {
     return offerSolution && onUseSolution ? (
@@ -174,6 +207,17 @@ export const SessionContextChip: React.FC<SessionContextChipProps> = ({
               Save
             </button>
           </div>
+        </div>
+      )}
+
+      {thread && (
+        <div className="flex items-center gap-2">
+          <span className="text-[9px] uppercase tracking-wider text-white/35 flex-none">
+            Thread
+          </span>
+          <span className="text-[10px] text-white/55 font-mono flex-1 truncate">
+            {describeThread(thread)}
+          </span>
         </div>
       )}
 

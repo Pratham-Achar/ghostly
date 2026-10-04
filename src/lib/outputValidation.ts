@@ -464,6 +464,15 @@ const SESSION_CONTEXT_LABEL_PATTERNS: RegExp[] = [
   /^\s*ghostly'?s\s+earlier\s+suggested\s+approach\s*:/i,
   /^\s*user\s+notes\s*:/i,
   /^\s*end[_ ]active[_ ]problem\b/i,
+  // ── The conversation-thread layer's labels ────────────────────────────
+  // ADDITIVE ONLY. All four can only come from our own prompt block, so their
+  // presence in an ANSWER means the model reproduced our scaffolding instead of
+  // answering. That is the same class of leak the labels above catch, and a
+  // new block that is not covered here is a new hole.
+  /^\s*earlier\s+interview\s+thread\b/i,
+  /^\s*earlier\s+suggested\s+answer\s*:/i,
+  /^\s*background\s+context\s*:/i,
+  /^\s*active\s+problem\s+context\s*:/i,
 ];
 
 /**
