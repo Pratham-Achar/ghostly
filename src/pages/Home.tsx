@@ -41,6 +41,7 @@ import {
 } from "../lib/interviewAgent";
 import { validateAnswerOutput } from "../lib/outputValidation";
 import { SessionContextChip } from "../components/SessionContextChip";
+import { LiveScreenPanel } from "../components/LiveScreenPanel";
 import { describeDrain, drainInterviewAsr } from "../lib/asrDrain";
 import { forceEndpointOnSubmit } from "../lib/forceEndpointRunner";
 import { shadowOverlapCheck, type ShadowOverlap } from "../lib/outputValidation";
@@ -200,6 +201,8 @@ export const Home: React.FC = () => {
    * and a 1s interval would re-render the overlay forever.
    */
   const [ctxTick, setCtxTick] = useState(() => Date.now());
+  // Bumped by Reset Interview so Live Screen forgets the watched region too.
+  const [liveScreenReset, setLiveScreenReset] = useState(0);
   useEffect(() => {
     const t = setInterval(() => setCtxTick(Date.now()), 30_000);
     return () => clearInterval(t);
@@ -1453,6 +1456,10 @@ export const Home: React.FC = () => {
       // the next question be answered as a follow-up to a conversation the user
       // just declared finished.
       clearSessionContext();
+      // The watched screen region goes with it: the region belonged to the
+      // problem that just been discarded, and leaving it watched would let the
+      // next session silently adopt a problem from the previous one's screen.
+      setLiveScreenReset((n) => n + 1);
     });
 
     // Interview Type Shortcuts — Ctrl+Shift+1/2/3/4/5/6
@@ -1634,6 +1641,29 @@ export const Home: React.FC = () => {
                   }
                 />
               )}
+
+              {/*
+                Live Screen. It only WATCHES and PROPOSES: the panel offers a
+                problem it read off the screen, and installing it needs the
+                click below, exactly like "Use answer as context" above.
+                `isStreaming` is a proxy for "transcription is live" — the real
+                decode runs in a worker the renderer cannot see — and the
+                main-process RAM guard is what actually protects the machine.
+              */}
+              <LiveScreenPanel
+                asrBusy={isStreaming}
+                resetSignal={liveScreenReset}
+                onUseProblem={(text) =>
+                  setSessionContext(
+                    startProblem(
+                      sessionContext,
+                      text,
+                      Date.now(),
+                      "live-screen",
+                    ),
+                  )
+                }
+              />
 
               {answerIssue && (
                 <motion.div

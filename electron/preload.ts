@@ -29,6 +29,45 @@ contextBridge.exposeInMainWorld("ghostly", {
   captureFullscreen: (): Promise<string> =>
     ipcRenderer.invoke("ghostly:capture-fullscreen"),
 
+  // ── Live Screen ────────────────────────────────────────────────────────
+  // NOTE there is deliberately NO API here that returns pixels. Frames are
+  // captured, compared and OCR'd inside the main process; the renderer only
+  // chooses a region, switches the watcher on and off, and reads a status.
+  liveScreenConfigure: (config: {
+    region?: { x: number; y: number; width: number; height: number } | null;
+    enabled?: boolean;
+  }): Promise<void> => ipcRenderer.invoke("ghostly:live-screen-configure", config),
+
+  liveScreenStatus: (): Promise<any> =>
+    ipcRenderer.invoke("ghostly:live-screen-status"),
+
+  liveScreenAsrBusy: (busy: boolean): Promise<void> =>
+    ipcRenderer.invoke("ghostly:live-screen-asr-busy", busy),
+
+  liveScreenReset: (): Promise<void> =>
+    ipcRenderer.invoke("ghostly:live-screen-reset"),
+
+  liveScreenPickRegion: (): Promise<{
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+  } | null> => ipcRenderer.invoke("ghostly:live-screen-pick-region"),
+
+  /** Fires when a local read changes the active problem. */
+  onLiveScreenProblem: (cb: (update: any) => void): (() => void) => {
+    const listener = (_e: unknown, update: any) => cb(update);
+    ipcRenderer.on("ghostly:live-screen-problem", listener);
+    return () => ipcRenderer.removeListener("ghostly:live-screen-problem", listener);
+  },
+
+  onLiveScreenStatusChanged: (cb: () => void): (() => void) => {
+    const listener = () => cb();
+    ipcRenderer.on("ghostly:live-screen-status-changed", listener);
+    return () =>
+      ipcRenderer.removeListener("ghostly:live-screen-status-changed", listener);
+  },
+
   // Settings persistence
   getSettings: (): Promise<any> => ipcRenderer.invoke("get-settings"),
   saveSettings: (settings: any): Promise<void> =>

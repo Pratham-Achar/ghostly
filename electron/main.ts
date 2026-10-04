@@ -10,6 +10,7 @@ import {
 import path from "path";
 import { registerHotkeys, unregisterHotkeys } from "./hotkeys";
 import { registerIpcHandlers } from "./ipc";
+import { initLiveScreen } from "./liveScreen";
 import { applyStealthMode, removeStealthMode } from "./stealth";
 import {
   createVisibilityController,
@@ -187,6 +188,14 @@ function createTray(): Tray {
 
 app.whenReady().then(() => {
   registerIpcHandlers();
+  // Live Screen reports upward through the window. The controller itself holds
+  // no Electron reference, which keeps its capture-and-compare loop testable.
+  initLiveScreen({
+    onProblem: (update) =>
+      mainWindow?.webContents.send("ghostly:live-screen-problem", update),
+    onStatus: () =>
+      mainWindow?.webContents.send("ghostly:live-screen-status-changed"),
+  });
   mainWindow = createMainWindow();
   tray = createTray();
   registerHotkeys(mainWindow);

@@ -43,7 +43,6 @@ import { selectContextBlock } from "../src/lib/contextSelection";
 import { appendThreadTurn, startThread } from "../src/lib/conversationThread";
 
 let pass = 0;
-let fail = 0;
 const failures: string[] = [];
 
 function check(name: string, actual: unknown, expected: unknown) {
@@ -529,14 +528,60 @@ check(
   check("12g and the follow-up then uses it", classifyFollowUp("What is the time complexity?", ctx, now).attach, true);
 }
 
-// ── Summary ─────────────────────────────────────────────────────────────────
+// ── 13. Privacy and no-cloud assertions on the real capture path ───────────
+
+{
+  const { readFileSync } = require("node:fs") as typeof import("node:fs");
+  const read = (p: string) => readFileSync(p, "utf8") as string;
+
+  const controller = read("electron/liveScreen.ts");
+  const capture = read("electron/capture.ts");
+  const ocr = read("electron/windowsOcr.ts");
+  const preload = read("electron/preload.ts");
+
+  // Part 26.4 — a captured frame is never written to disk.
+  checkFalse("13a the controller writes no file", /writeFile|createWriteStream|appendFile/.test(controller));
+  checkFalse("13b the capture path writes no file", /writeFile|createWriteStream|appendFile/.test(capture));
+  checkFalse("13c the OCR path writes no file", /writeFile|createWriteStream|appendFile/.test(ocr));
+
+  // Part 26.5 / 26.15 — no frame is ever encoded, logged or uploaded.
+  checkFalse("13d the controller never encodes an image", /toDataURL|toPNG|base64|data:image/.test(controller));
+  checkFalse("13e the OCR path never encodes an image", /toDataURL|toPNG|base64|data:image/.test(ocr));
+  checkFalse("13f no console output in the controller at all", /console\./.test(controller));
+
+  // Part 26.14 / 26.15 — Live Screen makes no network call of any kind.
+  const networkPattern = /\bfetch\(|require\(["']https?["']\)|XMLHttpRequest|axios/i;
+  checkFalse("13g the controller makes no request", networkPattern.test(controller));
+  checkFalse("13h the capture path makes no request", networkPattern.test(capture));
+  checkFalse("13i the OCR path makes no request", networkPattern.test(ocr));
+
+  // Part 26.15 — the renderer has no channel that could carry pixels.
+  const liveScreenBlock = preload.slice(
+    preload.indexOf("── Live Screen"),
+    preload.indexOf("── Deepgram"),
+  );
+  checkTrue("13j the preload bridge exists", liveScreenBlock.length > 0);
+  checkFalse(
+    "13k the bridge returns no image data",
+    /Promise<string>|ArrayBuffer|Uint8Array|base64|dataUrl/.test(liveScreenBlock),
+  );
+
+  // Part 26.3 — capture is genuinely region-only: GDI transfers exactly the
+  // selected rectangle, and nothing takes a whole-screen thumbnail on this path.
+  checkTrue("13l capture uses BitBlt", /BitBlt/.test(capture));
+  checkTrue("13m and reads back with GetDIBits", /GetDIBits/.test(capture));
+  checkFalse(
+    "13n and never calls desktopCapturer on the region path",
+    /desktopCapturer/.test(capture.slice(capture.indexOf("captureRegionBgra"))),
+  );
+}
 
 console.log(`\nLIVE SCREEN POLICY`);
 console.log(`  poll interval        : ${LIVE_SCREEN_POLL_MS} ms`);
 console.log(`  max reads per minute : ${LIVE_SCREEN_MAX_OCR_PER_MINUTE}`);
 console.log(`  min gap between reads: ${LIVE_SCREEN_MIN_OCR_GAP_MS} ms`);
 console.log(`  min free RAM         : ${LIVE_SCREEN_MIN_FREE_RAM_MB} MB`);
-console.log(`\n${pass} passed, ${fail} failed`);
+console.log(`\n${pass} passed, ${failures.length} failed`);
 if (failures.length) {
   console.log("\nFAILURES:\n" + failures.join("\n"));
   process.exit(1);

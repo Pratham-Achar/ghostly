@@ -46,6 +46,7 @@ import { validateAnswerOutput } from "../src/lib/outputValidation";
 
 let pass = 0;
 let fail = 0;
+void fail; // summarised from `failures.length` below
 const failures: string[] = [];
 
 function check(name: string, actual: unknown, expected: unknown) {
@@ -448,7 +449,7 @@ check("3i handles an answer with no terminator", extractAnswerHead("Redis keeps 
 
 // ── Summary ────────────────────────────────────────────────────────────────
 
-console.log(`${pass} passed, ${fail} failed`);
+console.log(`${pass} passed, ${failures.length} failed`);
 if (failures.length) {
   console.log("\nFAILURES:\n" + failures.join("\n"));
   process.exit(1);

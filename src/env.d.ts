@@ -268,5 +268,46 @@ interface Window {
       mode: "visible" | "hidden",
     ) => Promise<{ ok: boolean; mode: "visible" | "hidden" }>;
     getVisibility: () => Promise<"visible" | "hidden">;
+
+    // ── Live Screen ───────────────────────────────────────────────────
+    //
+    // Note what is ABSENT, and it is the point: there is no method that
+    // returns a frame, a screenshot, a data URL or base64 pixels. Live Screen
+    // captures, compares and OCRs inside the main process; the renderer can
+    // only choose a region, switch the watcher on and off, and read a status
+    // that contains no screen content.
+    liveScreenConfigure: (config: {
+      region?: { x: number; y: number; width: number; height: number } | null;
+      enabled?: boolean;
+    }) => Promise<void>;
+    liveScreenStatus: () => Promise<{
+      enabled: boolean;
+      region: { x: number; y: number; width: number; height: number } | null;
+      on: string;
+      regionLabel: string;
+      ocrLabel: string;
+      contextLabel: string;
+      ocrAvailable: boolean;
+      ocrUnavailableReason: string | null;
+      polls: number;
+      reads: number;
+      framesSkipped: number;
+      lastError: string | null;
+    }>;
+    /** Tell main whether transcription is live, so OCR yields to it. */
+    liveScreenAsrBusy: (busy: boolean) => Promise<void>;
+    liveScreenReset: () => Promise<void>;
+    /** Opens a full-screen overlay; resolves with a device-pixel rect or null. */
+    liveScreenPickRegion: () => Promise<{
+      x: number;
+      y: number;
+      width: number;
+      height: number;
+    } | null>;
+    /** Fires when a local read decides the active problem should change. */
+    onLiveScreenProblem: (
+      cb: (update: { problemText: string | null; reason: string }) => void,
+    ) => () => void;
+    onLiveScreenStatusChanged: (cb: () => void) => () => void;
   };
 }

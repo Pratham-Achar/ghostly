@@ -6,6 +6,13 @@ import { registerParakeetHandlers, resolveModelDir } from "./parakeetAsr";
 import { registerAsrExportHandlers } from "./asrExport";
 import { registerNvidiaAiHandlers } from "./nvidiaAi";
 import { registerDebugClipHandlers } from "./debugClipWriter";
+import {
+  configureLiveScreen,
+  getLiveScreenSnapshot,
+  resetLiveScreen,
+  setLiveScreenAsrBusy,
+} from "./liveScreen";
+import { pickScreenRegion } from "./regionPicker";
 import Store from "electron-store";
 
 const store = new Store({
@@ -53,6 +60,29 @@ const store = new Store({
 });
 
 export function registerIpcHandlers(): void {
+  // ── Live Screen ─────────────────────────────────────────────────────────
+  // Deliberately narrow: the renderer can point the watcher at a region, switch
+  // it on and off, and read a status snapshot. There is no channel that returns
+  // pixels, because the frames are captured, compared and read inside the main
+  // process and are never meant to exist anywhere else. See electron/liveScreen.ts.
+  ipcMain.handle(
+    "ghostly:live-screen-configure",
+    (_event, config: { region?: { x: number; y: number; width: number; height: number } | null; enabled?: boolean }) => {
+      configureLiveScreen(config ?? {});
+    },
+  );
+
+  ipcMain.handle("ghostly:live-screen-status", () => getLiveScreenSnapshot());
+
+  ipcMain.handle("ghostly:live-screen-asr-busy", (_event, busy: boolean) => {
+    setLiveScreenAsrBusy(Boolean(busy));
+  });
+
+  ipcMain.handle("ghostly:live-screen-reset", () => {
+    resetLiveScreen();
+  });
+
+  ipcMain.handle("ghostly:live-screen-pick-region", () => pickScreenRegion());
   // Grants navigator.mediaDevices.getDisplayMedia() a screen with system-audio
   // loopback, so the renderer can transcribe the interviewer's voice. Using
   // this handler avoids the flaky legacy `chromeMediaSource: 'desktop'` path.
