@@ -295,6 +295,16 @@ check("3i handles an answer with no terminator", extractAnswerHead("Redis keeps 
   checkFalse("10c and the empty case contains no context labels",
     /ACTIVE_PROBLEM|EARLIER INTERVIEW THREAD|Earlier suggested answer/i.test(withEmptyBlock));
 
+  // A whitespace-only block must ALSO be identity. The guard is `?.trim()`,
+  // not truthiness, precisely so that a stray "   " from a caller cannot open
+  // an empty context section. Without the `.trim()` this check fails.
+  const withBlankBlock = buildInterviewUserPrompt(turn, {
+    questionIndex: 0,
+    contextBlock: "   \n  ",
+  });
+  checkTrue("10c2 a whitespace-only context block is byte-identical too",
+    withBlankBlock === withNoOption);
+
   // The selector's own "none" must feed the builder byte-identically.
   const none = selectContextBlock({
     question: "Thanks.",
