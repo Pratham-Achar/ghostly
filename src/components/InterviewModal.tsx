@@ -76,6 +76,21 @@ export const InterviewModal: React.FC<InterviewModalProps> = ({
   // Developer-only engine comparison, read straight from the store.
   const asrComparisons = useStore((s) => s.asrComparisons);
   const asrCompareParakeet = useStore((s) => s.settings.asrCompareParakeet);
+  const asrCompareMode = useStore((s) => s.settings.asrCompareMode);
+  const asrCompareGroq = useStore((s) => s.settings.asrCompareGroq);
+  // ── Cloud-audio indicator ────────────────────────────────────────────────
+  // Deepgram and Groq Whisper comparison send the RAW AUDIO off the machine.
+  // Both are off by default and additionally hard-blocked outside DEV, so this
+  // can only ever be true in a development build the user explicitly
+  // configured. It is still worth stating on screen: "your microphone audio is
+  // being uploaded to a third party right now" is not something anyone should
+  // have to infer from a dev-only checkbox.
+  const cloudComparisonEngines = useMemo(() => {
+    const names: string[] = [];
+    if (import.meta.env.DEV && asrCompareMode) names.push("Deepgram");
+    if (import.meta.env.DEV && asrCompareGroq) names.push("Groq Whisper");
+    return names;
+  }, [asrCompareMode, asrCompareGroq]);
   const updateSettings = useStore((s) => s.updateSettings);
   const [parakeetPaddingMs, setParakeetPaddingMs] = useState(
     () => useStore.getState().settings.parakeetPaddingMs ?? PARAKEET_PADDING_MS,
@@ -716,6 +731,25 @@ export const InterviewModal: React.FC<InterviewModalProps> = ({
                 )}
                 {fallbackNotice && (
                   <div className="text-amber-200/80">{fallbackNotice}</div>
+                )}
+                {/* ── Cloud-audio indicator ────────────────────────────────
+                 * Rendered whenever a COMPARISON engine that uploads raw audio
+                 * is enabled. It sits with the other dev diagnostics rather
+                 * than in Settings because the consequence is about the live
+                 * session, not about the saved configuration. */}
+                {cloudComparisonEngines.length > 0 && (
+                  <div
+                    role="status"
+                    className="rounded border border-red-500/60 bg-red-500/10 px-2 py-1 text-red-200"
+                  >
+                    <span className="font-semibold">
+                      Recording audio is being uploaded to{" "}
+                      {cloudComparisonEngines.join(" and ")}.
+                    </span>{" "}
+                    Turn the Deepgram / Groq comparison off in Settings to stop
+                    sending microphone audio off this machine. The primary
+                    engine is unaffected.
+                  </div>
                 )}
               </div>
 

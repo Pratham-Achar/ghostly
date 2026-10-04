@@ -37,6 +37,16 @@
 /** How long a CORS-blocked provider is skipped. "The rest of the session." */
 export const CORS_SESSION_COOLDOWN_MS = 12 * 60 * 60 * 1000;
 
+/**
+ * A missing / deprecated model id is parked for the whole session.
+ *
+ * Not a tunable: the failure is deterministic. Nothing the app does can make
+ * `nvidia/llama-3.1-nemotron-70b-instruct` exist, so the only fix is a human
+ * opening Settings. Matches the CORS cooldown's intent — skip for the session,
+ * tell the user why.
+ */
+export const MODEL_SESSION_COOLDOWN_MS = 12 * 60 * 60 * 1000;
+
 /** Fallback when a 429 says nothing about when it resets. */
 export const DEFAULT_QUOTA_COOLDOWN_MS = 60 * 60 * 1000;
 
@@ -51,6 +61,8 @@ export type CooldownKind =
   | "quota"
   /** Blocked by CORS in the renderer; will not change during the session. */
   | "cors"
+  /** The configured model does not exist / is not enabled for this account. */
+  | "model"
   /** Transport-level failure: offline, DNS, TLS, reset. */
   | "network";
 
@@ -251,6 +263,23 @@ export function isCorsOrNetworkFailure(message: string): boolean {
  * real 429, so a provider that reports its limit only in prose is still parked
  * instead of retried.
  */
+/**
+ * True when the provider says the MODEL is the problem, whatever the status.
+ *
+ * Several gateways report a missing model as 400 or 422 with prose rather than
+ * a 404, so the status alone is not sufficient — observed NVIDIA 404 and other
+ * providers' prose both have to land in the same branch.
+ */
+export function looksLikeMissingModel(message: string): boolean {
+  const text = message.toLowerCase();
+  return (
+    /model/.test(text) &&
+    /(does not exist|not found|no such model|invalid model|unknown model|deprecat|is not available|unavailable|not enabled|no access)/.test(
+      text,
+    )
+  );
+}
+
 export function looksLikeRateLimit(message: string): boolean {
   const text = message.toLowerCase();
   return (
@@ -317,6 +346,27 @@ export function decideCooldown(input: {
   //     a network blip and retried in 30 seconds instead of parked for hours.
   if (status == null && looksLikeRateLimit(message)) {
     return quotaDecision(provider, message, headers, now);
+  }
+
+  // 1c. A missing MODEL, detected from the message. MUST run before every status
+  //     branch: gateways report a bad model id as 400, 404, 422, and sometimes
+  //     as nothing parseable at all — in which case the generic "no response"
+  //     branch below files it as a 30-second network blip and re-spends the
+  //     failure on every subsequent turn.
+  //
+  //     Deliberately keyed on the MESSAGE, never on a bare `status === 404`:
+  //     a 404 carrying no model wording is a wrong endpoint or a missing route,
+  //     which can be transient. Parking that for the whole session would silence
+  //     a provider that is working fine.
+  if (looksLikeMissingModel(message)) {
+    return {
+      cooldown: true,
+      kind: "model",
+      until: now + MODEL_SESSION_COOLDOWN_MS,
+      detail:
+        `${label} model not found — it is skipped for the rest of this session. ` +
+        `Choose another model in Settings.`,
+    };
   }
 
   // 2. A plain network failure with no recognisable text: short cooldown.

@@ -46,6 +46,8 @@ export type AnswerRejectionReason =
   | "artifact-numeric"
   | "artifact-meta"
   | "artifact-directive"
+  | "artifact-wait-sentinel"
+  | "artifact-conversation-instruction"
   | "no-prose";
 
 /**
@@ -156,6 +158,62 @@ const META_RESPONSE_RE = new RegExp(
     "^okay[.,!]*\\s*please note",
     // Our own label, lower-cased.
     "^background details",
+  ].join("|"),
+  "i",
+);
+
+/**
+ * The `WAIT` sentinel, as a STANDALONE token ANYWHERE in an answer.
+ *
+ * ── Why this is separate from `isWaitResponse` ─────────────────────────────
+ * `isWaitResponse` only fires when `WAIT` is the whole output, or the first
+ * line, or the whole line before a colon. A real observed failure was:
+ *
+ *   "What is the difference between a Node 79 - Node.js8 WAIT then provide a
+ *    clear question, and if a technical example or clarification, please WAIT"
+ *
+ * — `WAIT` appears twice, both mid-sentence, and that answer reached the UI.
+ * Once a model has emitted the sentinel it is refusing, so its presence
+ * anywhere is decisive regardless of what surrounds it.
+ *
+ * ── Why CASE-SENSITIVE ─────────────────────────────────────────────────────
+ * `WAIT` is the literal token the system prompt names (`reply with exactly:
+ * WAIT`), so it is always upper-case. A case-INSENSITIVE `\bwait\b` was
+ * measured against the 25 recorded fixture references and against
+ * hand-written correct answers, and it fires on real prose:
+ *
+ *   "I would wait for the index build to finish before measuring…"
+ *   "You wait on the future, and if replication lags you wait…"
+ *
+ * Case-sensitive measured **0/25 false rejects**; case-insensitive would have
+ * rejected correct answers. Case sensitivity is therefore a correctness
+ * requirement here, not a stylistic choice.
+ */
+const WAIT_SENTINEL_RE = /(?:^|[^A-Za-z])WAIT(?:[^A-Za-z]|$)/;
+
+/**
+ * An instruction ABOUT the conversation, addressed at the responder.
+ *
+ * ── Why `META_RESPONSE_RE` did not catch it ────────────────────────────────
+ * That regex requires a bare determiner before "question", so it matches "the
+ * question" and "a question" but not "a CLEAR question". The observed output
+ * said "provide a clear question", which fell straight through the gap. This
+ * pattern closes it by allowing the qualifier slot.
+ *
+ * Deliberately closed-class: the verbs are the request-for-input verbs and the
+ * only noun is the conversation artefact itself. No interview topic appears,
+ * so no legitimate technical answer can match — measured 0/25 false rejects on
+ * the recorded references.
+ */
+const CONVERSATION_INSTRUCTION_RE = new RegExp(
+  [
+    // "provide a clear question", "give me a more specific question", …
+    // The qualifier slot is what `META_RESPONSE_RE` was missing.
+    "(?:please\\s+)?(?:ask|give|provide|send|share|state|tell)\\s+(?:me\\s+)?(?:us\\s+)?(?:an?\\s+|the\\s+|your\\s+)(?:(?:more|clear(?:er)?|specific(?:ally)?|explicit|complete|full|exact|proper|whole)\\s+)*questions?",
+    // "please wait", "kindly wait for the question" — lower-case refusals.
+    "(?:please|kindly)\\s+wait\\b",
+    // "if you need a technical example or clarification, …" — the observed tail.
+    "\\b(?:technical\\s+)?(?:example|clarification)\\s*,?\\s*(?:or\\s+)?(?:clarification)?\\s*,?\\s*please\\s+wait",
   ].join("|"),
   "i",
 );
@@ -667,6 +725,29 @@ export function detectAnswerArtifact(
         detail: "answer reproduced an instruction-template phrase",
       };
     }
+  }
+
+  // 3b-bis. The WAIT sentinel as a standalone token ANYWHERE. Runs before the
+  // meta-response check so a mixed output ("…WAIT then provide a clear
+  // question…") is reported as the refusal it is, rather than as a generic
+  // meta-response. See {@link WAIT_SENTINEL_RE} for the case-sensitivity
+  // measurement that justifies it.
+  if (WAIT_SENTINEL_RE.test(trimmed)) {
+    return {
+      artifact: true,
+      reason: "artifact-wait-sentinel",
+      detail: "answer contained the WAIT refusal sentinel",
+    };
+  }
+
+  // 3b-ter. An instruction about the conversation rather than an answer to it.
+  // Closes the qualifier gap in `META_RESPONSE_RE` ("a clear question").
+  if (CONVERSATION_INSTRUCTION_RE.test(trimmed)) {
+    return {
+      artifact: true,
+      reason: "artifact-conversation-instruction",
+      detail: "answer instructed about the conversation instead of answering",
+    };
   }
 
   // 3b. Meta-response: asking for the question, requesting clarification, or

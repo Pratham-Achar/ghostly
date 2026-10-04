@@ -26,7 +26,7 @@
  *
  * The answer path is entirely inside the renderer, so every stage below is a
  * renderer-local `performance.now()` delta. The one cross-process metric is
- * `hotkey_pressed -> final transcript committed`, which spans main → renderer.
+ * `hotkey_pressed -> answer committed`, which spans main → renderer.
  * For that, main sends `pressedAt: Date.now()` and the renderer subtracts it
  * from its own `Date.now()` at the moment the answer is committed; the report
  * states the resulting accuracy rather than pretending it is sub-millisecond.
@@ -466,7 +466,12 @@ export function formatLatencyReport(turns: TurnTimings[]): string {
       lines.push(`  every value: ${values.join(", ")}`);
     }
   };
-  e2eLine("hotkey_pressed -> final transcript committed", hotkey);
+  // Named `hotkey -> ANSWER`, not `-> transcript`: the span runs from the keypress
+  // to the point an answer was committed to history, which is the only number a
+  // user experiences. `final transcript committed` was misleading twice over —
+  // it stopped sounding like a measurement once the AI stages were added, and
+  // it described a point (transcript) that is not the one being timed.
+  e2eLine("hotkey_pressed -> answer committed", hotkey);
   e2eLine("submit -> committed", committed);
   lines.push("");
 

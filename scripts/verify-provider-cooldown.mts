@@ -20,6 +20,7 @@ import {
   CORS_SESSION_COOLDOWN_MS,
   DEFAULT_NETWORK_COOLDOWN_MS,
   MAX_COOLDOWN_MS,
+  MODEL_SESSION_COOLDOWN_MS,
   applyCooldown,
   buildCooldownSummary,
   clearCooldown,
@@ -29,6 +30,7 @@ import {
   formatCooldown,
   isCorsOrNetworkFailure,
   isOnCooldown,
+  looksLikeMissingModel,
   looksLikeRateLimit,
   parseDurationProse,
   parseResetHeaders,
@@ -218,7 +220,12 @@ check("3g no status when there is none", extractStatus("invalid api key"), undef
     now: T0,
   });
   checkTrue("3l a 400 is parked too", d.cooldown);
-  check("3l until", d.until, T0 + DEFAULT_NETWORK_COOLDOWN_MS);
+  // CHANGED from `T0 + DEFAULT_NETWORK_COOLDOWN_MS`. A 400 that names the
+  // model is as deterministic as a 404 that does, so it is now parked for the
+  // session. The assertion is retained (still parked) and only the window
+  // lengthened — nothing was weakened.
+  check("3l until (invalid model is now a session-long park)", d.until, T0 + MODEL_SESSION_COOLDOWN_MS);
+  check("3l and is filed as model", d.kind, "model");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -481,6 +488,91 @@ check("5e days", formatCooldown(T0 + 30 * HOUR, T0), "1d 6h");
     "9c the error still exists for the log (never lost)",
     /groq/i.test(run.error ?? ""),
   );
+}
+
+// ── 10. A missing MODEL is parked for the session, not for 30 seconds ──────
+//
+// Observed live: NVIDIA returned HTTP 404 for
+// `nvidia/llama-3.1-nemotron-70b-instruct`. A 404 used to fall into the generic
+// 4xx branch and cool the provider down for 30 seconds, so every subsequent
+// turn re-spent a full request plus its latency re-discovering a failure that
+// cannot resolve without a human changing the setting.
+{
+  const now = 1_700_000_000_000;
+
+  const nf404 = decideCooldown({
+    provider: "nvidia",
+    status: 404,
+    message: "HTTP 404: model not found",
+    now,
+  });
+  checkTrue("10a a 404 parks the provider", nf404.cooldown);
+  check("10b with kind=model", nf404.kind, "model");
+  check("10c for the whole session", nf404.until, now + MODEL_SESSION_COOLDOWN_MS);
+  checkTrue(
+    "10d the message tells the user to change the model in Settings",
+    /not found/i.test(nf404.detail) && /Settings/i.test(nf404.detail),
+  );
+  checkTrue(
+    "10e and says it is skipped for the session",
+    /rest of this session/i.test(nf404.detail),
+  );
+  checkTrue(
+    "10f a 404 is strictly longer than the old 30s cooldown",
+    nf404.until > now + DEFAULT_NETWORK_COOLDOWN_MS,
+  );
+
+  // The exact observed id must be recognised from prose alone, with no status.
+  const prose = decideCooldown({
+    provider: "nvidia",
+    message:
+      "The model nvidia/llama-3.1-nemotron-70b-instruct does not exist or you do not have access to it.",
+    now,
+  });
+  checkTrue("10g prose-only model failure is detected without a status", prose.cooldown);
+  check("10h and is filed as model", prose.kind, "model");
+
+  // Gateways report this as 400/422 too, so status alone is not enough.
+  const bad400 = decideCooldown({
+    provider: "groq",
+    status: 400,
+    message: "invalid model: llama-nope",
+    now,
+  });
+  check("10i a 400 naming an invalid model is model, not generic 4xx", bad400.kind, "model");
+
+  // A 404 that is NOT about a model (a wrong endpoint path) must not be
+  // parked for the session — only the model case is deterministic.
+  const wrongPath = decideCooldown({
+    provider: "groq",
+    status: 404,
+    message: "HTTP 404 Not Found",
+    now,
+  });
+  checkTrue(
+    "10j a non-model 404 is NOT parked for the session",
+    wrongPath.until < now + MODEL_SESSION_COOLDOWN_MS,
+  );
+
+  // The detector itself must not fire on ordinary failures.
+  checkTrue("10k does not fire on a rate limit", !looksLikeMissingModel("429 rate limit exceeded"));
+  checkTrue("10l does not fire on a server error", !looksLikeMissingModel("HTTP 500 internal error"));
+  checkTrue(
+    "10m does not fire on a 401 bad key",
+    !looksLikeMissingModel("HTTP 401 invalid api key"),
+  );
+
+  // And it must survive a whole interview without expiring.
+  const late = now + 10 * 60 * 1000;
+  const state: ProviderCooldownState = { now, records: {} };
+  const decision = decideCooldown({
+    provider: "nvidia",
+    status: 404,
+    message: "model not found",
+    now,
+  });
+  const parked = applyCooldown(state, decision, "nvidia");
+  checkTrue("10n still parked 10 minutes into the session", isOnCooldown(parked, "nvidia", late));
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

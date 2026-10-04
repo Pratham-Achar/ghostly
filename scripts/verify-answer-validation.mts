@@ -14,7 +14,7 @@ import {
   detectAnswerArtifact,
 } from "../src/lib/outputValidation";
 import { groqAnswerDirective } from "../src/lib/ai/groq";
-import { isWaitResponse } from "../src/lib/interviewAgent";
+import { isWaitResponse, INTERVIEW_SYSTEM_PROMPT } from "../src/lib/interviewAgent";
 import {
   orchestrateAnswer,
   type AttemptSpec,
@@ -559,6 +559,140 @@ async function run(scripts: Record<string, Script>, hedgeMs = 40) {
   checkTrue(
     "5h OpenRouter is unchanged (no Groq directive)",
     !openrouterSrc.includes("groqAnswerDirective"),
+  );
+}
+
+// ── 5i-bis. THE LIVE BUG: a mixed refusal that reached the UI ──────────────
+//
+// APPROXIMATION FROM SCREENSHOT. The user reported this text appearing in the
+// interview panel; it is a hand transcription of what was on screen, not a
+// paste of the exact string. The orchestrator's WINNER telemetry line
+// (`orchestrator.ts`) deliberately logs NO answer text — only http/firstText/
+// total/success/winner/reason — so the exact bytes are not recoverable from the
+// logs. If the exact string is found, add it as an extra case below; the
+// STRUCTURAL cases underneath are what actually protect the app, and they do
+// not depend on this transcription.
+//
+// Why every pre-existing check passed it:
+//   • isWaitResponse — WAIT is mid-sentence twice, never the whole output.
+//   • META_RESPONSE_RE — needs a BARE determiner before "question", so
+//     "provide a CLEAR question" fell through the qualifier gap.
+//   • isBareDirective — bails above 12 tokens; this is ~21.
+//   • isInstructionTemplate — needs >= 3 lines; this is one.
+//   • isNumericArtifact / isTemplateEcho / isQuestionEcho / isNoProse — all
+//     bail on shape or size thresholds this text satisfies.
+{
+  const BAD =
+    "What is the difference between a Node 79 - Node.js8 WAIT then provide a clear question, and if a technical example or clarification, please WAIT";
+  const QUESTION = "What is difference between SQL and NoSQL databases?";
+  const opts = { question: QUESTION, promptTemplate: INTERVIEW_SYSTEM_PROMPT };
+
+  checkTrue(
+    "5i-bis the approximation is REJECTED",
+    validateAnswerOutput(BAD, opts).ok === false,
+  );
+  check(
+    "5i-bis and reported as the WAIT sentinel",
+    validateAnswerOutput(BAD, opts).reason,
+    "artifact-wait-sentinel",
+  );
+  checkTrue(
+    "5i-bis isWaitResponse alone does NOT catch it (the actual bug)",
+    isWaitResponse(BAD) === false,
+  );
+}
+
+// ── 5j. WAIT sentinel as a standalone token ANYWHERE ───────────────────────
+//
+// Structural cases, independent of the screenshot transcription. Each is a
+// normal-looking sentence with the sentinel embedded, which is the shape that
+// got through.
+{
+  const q = "What is difference between SQL and NoSQL databases?";
+
+  const WAIT_REJECT: Array<[string, string]> = [
+    [
+      "sql-nosql-wait-mid",
+      "One is relational with a fixed schema. WAIT",
+    ],
+    [
+      "trailing-wait",
+      "One is relational with a fixed schema and joins, the other is schemaless. WAIT",
+    ],
+    [
+      "wait-as-interjection-not-sentinel",
+      "I would use the relational one. Wait, sorry, the other is better for flexible documents.",
+    ],
+    [
+      "wait-lower-case-should-still-pass",
+      "I would wait for replication to catch up before writing to the new primary, and explain why.",
+    ],
+    [
+      "wait-as-verb-not-sentinel",
+      "You wait on the future, and if replication lags you wait for the replica rather than writing to the primary.",
+    ],
+  ];
+
+  for (const [id, text] of WAIT_REJECT) {
+    const v = validateAnswerOutput(text, { question: q });
+    // The lowercase / mixed-case cases are legitimate English and MUST be
+    // accepted: only the upper-case sentinel is decisive.
+    const shouldAccept =
+      id.includes("lower-case") ||
+      id.includes("as-verb") ||
+      id.includes("interjection");
+    checkTrue(
+      `5j ${id}: ${shouldAccept ? "accepted" : "rejected"}`,
+      shouldAccept ? v.ok === true : v.ok === false,
+    );
+    if (!shouldAccept) {
+      check(`5j ${id}: reason`, v.reason, "artifact-wait-sentinel");
+    }
+  }
+
+  // The sentinel is upper-case by contract; a case-insensitive rule would
+  // reject correct prose. Assert the property that makes it safe.
+  checkTrue(
+    "5j case-sensitivity is load-bearing: lowercase 'wait' in prose is accepted",
+    validateAnswerOutput(
+      "I would wait for the index build to finish before measuring, because a half-built index gives a misleading plan.",
+      { question: q },
+    ).ok === true,
+  );
+}
+
+// ── 5k. Instructions ABOUT the conversation ───────────────────────────────
+{
+  const q = "What is difference between SQL and NoSQL databases?";
+
+  const INSTR_REJECT: string[] = [
+    "Please provide a clear question.",
+    "Provide a clear question and I will answer it.",
+    "Give me a more specific question please.",
+    "Please wait for the question.",
+    "Kindly wait until the interviewer asks something.",
+    "If you need a technical example or clarification, please wait.",
+  ];
+
+  for (const text of INSTR_REJECT) {
+    const v = validateAnswerOutput(text, { question: q });
+    checkTrue(`5k rejects: ${JSON.stringify(text.slice(0, 46))}`, v.ok === false);
+    checkTrue(
+      `5k reason is structural: ${JSON.stringify(text.slice(0, 30))}`,
+      v.reason === "artifact-conversation-instruction" ||
+        v.reason === "artifact-meta" ||
+        v.reason === "no-prose" ||
+        v.reason === "heading-only",
+    );
+  }
+
+  // A legitimate answer that happens to discuss a question must survive.
+  checkTrue(
+    "5k an answer discussing 'a complete answer' is NOT rejected",
+    validateAnswerOutput(
+      "I'd give a complete answer by comparing the two side by side, since a table makes the tradeoff obvious.",
+      { question: q },
+    ).ok === true,
   );
 }
 

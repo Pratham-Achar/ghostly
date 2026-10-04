@@ -296,7 +296,7 @@ function fakeClock(start = 1000) {
     "4f states the renderer accuracy",
     report.includes("+/-1ms"),
   );
-  checkTrue("4g lists the end-to-end metric by name", report.includes("hotkey_pressed -> final transcript committed"));
+  checkTrue("4g lists the end-to-end metric by name", report.includes("hotkey_pressed -> answer committed"));
   checkTrue("4h lists every value below the sample floor", report.includes("every value"));
   checkTrue("4i does not print a p95 for a small sample", /hotkey_pressed[^\n]*p95=-/.test(report));
   checkTrue("4j reports outcomes", report.includes("answered=2") && report.includes("wait=1"));
