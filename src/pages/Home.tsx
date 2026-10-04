@@ -11,6 +11,21 @@ import {
   OPENROUTER_FREE_MODEL,
 } from "../lib/ai/openrouter";
 import { describeProviderChain } from "../lib/providerDiagnostics";
+import {
+  buildCooldownSummary,
+  useProviderCooldown,
+} from "../lib/useProviderCooldown";
+import {
+  buildContextBlock,
+  classifyFollowUp,
+  detectProblemStart,
+  extractApproachSummary,
+  pruneSessionContext,
+  startProblem,
+  touchProblem,
+  SESSION_CONTEXT_TTL_MS,
+  type ProblemSource,
+} from "../lib/sessionContext";
 import { buildPrompt, buildInterviewContext } from "../lib/prompts";
 import {
   buildInterviewSystemPrompt,
@@ -25,6 +40,7 @@ import {
   type SubmitRecord,
 } from "../lib/interviewAgent";
 import { validateAnswerOutput } from "../lib/outputValidation";
+import { SessionContextChip } from "../components/SessionContextChip";
 import { describeDrain, drainInterviewAsr } from "../lib/asrDrain";
 import { createShortcutGuard } from "../lib/interviewShortcuts";
 import { correctQuestionWithCandidate } from "../lib/candidateCorrection";
@@ -75,6 +91,9 @@ export const Home: React.FC = () => {
     error,
     settings,
     sessionMessages,
+    sessionContext,
+    setSessionContext,
+    clearSessionContext,
     addScreenshot,
     removeScreenshot,
     setCurrentSolution,
@@ -117,6 +136,34 @@ export const Home: React.FC = () => {
   // Repeat / editable-target guard for the global interview shortcuts. Kept in
   // a ref so it survives re-renders and holds its cooldown state.
   const shortcutGuardRef = useRef(createShortcutGuard());
+
+  /**
+   * A ticking clock for the context chip.
+   *
+   * Exists purely so an EXPIRED context stops being displayed as active. Without
+   * it the chip would keep showing a problem that `pruneSessionContext` has
+   * already dropped, which is worse than showing nothing: the user would be told
+   * the model still has context when it does not.
+   *
+   * 30s, not 1s — the TTL is 30 minutes, so sub-second freshness buys nothing
+   * and a 1s interval would re-render the overlay forever.
+   */
+  const [ctxTick, setCtxTick] = useState(() => Date.now());
+  useEffect(() => {
+    const t = setInterval(() => setCtxTick(Date.now()), 30_000);
+    return () => clearInterval(t);
+  }, []);
+
+  /**
+   * Provider cooldown — "do not call this one again for N minutes".
+   *
+   * Aimed squarely at the three live failures that all looked like "the AI is
+   * broken": OpenRouter out of daily quota, Gemini out of quota for 3h 15m, and
+   * NVIDIA blocked from the renderer on every single turn. Each is a provider
+   * STATE, not a request problem, and retrying them per turn made the interview
+   * slower without making it work.
+   */
+  const cooldown = useProviderCooldown();
 
   // Keep refs in sync
   useEffect(() => {
@@ -430,8 +477,61 @@ export const Home: React.FC = () => {
         // receives (e.g. "What is mango?" + "MongoDB" → "What is MongoDB?").
         userMessageContent = `🎙️ ${(finalQuestion ?? latest?.text.trim()) ?? "(no audio captured)"}`;
         systemInstruction = buildInterviewSystemPrompt(settings);
+
+        // ── Session context ───────────────────────────────────────────────
+        // Runs AFTER the gate has already answered "is this a real question?",
+        // because a problem must be a question to be worth remembering, and
+        // BEFORE the prompt is built.
+        //
+        // Order matters and is the whole design:
+        //   1. TTL prune — an expired context must never be attached.
+        //   2. A new problem start REPLACES it.
+        //   3. Otherwise, a follow-up attaches and refreshes `lastUsedAt`.
+        //
+        // Step 2 is `classifyFollowUp`'s job, which returns
+        // "a new problem replaces it" — so the decision and the reason for it
+        // come from one place rather than two that can disagree.
+        const ctxNow = Date.now();
+        const prunedCtx = pruneSessionContext(
+          useStore.getState().sessionContext,
+          ctxNow,
+        );
+        if (prunedCtx !== useStore.getState().sessionContext) {
+          setSessionContext(prunedCtx);
+        }
+
+        const resolvedQuestion = (finalQuestion ?? latest?.text.trim()) ?? "";
+        const verdict = classifyFollowUp(resolvedQuestion, prunedCtx, ctxNow);
+        let activeCtx = prunedCtx;
+
+        if (resolvedQuestion) {
+          if (detectProblemStart(resolvedQuestion).isProblemStart) {
+            activeCtx = startProblem(prunedCtx, resolvedQuestion, ctxNow);
+            setSessionContext(activeCtx);
+            console.log(
+              `[CTX] problem started kind=${activeCtx.activeProblem?.kind} id=${activeCtx.activeProblem?.id}`,
+            );
+          } else if (verdict.attach) {
+            activeCtx = touchProblem(prunedCtx, ctxNow);
+            setSessionContext(activeCtx);
+            console.log(`[CTX] context attached — ${verdict.cue}`);
+          } else if (prunedCtx.activeProblem) {
+            // Logged even when it does NOT attach: "why did it not use my
+            // context" is the first question this feature will be asked, and
+            // the answer has to be in the log rather than inferred.
+            console.log(`[CTX] context not attached — ${verdict.reason}`);
+          }
+        }
+
+        // Empty string when nothing applies, which keeps the prompt byte-identical
+        // to the previous output on every non-follow-up turn.
+        const ctxBlock = verdict.attach
+          ? buildContextBlock(activeCtx)
+          : "";
+
         prompt = buildInterviewUserPrompt(interviewTurn, {
           questionIndex,
+          contextBlock: ctxBlock,
           previousAnswers: sessionMessages
             .filter((m) => m.role === "assistant")
             .slice(-2)
@@ -526,6 +626,11 @@ export const Home: React.FC = () => {
               promptTemplate: INTERVIEW_SYSTEM_PROMPT,
             });
           },
+          // Providers on cooldown are removed from the run before it starts, so
+          // a 429 costs zero latency rather than a full timeout. Every hard
+          // failure is reported back, which is how a provider becomes parked in
+          // the first place.
+          cooldown: cooldown.gate,
           onStatus: (status) => {
             // Stale = superseded or aborted: never touch the UI.
             if (isStale() || !isInterview) return;
@@ -606,12 +711,41 @@ export const Home: React.FC = () => {
         // Never save "", never render an empty card: report what the providers
         // actually said and offer Retry.
         if (!fullSolution.trim()) {
-          const detail =
-            run.error ??
-            (run.aborted
-              ? "Cancelled."
-              : "No provider returned an answer.");
-          console.error(`[AI] no usable answer — ${detail}`);
+          // ── Say WHAT is wrong, not what the provider said ───────────────
+          // The raw text here is `Groq API error: Rate limit reached…` or a
+          // Chromium CORS message. It names a condition the user cannot act on
+          // and hides the two they can: which provider is parked until when,
+          // and whether the provider they expected is even in the chain.
+          const chain = describeProviderChain(settings);
+          const summary = buildCooldownSummary({
+            state: cooldown.state,
+            now: Date.now(),
+            chain: chain.status
+              .filter((s) => s.availability === "ready")
+              .map((s) => s.provider),
+            chainNotes: chain.status
+              .filter((s) => s.availability !== "ready")
+              .map((s) => ({ provider: s.provider, reason: s.detail })),
+            failures: run.failures,
+          });
+          const detail = [
+            summary.headline,
+            ...summary.lines,
+            // Providers that WERE tried still deserve one line each, but the
+            // headline already says why, so this stays short.
+            run.failures.length
+              ? `Last error: ${run.failures[0].provider.toUpperCase()} — ${
+                  run.failures[0].reason
+                }`
+              : "",
+          ]
+            .filter(Boolean)
+            .join("\n");
+          console.error(
+            `[AI] no usable answer — ${summary.headline} | ${summary.lines.join(
+              " | ",
+            )} | raw=${run.error ?? "(none)"}`,
+          );
           setCurrentSolution("");
           setAnswerIssue({ kind: "empty", message: detail });
           lastSubmitRef.current = {
@@ -704,6 +838,32 @@ export const Home: React.FC = () => {
             signature: lastSubmitRef.current.signature,
             status: "ok",
           };
+        }
+
+        // ── Remember the approach ────────────────────────────────────────
+        // Only here, which is the only point where an answer is KNOWN to have
+        // passed the output gate. Summarising an earlier point in the flow
+        // would put a refusal or a prompt artefact into every later prompt.
+        //
+        // No LLM call: `extractApproachSummary` is a truncation. And no
+        // transcript text reaches a log — only the boolean and a character
+        // count.
+        if (isInterview) {
+          const summary = extractApproachSummary(fullSolution);
+          const current = useStore.getState().sessionContext;
+          if (summary && current.activeProblem) {
+            setSessionContext({
+              ...current,
+              approachSummary: summary,
+              activeProblem: {
+                ...current.activeProblem,
+                lastUsedAt: Date.now(),
+              },
+            });
+            console.log(
+              `[CTX] approach summary stored (${summary.length} chars)`,
+            );
+          }
         }
       } catch (err) {
         clearSubmitLock();
@@ -972,6 +1132,12 @@ export const Home: React.FC = () => {
       setInterviewCollapsed(false);
       setIsStreaming(false);
       clearSolution();
+      // ── Reset interview also drops the session context ─────────────────
+      // The ONLY clear-on-a-key binding that may do this. Ctrl+G already means
+      // "start over from nothing", so leaving a problem behind here would make
+      // the next question be answered as a follow-up to a conversation the user
+      // just declared finished.
+      clearSessionContext();
     });
 
     // Interview Type Shortcuts — Ctrl+Shift+1/2/3/4/5/6
@@ -1118,6 +1284,42 @@ export const Home: React.FC = () => {
 
             {/* Answer could not be produced (empty) or was cut short. */}
             <AnimatePresence>
+              {/*
+                ── Session context chip ───────────────────────────────────────
+                Placed directly above the detected-question banner because that
+                is the only place the user reads the question they are about to
+                be asked, so it is also the only place where "what is this
+                referring to" is answerable at a glance.
+
+                The "Use as context" offer is only rendered when the Solve /
+                screenshot flow actually produced something, and it is a button:
+                nothing is ever attached without an explicit click.
+              */}
+              {(!settingsOpen || true) && (
+                <SessionContextChip
+                  context={sessionContext}
+                  now={ctxTick}
+                  onChange={setSessionContext}
+                  onClear={clearSessionContext}
+                  offerSolution={
+                    !sessionContext.activeProblem &&
+                    currentSolution?.trim()
+                      ? { label: "Use answer as context", source: "screenshot" as ProblemSource }
+                      : null
+                  }
+                  onUseSolution={(source) =>
+                    setSessionContext(
+                      startProblem(
+                        sessionContext,
+                        currentSolution.trim(),
+                        Date.now(),
+                        source,
+                      ),
+                    )
+                  }
+                />
+              )}
+
               {answerIssue && (
                 <motion.div
                   initial={{ opacity: 0, y: -5 }}
@@ -1135,9 +1337,23 @@ export const Home: React.FC = () => {
                         ? "No answer received"
                         : "Answer cut off — partial kept"}
                     </span>
-                    <p className="text-[10px] text-white/45 font-mono leading-snug line-clamp-2 mt-0.5">
-                      {answerIssue.message}
-                    </p>
+                    {/*
+                      Rendered as lines rather than one clamped string.
+
+                      A single `line-clamp-2` paragraph cannot show "OpenRouter is
+                      out of quota for 3h 15m, Groq is not in your provider
+                      chain" — it clips to the first fragment, which is the least
+                      useful part. The message is built from short, deliberate
+                      lines in `buildCooldownSummary`, so preserving them verbatim
+                      is what makes the panel actionable.
+                    */}
+                    <div className="text-[10px] text-white/55 font-mono leading-snug mt-0.5 space-y-0.5">
+                      {answerIssue.message.split("\n").map((line, i) => (
+                        <p key={i} className={i === 0 ? "text-white/75" : ""}>
+                          {line}
+                        </p>
+                      ))}
+                    </div>
                   </div>
                   <button
                     onClick={retryAnswer}

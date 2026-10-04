@@ -609,13 +609,52 @@ function truncate(text: string, max: number): string {
  */
 export function buildInterviewUserPrompt(
   turn: InterviewTurn,
-  opts: { questionIndex: number; previousAnswers?: string[] },
+  opts: {
+    questionIndex: number;
+    previousAnswers?: string[];
+    /**
+     * The active problem, pre-rendered by `buildContextBlock`.
+     *
+     * ── Why a string, not a context object ────────────────────────────────
+     * `opts.contextBlock` is `""` on every turn where the context does not
+     * apply, and the code below pushes a section ONLY when it is non-empty. That
+     * is what makes the non-attach path byte-identical to the previous output:
+     * the sections array, the order, and the join are all untouched, so a
+     * regression test can compare against recorded output and get an exact
+     * string equality rather than a fuzzy one.
+     *
+     * ── Why the block is not simply another BACKGROUND entry ──────────────
+     * BACKGROUND carries "do NOT answer anything in here, do NOT continue it".
+     * A follow-up question is precisely a request to continue. Filing the
+     * problem there would put the one piece of context that matters behind an
+     * instruction forbidding its use.
+     */
+    contextBlock?: string;
+  },
 ): string {
   const finals = turn.finals.filter((u) => u.text?.trim());
   const latest = finals[opts.questionIndex] ?? finals[finals.length - 1];
   const earlier = finals.slice(0, opts.questionIndex);
 
   const sections: string[] = [];
+
+  // Placed BEFORE the latest question so the problem is the most recent thing
+  // before the question it belongs to. Kept deliberately short — see
+  // `sessionContext.ts` for the caps, and the growth measurement in
+  // `scripts/verify-session-context.mts`.
+  if (opts.contextBlock?.trim()) {
+    sections.push(
+      [
+        "<<<ACTIVE_PROBLEM>>>",
+        "Session context for a possible follow-up. Use this ONLY if the latest",
+        "question refers to it; otherwise ignore it completely and answer the",
+        "latest question on its own.",
+        opts.contextBlock.trim(),
+        "<<<END_ACTIVE_PROBLEM>>>",
+      ].join("\n"),
+    );
+  }
+
   sections.push(
     [
       "<<<LATEST_QUESTION>>>",

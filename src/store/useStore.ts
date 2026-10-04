@@ -4,6 +4,10 @@ import type { InterviewTurn } from "../lib/interviewAgent";
 import type { DeepgramTelemetry } from "../lib/deepgramProtocol";
 import type { GroqAsrTelemetry } from "../lib/groqWhisper";
 import { DEFAULT_PRIMARY_ASR, type PrimaryAsr } from "../lib/primaryAsr";
+import {
+  EMPTY_SESSION_CONTEXT,
+  type SessionContext,
+} from "../lib/sessionContext";
 
 /**
  * Transcription engines. `moonshine` is local and default; `deepgram` is the
@@ -228,6 +232,25 @@ export interface Settings {
    */
   primaryAsr?: PrimaryAsr;
   /**
+   * Load the local Parakeet model as soon as the Live Interview panel opens,
+   * instead of on Start Interview.
+   *
+   * ── Why it exists ─────────────────────────────────────────────────────────
+   * The model takes 6.5 s to load standalone and 14.7–23.8 s inside the app.
+   * Loaded on Start, that window is exactly when the interviewer begins
+   * speaking, so the first one or two questions are buffered rather than
+   * transcribed. Preloading moves the cost to a moment when the user is reading
+   * the panel instead of talking.
+   *
+   * ── Why it is OFF by default ─────────────────────────────────────────────
+   * The cost is real and permanent for the session: ~740 MB of resident memory
+   * in a separate utility process (measured — see `PARAKEET_PRELOAD_RAM_MB`),
+   * held until the 5-minute idle unload or Stop Interview. A user who opens the
+   * panel to read their resume and closes it again must not be charged 740 MB
+   * for it.
+   */
+  parakeetPreload?: boolean;
+  /**
    * Developer-only: when Parakeet is primary, ALSO run Moonshine over the same
    * buffer and fill the Moonshine column of the comparison grid.
    *
@@ -278,6 +301,24 @@ interface GhostlyStore {
   /** Set when an answer could not be produced (empty) or was cut short. */
   answerIssue: AnswerIssue | null;
   /**
+   * The active problem a follow-up question may refer to.
+   *
+   * ── Why this is a SEPARATE slice, not part of `interviewMessages` ─────────
+   * `interviewMessages` is the visible transcript and is cleared constantly:
+   * Clear chat, Next Question, panel open and panel close all wipe it. If the
+   * problem statement lived there it would be gone before the follow-up arrived,
+   * which is the exact failure this slice exists to fix.
+   *
+   * The separation is what makes the semantics expressible at all: "Clear chat"
+   * clears the transcript and NOT this; "Reset interview" clears both. Neither
+   * can be expressed if they share a slice.
+   *
+   * IN-MEMORY ONLY and never persisted: a stale problem surviving a restart
+   * would be worse than none, because the next question would be answered as
+   * though it referred to it.
+   */
+  sessionContext: SessionContext;
+  /**
    * Which backend OpenRouter actually routed the last answer to (e.g. "groq",
    * "google"). Runtime-only, deliberately NOT part of `settings`: it changes
    * on every answer and must not trigger settings persistence or recreate the
@@ -310,6 +351,10 @@ interface GhostlyStore {
   // Actions — live interview transcript (shared between overlay + interview panel)
   addInterviewMessage: (msg: TranscriptMessage) => void;
   clearInterviewMessages: () => void;
+  /** Replace the whole session context (the only write path). */
+  setSessionContext: (ctx: SessionContext) => void;
+  /** Drop the problem, the approach summary and the user notes. */
+  clearSessionContext: () => void;
   /** Record one engine-vs-engine comparison. Developer-only diagnostics. */
   addAsrComparison: (comparison: AsrComparison) => void;
   /** Drop all comparison records. */
@@ -355,6 +400,7 @@ export const useStore = create<GhostlyStore>((set, get) => ({
   agentNotice: null,
   detectedQuestion: null,
   answerIssue: null,
+  sessionContext: EMPTY_SESSION_CONTEXT,
   openRouterBackendProvider: null,
   history: [],
   mouseEnabled: false,
@@ -404,6 +450,9 @@ export const useStore = create<GhostlyStore>((set, get) => ({
     // Parakeet existed resolves to a working engine on upgrade. Selecting
     // Parakeet is a UI action, never a source edit.
     primaryAsr: DEFAULT_PRIMARY_ASR,
+    // Off by default: ~740 MB of resident memory for a panel the user may only
+    // glance at. See the `parakeetPreload` doc comment for the measurement.
+    parakeetPreload: false,
     asrCompareMoonshine: false,
     groqAsrModel: "whisper-large-v3",
     autoAnswer: false,
@@ -478,6 +527,14 @@ export const useStore = create<GhostlyStore>((set, get) => ({
   setAgentNotice: (reason) => set({ agentNotice: reason }),
   setDetectedQuestion: (value) => set({ detectedQuestion: value }),
   setAnswerIssue: (value) => set({ answerIssue: value }),
+  // ── Session context ────────────────────────────────────────────────────
+  //
+  // Deliberately ONE writer. `clearInterviewMessages` is on the hot path for
+  // several unrelated UI actions, and any of them clearing this slice by
+  // accident is exactly the bug this slice is meant to prevent. Nothing else in
+  // the store may touch it.
+  setSessionContext: (ctx) => set({ sessionContext: ctx }),
+  clearSessionContext: () => set({ sessionContext: EMPTY_SESSION_CONTEXT }),
   setOpenRouterBackendProvider: (
     v: string | null,
   ) => set({ openRouterBackendProvider: v }),

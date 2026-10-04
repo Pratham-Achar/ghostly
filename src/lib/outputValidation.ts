@@ -45,6 +45,7 @@ export type AnswerRejectionReason =
   | "artifact-instruction"
   | "artifact-numeric"
   | "artifact-meta"
+  | "artifact-directive"
   | "no-prose";
 
 /**
@@ -91,7 +92,7 @@ const DELIMITER_RE = /<<<|>>>/;
  * vocabulary.
  */
 const INTERNAL_LABEL_RE =
-  /\b(ITEM_QUESTION|LATEST_TASK|END_LATEST_TASK|INITIAL_QUESTION|INTERVIEW_QUESTION|LATEST_QUESTION|END_LATEST_QUESTION|PREVIOUS_ANSWERS|END_PREVIOUS_ANSWERS|BACKGROUND|END_BACKGROUND|WHAT IS PROBLEMS)\b/;
+  /\b(ITEM_QUESTION|LATEST_TASK|END_LATEST_TASK|INITIAL_QUESTION|INTERVIEW_QUESTION|LATEST_QUESTION|END_LATEST_QUESTION|PREVIOUS_ANSWERS|END_PREVIOUS_ANSWERS|BACKGROUND|END_BACKGROUND|WHAT IS PROBLEMS|ACTIVE_PROBLEM|END_ACTIVE_PROBLEM)\b/;
 
 /**
  * Distinctive strings that only exist in OUR instruction template.
@@ -177,6 +178,195 @@ const PLACEHOLDER_RE =
 const NUMERIC_TOKEN_RE = /^[\d.,:%$+\-()/]+$/;
 
 /**
+ * CLOSED CLASS of speech-act verbs: the verb of an imperative addressed AT a
+ * responder ("Answer that text", "Repeat the prompt").
+ *
+ * ── Why a closed class and not a topic blacklist ────────────────────────────
+ * Everything the check below consults is vocabulary *about the conversation
+ * itself*. There is no interview topic in here, so no legitimate question or
+ * answer can be caught by it — that is the property a topic blacklist cannot
+ * have, and the reason this is a structural rule rather than a word filter.
+ */
+const SPEECH_ACT_VERBS = new Set([
+  "answer",
+  "repeat",
+  "summarize",
+  "summarise",
+  "rephrase",
+  "paraphrase",
+  "translate",
+  "transcribe",
+  "retype",
+  "rewrite",
+  "reword",
+  "echo",
+  "print",
+  "copy",
+  "quote",
+  "respond",
+  "reply",
+  "describe",
+  "explain",
+  "solve",
+  "list",
+  "write",
+  "generate",
+  "output",
+  "return",
+]);
+
+/**
+ * NOUNS that can only refer to the CONVERSATION ARTEFACT — the text the user
+ * just sent. Nothing on earth is a "prompt", a "passage" or "the above text" in
+ * a spoken interview answer; they are references to the message.
+ */
+const CONVERSATION_REFERENCE_NOUNS = new Set([
+  "text",
+  "wording",
+  "wordings",
+  "prompt",
+  "passage",
+  "message",
+  "statement",
+  "sentence",
+  "transcript",
+  "instruction",
+  "instructions",
+  "directive",
+  "directions",
+  "question",
+  "questions",
+  "answer",
+  "answers",
+]);
+
+/**
+ * True when the whole response is a bare directive at the model rather than an
+ * answer to the interviewer.
+ *
+ * ── The observed failure ────────────────────────────────────────────────────
+ *   turn 1791060167441-w9zhux, `groq/allam-2-7b`
+ *   answer: "and Answer that text"
+ *
+ * It survived every existing signal, and the reasons are worth recording:
+ *   • `META_RESPONSE_RE` looks for *asking* for the question ("what is the
+ *     question"). This never asks — it ORDERS.
+ *   • `TEMPLATE_LEAK_PHRASES` holds the Groq directive's full wording ("answer
+ *     that question directly and immediately"). The model echoed a mangled
+ *     fragment of it, not the full string, so the exact-substring test misses.
+ *   • `readsAsLabel` is defeated by the word "that", which is in
+ *     `SENTENCE_MARKERS` — the fragment reads as a sentence, so the label test
+ *     correctly declines to fire.
+ *
+ * ── The STRUCTURAL test instead ─────────────────────────────────────────────
+ * Classify every token, then require that NOTHING in the response is a content
+ * word about the interview. Concretely: after dropping function words and the
+ * known sentence-marker vocabulary, every remaining word must be either
+ *
+ *     (a) a speech-act verb in {@link SPEECH_ACT_VERBS}, or
+ *     (b) a conversation-reference noun in {@link CONVERSATION_REFERENCE_NOUNS},
+ *     (c) a demonstrative determiner (`that`, `this`, `the`, `above`, …).
+ *
+ * If that holds, the response carries no topical content at all — it is a
+ * command about the conversation, not an answer about anything.
+ *
+ * Why it cannot reject a real answer: a real answer necessarily contains at
+ * least one content word that is neither. "I would answer that question by
+ * explaining the parser" keeps `explaining`, which is not a speech-act verb, so
+ * it passes. Only a response made ENTIRELY of conversation-meta vocabulary is
+ * rejected.
+ */
+function isBareDirective(text: string): boolean {
+  const words = tokenize(text);
+  if (words.length === 0 || words.length > 12) return false;
+
+  const demonstratives = new Set([
+    "that",
+    "this",
+    "these",
+    "those",
+    "the",
+    "a",
+    "an",
+    "above",
+    "below",
+    "following",
+    "previous",
+    "preceding",
+    "last",
+    "it",
+    "again",
+    "verbatim",
+    "word",
+    "words",
+  ]);
+
+  /**
+   * Function words that carry no content of their own.
+   *
+   * Needed because the observed output was a CONTINUATION fragment, not a
+   * clean imperative: allam-2-7b emitted `"and Answer that text"` — a leading
+   * `and` spliced onto the directive. Without these the fragment would fail on
+   * `and` and sail through, which is precisely the reported bug.
+   *
+   * Same safety argument as everywhere else in this module: none of these can
+   * be the only content in a real answer, so admitting them cannot widen the
+   * rejection set to anything topical.
+   */
+  const functionWords = new Set([
+    "and",
+    "or",
+    "but",
+    "then",
+    "so",
+    "now",
+    "just",
+    "only",
+    "also",
+    "please",
+    "your",
+    "my",
+    "our",
+    "us",
+    "me",
+    "you",
+    "as",
+    "of",
+    "for",
+    "to",
+    "in",
+    "on",
+    "with",
+    "exactly",
+    "verbatim",
+    "literally",
+    "out",
+    "back",
+  ]);
+
+  let sawSpeechAct = false;
+  let sawReference = false;
+
+  for (const w of words) {
+    if (SPEECH_ACT_VERBS.has(w)) {
+      sawSpeechAct = true;
+      continue;
+    }
+    if (CONVERSATION_REFERENCE_NOUNS.has(w)) {
+      sawReference = true;
+      continue;
+    }
+    if (demonstratives.has(w) || functionWords.has(w)) continue;
+    // Any other word means the response is about something real.
+    return false;
+  }
+
+  // A directive needs a command, and a command with nothing to act on is not a
+  // failure mode we have ever observed. Both must be present.
+  return sawSpeechAct && sawReference;
+}
+
+/**
  * Labels that appear in our own prompt template. A model that echoes one back
  * has produced a prompt artefact, not an answer.
  *
@@ -196,7 +386,26 @@ const PROMPT_LABEL_PATTERNS: RegExp[] = [
 
 /** The neutral delimiters used by `buildInterviewUserPrompt`. */
 const DELIMITER_ECHO_PATTERNS: RegExp[] = [
-  /^\s*<{2,}\s*(latest_question|background|previous_answers|end_latest_question|end_background|end_previous_answers)\b/i,
+  /^\s*<{2,}\s*(latest_question|background|previous_answers|end_latest_question|end_background|end_previous_answers|active_problem|end_active_problem)\b/i,
+];
+
+/**
+ * Labels of the session-context block, as BARE lines.
+ *
+ * The underscore-joined forms are already covered by
+ * {@link INTERNAL_LABEL_RE}; these are the same labels as they appear in real
+ * prose — "Active problem: …" — because a model asked to restate the context
+ * will usually drop the underscores and emit the readable form.
+ *
+ * Same rule as everywhere else in this module: these are OUR strings. None of
+ * them can appear in a legitimate spoken answer, and none of them names an
+ * interview topic.
+ */
+const SESSION_CONTEXT_LABEL_PATTERNS: RegExp[] = [
+  /^\s*active\s+problem\s*:/i,
+  /^\s*ghostly'?s\s+earlier\s+suggested\s+approach\s*:/i,
+  /^\s*user\s+notes\s*:/i,
+  /^\s*end[_ ]active[_ ]problem\b/i,
 ];
 
 /**
@@ -470,6 +679,17 @@ export function detectAnswerArtifact(
     };
   }
 
+  // 3c. A bare directive at the model instead of an answer to the interviewer.
+  //     Runs BEFORE the placeholder and instruction-template checks because it
+  //     is the more specific statement about the same class of failure.
+  if (isBareDirective(trimmed)) {
+    return {
+      artifact: true,
+      reason: "artifact-directive",
+      detail: "answer was a directive addressed to the model, not a response",
+    };
+  }
+
   // 4. Unfilled placeholder blocks.
   const placeholders = trimmed.match(PLACEHOLDER_RE) ?? [];
   if (placeholders.length >= 2) {
@@ -549,6 +769,20 @@ export function validateAnswerOutput(
       reason: artifact.reason ?? "artifact-template",
       detail: artifact.detail ?? "answer rejected as a prompt artefact",
     };
+  }
+
+  // The session-context labels. ADDITIVE ONLY: nothing here removes or relaxes an
+  // existing check, so every answer this feature already rejected is still
+  // rejected, and every answer it accepted is still accepted unless it now
+  // echoes a block label.
+  for (const pattern of SESSION_CONTEXT_LABEL_PATTERNS) {
+    if (pattern.test(trimmed)) {
+      return {
+        ok: false,
+        reason: "prompt-label",
+        detail: `output reproduced a session-context label: ${trimmed.slice(0, 60)}`,
+      };
+    }
   }
 
   for (const pattern of PROMPT_LABEL_PATTERNS) {
