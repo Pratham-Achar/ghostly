@@ -8,6 +8,7 @@ import {
   EMPTY_SESSION_CONTEXT,
   type SessionContext,
 } from "../lib/sessionContext";
+import { capTurns, type TurnTimings } from "../lib/stageTiming";
 
 /**
  * Transcription engines. `moonshine` is local and default; `deepgram` is the
@@ -260,6 +261,24 @@ export interface Settings {
    */
   asrCompareMoonshine?: boolean;
   /**
+   * Close the open VAD phrase when `Ctrl+Enter` is pressed, instead of waiting
+   * out the remaining silence.
+   *
+   * The drain barrier only waits for finals that ALREADY exist in the worker
+   * queue. A phrase the VAD has not yet closed is not a final, so the barrier
+   * reports `alreadyIdle` and the submit proceeds with the tail of the
+   * question missing — the worst failure mode in the whole app, because the
+   * answer is confidently wrong rather than visibly broken. This setting
+   * closes that race.
+   *
+   * Applies ONLY when Parakeet is the primary engine; Moonshine's path is left
+   * byte-for-byte unchanged. `undefined` is treated as ON (see the consumer in
+   * `useInterviewAudio`) so a settings blob written before this key existed
+   * gets the intended default rather than silently keeping the old behaviour.
+   * Turning it OFF restores exactly the previous behaviour.
+   */
+  forceEndpointOnHotkey?: boolean;
+  /**
    * Developer-only: override for {@link PARAKEET_PADDING_MS}, in ms. `0` disables
    * padding entirely, which is what the padded-vs-unpadded A/B on saved real
    * clips flips. Unset means the provisional 300 ms default.
@@ -326,6 +345,17 @@ interface GhostlyStore {
    */
   openRouterBackendProvider: string | null;
 
+  /**
+   * Per-turn latency records — the input to the Debug panel's Latency report.
+   *
+   * Capped at `LATENCY_TURN_LIMIT` and in-memory only, like every other
+   * diagnostic: numbers, stage names and closed-vocabulary reasons, never
+   * transcript text, prompt text, an answer or a key. Keeping it out of
+   * `settings` matters for the same reason as `openRouterBackendProvider` —
+   * writing a turn must not trigger settings persistence.
+   */
+  latencyTurns: TurnTimings[];
+
   // History
   history: Solution[];
 
@@ -357,6 +387,10 @@ interface GhostlyStore {
   clearSessionContext: () => void;
   /** Record one engine-vs-engine comparison. Developer-only diagnostics. */
   addAsrComparison: (comparison: AsrComparison) => void;
+  /** Append one turn's latency record, evicting the oldest past the cap. */
+  addLatencyTurn: (turn: TurnTimings) => void;
+  /** Drop every latency record (the report's "Clear"). */
+  clearLatencyTurns: () => void;
   /** Drop all comparison records. */
   clearAsrComparisons: () => void;
   setInterviewInterim: (
@@ -402,6 +436,7 @@ export const useStore = create<GhostlyStore>((set, get) => ({
   answerIssue: null,
   sessionContext: EMPTY_SESSION_CONTEXT,
   openRouterBackendProvider: null,
+  latencyTurns: [],
   history: [],
   mouseEnabled: false,
   settings: {
@@ -454,6 +489,7 @@ export const useStore = create<GhostlyStore>((set, get) => ({
     // glance at. See the `parakeetPreload` doc comment for the measurement.
     parakeetPreload: false,
     asrCompareMoonshine: false,
+    forceEndpointOnHotkey: true,
     groqAsrModel: "whisper-large-v3",
     autoAnswer: false,
   },
@@ -524,6 +560,9 @@ export const useStore = create<GhostlyStore>((set, get) => ({
       };
     }),
   clearAsrComparisons: () => set({ asrComparisons: [] }),
+  addLatencyTurn: (turn) =>
+    set((state) => ({ latencyTurns: capTurns([...state.latencyTurns, turn]) })),
+  clearLatencyTurns: () => set({ latencyTurns: [] }),
   setAgentNotice: (reason) => set({ agentNotice: reason }),
   setDetectedQuestion: (value) => set({ detectedQuestion: value }),
   setAnswerIssue: (value) => set({ answerIssue: value }),
