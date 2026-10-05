@@ -92,6 +92,23 @@ export interface ConversationThread {
    * is what makes the layer work for a topic nobody anticipated.
    */
   topicTerms: string[];
+  /**
+   * Content words from the question the thread was STARTED on, kept
+   * permanently and used to lead {@link topicTerms}.
+   *
+   * Why this is separate from `topicTerms`: that fingerprint is rebuilt from the
+   * RETAINED turns, newest first, so after an ordinary four-question
+   * drill-down the subject word is pushed out by the scaffolding of the
+   * follow-ups ("what", "happens", "cache", "miss", "can", "explain"). A thread
+   * about Redis then held no "redis" at all, and the next question that plainly
+   * named Redis matched nothing. Turn eviction makes it worse, because the seed
+   * question is the first turn to go. The subject is what the thread is ABOUT
+   * and must not depend on which turns happen to still be retained.
+   *
+   * Optional so a thread literal written before this field existed still works;
+   * when it is absent the fingerprint simply leads with the retained turns.
+   */
+  subjectTerms?: string[];
   /** Most recent LAST, so `turns[turns.length - 1]` is the current turn. */
   turns: ThreadTurn[];
   updatedAt: number;
@@ -255,7 +272,12 @@ const THREAD_CUE_GROUPS: Array<{ reason: string; re: RegExp }> = [
   },
   {
     reason: "asks about the flow or sequence",
-    re: /\bwhat(?:'s| is)\s+the\s+flow\b|\bwhat\s+happens\s+(?:when|if|next)\b|\bwhat\s+happens\s+after\b|\bhow\s+does\s+it\s+work\b|\bwalk\s+me\s+through\s+the\s+flow\b/i,
+    // The second alternative is deliberately narrow: it requires the DEFINITE
+    // object, so "explain the flow" continues the thread while "explain Docker"
+    // still opens a new subject (and is caught by NEW_SUBJECT_CUES). A bare
+    // "can you explain" cue would have broken that, because a cue is tested
+    // BEFORE the new-subject check.
+    re: /\bwhat(?:'s| is)\s+the\s+flow\b|\bwhat\s+happens\s+(?:when|if|next|after|on|during|for)\b|\bhow\s+does\s+it\s+work\b|\bwalk\s+me\s+through\s+the\s+flow\b|\b(?:explain|walk\s+me\s+through)\s+the\s+(?:flow|process|steps|pipeline|sequence|approach|design|architecture)\b/i,
   },
   {
     reason: "asks about trade-offs or drawbacks",
@@ -419,8 +441,10 @@ export function startThread(
   question: string,
   now: number,
 ): ConversationThread {
+  const terms = threadContentWords(question).slice(0, THREAD_MAX_TOPIC_TERMS);
   return {
-    topicTerms: threadContentWords(question).slice(0, THREAD_MAX_TOPIC_TERMS),
+    topicTerms: [...terms],
+    subjectTerms: [...terms],
     turns: [{ question: question.trim(), answerHead: null }],
     updatedAt: now,
   };
@@ -433,6 +457,11 @@ export function startThread(
  * a term from an evicted turn would keep a subject alive after every question
  * about it has scrolled out, which is the drift that makes a thread attach to
  * the wrong thing.
+ *
+ * The one term class that survives re-derivation is the thread's own SUBJECT
+ * (see {@link ConversationThread.subjectTerms}). It leads the fingerprint so a
+ * thread cannot lose the thing it is about to a run of generic follow-ups, and
+ * later turns fill whatever budget is left.
  */
 export function appendThreadTurn(
   thread: ConversationThread,
@@ -443,15 +472,29 @@ export function appendThreadTurn(
   const turns = [...thread.turns, { question: question.trim(), answerHead }];
   const kept = turns.slice(-THREAD_MAX_TURNS);
   const terms: string[] = [];
-  // Most recent turn first, so its vocabulary leads the fingerprint.
+  const add = (word: string): boolean => {
+    if (!terms.includes(word)) terms.push(word);
+    return terms.length >= THREAD_MAX_TOPIC_TERMS;
+  };
+  // The subject first: it is what the thread is about, and it must not be
+  // evicted by the newest turn's question scaffolding.
+  for (const w of thread.subjectTerms ?? []) {
+    if (add(w)) break;
+  }
+  // Then the retained turns, most recent first, so fresh vocabulary follows the
+  // subject rather than competing with it.
   for (const t of [...kept].reverse()) {
     for (const w of threadContentWords(t.question)) {
-      if (!terms.includes(w)) terms.push(w);
-      if (terms.length >= THREAD_MAX_TOPIC_TERMS) break;
+      if (add(w)) break;
     }
     if (terms.length >= THREAD_MAX_TOPIC_TERMS) break;
   }
-  return { topicTerms: terms, turns: kept, updatedAt: now };
+  return {
+    topicTerms: terms,
+    subjectTerms: thread.subjectTerms,
+    turns: kept,
+    updatedAt: now,
+  };
 }
 
 // ── Prompt block ────────────────────────────────────────────────────────────

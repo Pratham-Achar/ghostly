@@ -202,6 +202,27 @@ const ASKS_FOR_WORK = /\b(?:design|implement|write|code|build|solve|create|refac
 const REFERENTIAL_OBJECT =
   /\b(?:it|this|that|them|the\s+above|the\s+same)\b[\s?.!]*$/i;
 
+/**
+ * The same distinction, for a DEFINITE object that names work already done.
+ *
+ * `NEW_PROBLEM_CUES` matches `optimize the …`, so "Can you optimize the
+ * solution?" looked like the opening of a fresh problem and REPLACED the active
+ * problem with a sentence that contains no problem at all. The next turn then
+ * answered "Why did you choose HashMap?" with no problem in the prompt — which
+ * is exactly the fourth question of the ordinary drill-down, so the damage
+ * landed on the commonest exchange there is.
+ *
+ * The object is what decides it: "optimize the solution" / "improve the code" /
+ * "refactor the implementation" refer to a product that already exists, while
+ * "implement a function that reverses a string" or "design a rate limiter" name
+ * new work and must still start a problem. Only the nouns that CANNOT denote
+ * future work are vetoed, so a genuinely new problem phrased politely is
+ * unaffected. Consulted only after a work cue matched, so it can never widen
+ * what counts as a problem start — it only stops false positives.
+ */
+const REFERENTIAL_PRODUCT =
+  /\b(?:the|your|this)\s+(?:current\s+|existing\s+|above\s+|previous\s+)?(?:solution|code|implementation|approach|algorithm|method|function|class|design|system)\b[\s?.!]*$/i;
+
 export function detectProblemStart(
   question: string,
 ): { isProblemStart: boolean; kind: ProblemKind; reason: string } {
@@ -234,8 +255,8 @@ export function detectProblemStart(
   }
 
   // Verb matched, but the sentence points at the existing work instead of
-  // stating new work. See REFERENTIAL_OBJECT.
-  if (REFERENTIAL_OBJECT.test(text)) {
+  // stating new work. See REFERENTIAL_OBJECT and REFERENTIAL_PRODUCT.
+  if (REFERENTIAL_OBJECT.test(text) || REFERENTIAL_PRODUCT.test(text)) {
     return {
       isProblemStart: false,
       kind: "other",
