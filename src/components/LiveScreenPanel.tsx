@@ -128,9 +128,16 @@ export const LiveScreenPanel: React.FC<LiveScreenPanelProps> = ({
 
   const disabled = busy || !status.ocrAvailable;
 
+  // The overlay root is `pointer-events-none` and the Electron window ignores
+  // mouse events by default. Both have to be opted back in or the buttons below
+  // are not merely hard to click — they cannot receive a click at all. This is
+  // the same pairing every other interactive panel uses (see the screenshots
+  // strip / chat container in Home.tsx).
   return (
     <div
-      className="px-2 py-1.5 rounded-lg space-y-1"
+      className="px-2 py-1.5 rounded-lg space-y-1 pointer-events-auto"
+      onMouseEnter={() => window.ghostly.enableMouse()}
+      onMouseLeave={() => window.ghostly.disableMouse()}
       style={{
         background: "rgba(120, 140, 200, 0.08)",
         border: "1px solid rgba(140, 160, 220, 0.18)",

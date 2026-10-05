@@ -6,6 +6,53 @@ const MOVE_STEP = 25;
 // Simple mutex to prevent race conditions between hotkeys
 let isBusy = false;
 
+/**
+ * Capture the full screen and hand the image to the renderer.
+ *
+ * Shared by the Ctrl+H hotkey and the tray's "Capture Screen" item so both take
+ * the SAME screenshot. The tray item used to send `ghostly:screenshot` with no
+ * payload at all: the renderer appended `undefined` to its screenshot list, so
+ * Solve asked the provider to "analyze the problem in the screenshot" with no
+ * screenshot attached. That is how a screenshot could be "taken" and no answer
+ * ever arrive.
+ *
+ * The window is hidden for the capture when it is currently visible, so
+ * Ghostly never photographs its own overlay.
+ *
+ * @returns true when an image was captured and sent.
+ */
+export async function captureAndSendScreenshot(
+  win: BrowserWindow,
+): Promise<boolean> {
+  const wasVisible = win.getOpacity() > 0;
+  if (wasVisible) {
+    win.setOpacity(0);
+    win.blur();
+    win.setIgnoreMouseEvents(true, { forward: false });
+  }
+  try {
+    await new Promise((r) => setTimeout(r, 150));
+    const base64 = await captureFullScreen();
+    if (wasVisible) {
+      win.setOpacity(1);
+      win.setIgnoreMouseEvents(true, { forward: true });
+      win.focus();
+    }
+    win.webContents.send("ghostly:screenshot", base64);
+    console.log("[Ghostly] Screenshot captured and sent to renderer");
+    return true;
+  } catch (err) {
+    console.error("[Ghostly] Failed to capture screen:", err);
+    // Always restore window visibility on error.
+    if (win.getOpacity() === 0) {
+      win.setOpacity(1);
+      win.setIgnoreMouseEvents(true, { forward: true });
+      win.focus();
+    }
+    return false;
+  }
+}
+
 export function registerHotkeys(win: BrowserWindow): void {
   // Helper: show window
   const showWindow = () => {
@@ -26,26 +73,7 @@ export function registerHotkeys(win: BrowserWindow): void {
     if (isBusy) return;
     isBusy = true;
     try {
-      const wasVisible = win.getOpacity() > 0;
-      if (wasVisible) {
-        hideWindow();
-      }
-
-      await new Promise((r) => setTimeout(r, 150));
-
-      const base64 = await captureFullScreen();
-
-      if (wasVisible) {
-        showWindow();
-      }
-      win.webContents.send("ghostly:screenshot", base64);
-      console.log("[Ghostly] Screenshot captured and sent to renderer");
-    } catch (err) {
-      console.error("[Ghostly] Failed to capture screen:", err);
-      // Always restore window visibility on error
-      if (win.getOpacity() === 0) {
-        showWindow();
-      }
+      await captureAndSendScreenshot(win);
     } finally {
       isBusy = false;
     }

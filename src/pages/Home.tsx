@@ -60,6 +60,11 @@ import {
 } from "../lib/stageTiming";
 import type { ForceEndpointTiming } from "../lib/stageTiming";
 import { createShortcutGuard } from "../lib/interviewShortcuts";
+import {
+  decideSolveTarget,
+  lastUsableScreenshot,
+  usableScreenshots,
+} from "../lib/solveTarget";
 import { correctQuestionWithCandidate } from "../lib/candidateCorrection";
 import {
   getInterviewControls,
@@ -365,7 +370,7 @@ export const Home: React.FC = () => {
         !isGeneral &&
         !isInterview &&
         !isFollowUp &&
-        screenshotList.length === 0
+        usableScreenshots(screenshotList).length === 0
       ) {
         setError(
           "No screenshots yet. Press Ctrl+H or Ctrl+Shift+C to capture a screenshot first.",
@@ -678,11 +683,10 @@ export const Home: React.FC = () => {
         // for the question-echo signal only.
         let answeredQuestion = "";
 
-        // Use the latest screenshot for the AI call (if it exists)
-        const latestScreenshot =
-          screenshotList.length > 0
-            ? screenshotList[screenshotList.length - 1]
-            : undefined;
+        // Use the newest ATTACHABLE screenshot. `screenshotList[screenshotList.length - 1]`
+        // was used before, so one payload-less entry at the end silently sent
+        // no image while the prompt still said "the problem in the screenshot".
+        const latestScreenshot = lastUsableScreenshot(screenshotList);
 
         if (isInterview && interviewTurn) {
           // A candidate correction can change the raw question (e.g.
@@ -1430,7 +1434,25 @@ export const Home: React.FC = () => {
         // single bar but keeps capturing (closing it would stop the audio).
         setInterviewCollapsed(true);
       }
-      await runAIStream(shots, turn);
+
+      // ── What this press answers ──────────────────────────────────────────
+      // A live question always wins. But when the panel is open and the gate
+      // found nothing answerable, the old code still took the live path and
+      // stopped at the WAIT notice — so a screenshot that was sitting in the
+      // strip was never sent to any provider and Solve looked broken. A
+      // screenshot IS a question: fall back to it rather than requiring an
+      // audio submission. See `lib/solveTarget.ts`.
+      const decision = decideSolveTarget({
+        hasTurn: Boolean(turn),
+        gateSaysAnswer: turn
+          ? evaluateInterviewTurn(normalizeTurn(turn)).action === "answer"
+          : false,
+        usableScreenshots: usableScreenshots(shots).length,
+      });
+      console.log(
+        `[AI] solve target=${decision.target} (${decision.reason})`,
+      );
+      await runAIStream(shots, decision.target === "interview" ? turn : undefined);
       // The turn's own timings are published by `runAIStream`; this only has to
       // stop the next hotkey press inheriting this one's instants.
       hotkeyPressedAtRef.current = null;
@@ -1619,6 +1641,7 @@ export const Home: React.FC = () => {
               */}
               {(!settingsOpen || true) && (
                 <SessionContextChip
+                  key="session-context"
                   context={sessionContext}
                   now={ctxTick}
                   onChange={setSessionContext}
@@ -1651,6 +1674,7 @@ export const Home: React.FC = () => {
                 main-process RAM guard is what actually protects the machine.
               */}
               <LiveScreenPanel
+                key="live-screen"
                 asrBusy={isStreaming}
                 resetSignal={liveScreenReset}
                 onUseProblem={(text) =>
@@ -1667,6 +1691,7 @@ export const Home: React.FC = () => {
 
               {answerIssue && (
                 <motion.div
+                  key="answer-issue"
                   initial={{ opacity: 0, y: -5 }}
                   animate={{ opacity: 1, y: 0 }}
                   exit={{ opacity: 0 }}

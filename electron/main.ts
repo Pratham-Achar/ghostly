@@ -8,7 +8,7 @@ import {
   ipcMain,
 } from "electron";
 import path from "path";
-import { registerHotkeys, unregisterHotkeys } from "./hotkeys";
+import { registerHotkeys, unregisterHotkeys, captureAndSendScreenshot } from "./hotkeys";
 import { registerIpcHandlers } from "./ipc";
 import { initLiveScreen } from "./liveScreen";
 import { applyStealthMode, removeStealthMode } from "./stealth";
@@ -167,9 +167,14 @@ function createTray(): Tray {
     },
     {
       label: "Capture Screen",
+      // Must go through the SAME capture the Ctrl+H hotkey uses. This used to
+      // emit `ghostly:screenshot` with no payload, which appended `undefined`
+      // to the renderer's screenshot list: Solve then sent a prompt that asked
+      // for "the problem in the screenshot" while attaching no screenshot at
+      // all, so no answer ever arrived.
       click: () => {
         if (mainWindow) {
-          mainWindow.webContents.send("ghostly:screenshot");
+          void captureAndSendScreenshot(mainWindow);
         }
       },
     },

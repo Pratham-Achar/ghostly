@@ -501,10 +501,19 @@ export const useStore = create<GhostlyStore>((set, get) => ({
   setIsStreaming: (v) => set({ isStreaming: v }),
   setCurrentScreenshot: (b64) => set({ currentScreenshot: b64 }),
   addScreenshot: (b64) =>
-    set((s) => ({
-      screenshots: [...s.screenshots, b64],
-      currentScreenshot: b64,
-    })),
+    set((s) => {
+      // An empty payload must never enter the list. A screenshot entry that is
+      // not an image is worse than no screenshot at all: the strip renders it,
+      // `screenshots.length > 0` satisfies the "you forgot to capture" guard,
+      // and the provider is asked to read a picture that was never sent.
+      if (typeof b64 !== "string" || b64.length === 0) {
+        return {};
+      }
+      return {
+        screenshots: [...s.screenshots, b64],
+        currentScreenshot: b64,
+      };
+    }),
   clearScreenshots: () => set({ screenshots: [], currentScreenshot: null }),
   removeScreenshot: (index) =>
     set((s) => {

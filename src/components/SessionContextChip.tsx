@@ -51,6 +51,19 @@ const KIND_LABEL: Record<ProblemKind, string> = {
   other: "Problem",
 };
 
+/**
+ * The chip renders inside the overlay's `pointer-events-none` root while the
+ * Electron window ignores mouse events by default. Both have to be opted back
+ * in or the Edit / Clear / "Use answer as context" buttons cannot receive a
+ * click at all — the offer exists, is visible, and is inert. This is the same
+ * pairing every other interactive panel in the overlay uses.
+ */
+const CHIP_ROOT =
+  "px-2 py-1.5 rounded-lg pointer-events-auto flex items-center gap-2";
+
+const enableMouse = () => window.ghostly.enableMouse();
+const disableMouse = () => window.ghostly.disableMouse();
+
 export const SessionContextChip: React.FC<SessionContextChipProps> = ({
   context,
   now = Date.now(),
@@ -75,7 +88,9 @@ export const SessionContextChip: React.FC<SessionContextChipProps> = ({
   if (!problem && thread) {
     return (
       <div
-        className="flex items-center gap-2 px-2 py-1.5 rounded-lg"
+        className={CHIP_ROOT}
+        onMouseEnter={enableMouse}
+        onMouseLeave={disableMouse}
         style={{
           background: "rgba(120, 140, 200, 0.08)",
           border: "1px solid rgba(140, 160, 220, 0.18)",
@@ -101,7 +116,9 @@ export const SessionContextChip: React.FC<SessionContextChipProps> = ({
   if (!problem) {
     return offerSolution && onUseSolution ? (
       <div
-        className="flex items-center gap-2 px-2 py-1.5 rounded-lg"
+        className={CHIP_ROOT}
+        onMouseEnter={enableMouse}
+        onMouseLeave={disableMouse}
         style={{
           background: "rgba(120, 140, 200, 0.08)",
           border: "1px solid rgba(140, 160, 220, 0.18)",
@@ -150,7 +167,9 @@ export const SessionContextChip: React.FC<SessionContextChipProps> = ({
 
   return (
     <div
-      className="px-2 py-1.5 rounded-lg space-y-1"
+      className={`${CHIP_ROOT} space-y-1`}
+      onMouseEnter={enableMouse}
+      onMouseLeave={disableMouse}
       style={{
         background: "rgba(120, 140, 200, 0.08)",
         border: "1px solid rgba(140, 160, 220, 0.18)",
