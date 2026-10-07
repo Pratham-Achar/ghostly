@@ -7,6 +7,22 @@ interface Window {
     disableMouse: () => void;
     hide: () => void;
     show: () => void;
+
+    /**
+     * Ghostly's own window opacity — NOT the Region Picker's dim overlay.
+     *
+     * Read on mount to show the persisted value, written on every slider change
+     * so a restart restores it. `percent` comes from the main process so the UI
+     * never rounds differently from the value actually applied to the window.
+     */
+    getOverlayOpacity: () => Promise<{
+      opacity: number;
+      percent: number;
+      hidden: boolean;
+    }>;
+    setOverlayOpacity: (
+      value: number,
+    ) => Promise<{ opacity: number; percent: number; hidden: boolean }>;
     captureFullscreen: () => Promise<string>;
 
     // Settings
@@ -19,6 +35,13 @@ interface Window {
 
     // Events
     onScreenshot: (cb: (b64: string) => void) => () => void;
+    /**
+     * The global `Ctrl+Shift+S` Capture Screen shortcut, forwarded from the
+     * main process so the shortcut and the Capture Screen BUTTON run the SAME
+     * renderer callback → same `ghostly:capture-fullscreen` IPC → same capture
+     * function. One implementation, two triggers.
+     */
+    onCaptureScreen: (cb: () => void) => () => void;
     /**
      * The main process' wall-clock instant of the `Ctrl+Enter` press.
      *
@@ -196,6 +219,10 @@ interface Window {
       inFlight: number;
       consecutiveFailures: number;
     }>;
+    // System memory, numbers only: available/total physical RAM in MB, read by
+    // the ASR fallback guard to refuse a Moonshine load under
+    // MIN_FALLBACK_AVAILABLE_MB. No processes, no paths, no transcripts.
+    getSystemMemory: () => Promise<{ availableMb: number; totalMb: number }>;
 
     // ── Model download ────────────────────────────────────────────────
     //
@@ -232,35 +259,6 @@ interface Window {
       dir: string;
     }>;
 
-    // ── NVIDIA NIM, executed in the MAIN process ──────────────────────
-    //
-    // NVIDIA sends no `Access-Control-Allow-Origin` for this app's origin, so
-    // a renderer-side fetch is blocked before it leaves. The main process has
-    // no origin, so the request runs there.
-    //
-    // Note what is ABSENT, and it is the point: there is no key parameter. The
-    // main process reads the key from its own settings store, so there is no
-    // code path that puts the secret on the wire.
-    nvidiaStreamStart: (payload: {
-      model: string;
-      messages: unknown[];
-      maxTokens?: number;
-    }) => Promise<
-      | { ok: true; id: number }
-      | { ok: false; code: string; message: string }
-    >;
-    nvidiaStreamAbort: (payload: { id: number }) => Promise<{ ok: boolean }>;
-    onNvidiaStream: (
-      cb: (e: {
-        id: number;
-        type: "chunk" | "done" | "error";
-        text?: string;
-        code?: string;
-        status?: number;
-        message?: string;
-      }) => void,
-    ) => () => void;
-
     // ── Dev-only screen visibility ────────────────────────────────────
     // Runtime-only (not persisted) and refused by the main process in a
     // packaged build.
@@ -269,45 +267,20 @@ interface Window {
     ) => Promise<{ ok: boolean; mode: "visible" | "hidden" }>;
     getVisibility: () => Promise<"visible" | "hidden">;
 
-    // ── Live Screen ───────────────────────────────────────────────────
+    // ── One-shot local screen text ────────────────────────────────
     //
-    // Note what is ABSENT, and it is the point: there is no method that
-    // returns a frame, a screenshot, a data URL or base64 pixels. Live Screen
-    // captures, compares and OCRs inside the main process; the renderer can
-    // only choose a region, switch the watcher on and off, and read a status
-    // that contains no screen content.
-    liveScreenConfigure: (config: {
-      region?: { x: number; y: number; width: number; height: number } | null;
-      enabled?: boolean;
-    }) => Promise<void>;
-    liveScreenStatus: () => Promise<{
-      enabled: boolean;
-      region: { x: number; y: number; width: number; height: number } | null;
-      on: string;
-      regionLabel: string;
-      ocrLabel: string;
-      contextLabel: string;
-      ocrAvailable: boolean;
-      ocrUnavailableReason: string | null;
-      polls: number;
-      reads: number;
-      framesSkipped: number;
-      lastError: string | null;
+    // OCR of an image the renderer already holds (an attached screenshot).
+    // Returns TEXT and never pixels, and writes nothing to disk. Used when
+    // building a prompt for an attached screenshot; cloud providers still
+    // receive the image itself. The automatic screen watcher that used this
+    // channel for polling was removed.
+    ocrImageText: (payload: { dataUrl: string }) => Promise<{
+      ok: boolean;
+      text?: string;
+      code?: string;
+      message?: string;
+      width?: number;
+      height?: number;
     }>;
-    /** Tell main whether transcription is live, so OCR yields to it. */
-    liveScreenAsrBusy: (busy: boolean) => Promise<void>;
-    liveScreenReset: () => Promise<void>;
-    /** Opens a full-screen overlay; resolves with a device-pixel rect or null. */
-    liveScreenPickRegion: () => Promise<{
-      x: number;
-      y: number;
-      width: number;
-      height: number;
-    } | null>;
-    /** Fires when a local read decides the active problem should change. */
-    onLiveScreenProblem: (
-      cb: (update: { problemText: string | null; reason: string }) => void,
-    ) => () => void;
-    onLiveScreenStatusChanged: (cb: () => void) => () => void;
   };
 }

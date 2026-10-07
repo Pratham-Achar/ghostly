@@ -25,48 +25,44 @@ contextBridge.exposeInMainWorld("ghostly", {
   hide: (): void => ipcRenderer.send("ghostly:hide"),
   show: (): void => ipcRenderer.send("ghostly:show"),
 
+  // ── Ghostly's own window opacity ────────────────────────────────────────
+  //
+  // NOT the Region Picker's dim overlay: that is a separate window with its own
+  // slider and its own range. This controls how see-through Ghostly's own window
+  // is, so the interview app stays visible behind it.
+  //
+  // Read on mount so the slider shows the persisted value, and written on every
+  // change so a restart restores it. `percent` is supplied so the UI never has to
+  // do its own rounding (and therefore never disagrees with the main process).
+  getOverlayOpacity: (): Promise<{
+    opacity: number;
+    percent: number;
+    hidden: boolean;
+  }> => ipcRenderer.invoke("ghostly:get-overlay-opacity"),
+
+  setOverlayOpacity: (
+    value: number,
+  ): Promise<{ opacity: number; percent: number; hidden: boolean }> =>
+    ipcRenderer.invoke("ghostly:set-overlay-opacity", value),
+
   // Capture
   captureFullscreen: (): Promise<string> =>
     ipcRenderer.invoke("ghostly:capture-fullscreen"),
 
-  // ── Live Screen ────────────────────────────────────────────────────────
-  // NOTE there is deliberately NO API here that returns pixels. Frames are
-  // captured, compared and OCR'd inside the main process; the renderer only
-  // chooses a region, switches the watcher on and off, and reads a status.
-  liveScreenConfigure: (config: {
-    region?: { x: number; y: number; width: number; height: number } | null;
-    enabled?: boolean;
-  }): Promise<void> => ipcRenderer.invoke("ghostly:live-screen-configure", config),
-
-  liveScreenStatus: (): Promise<any> =>
-    ipcRenderer.invoke("ghostly:live-screen-status"),
-
-  liveScreenAsrBusy: (busy: boolean): Promise<void> =>
-    ipcRenderer.invoke("ghostly:live-screen-asr-busy", busy),
-
-  liveScreenReset: (): Promise<void> =>
-    ipcRenderer.invoke("ghostly:live-screen-reset"),
-
-  liveScreenPickRegion: (): Promise<{
-    x: number;
-    y: number;
-    width: number;
-    height: number;
-  } | null> => ipcRenderer.invoke("ghostly:live-screen-pick-region"),
-
-  /** Fires when a local read changes the active problem. */
-  onLiveScreenProblem: (cb: (update: any) => void): (() => void) => {
-    const listener = (_e: unknown, update: any) => cb(update);
-    ipcRenderer.on("ghostly:live-screen-problem", listener);
-    return () => ipcRenderer.removeListener("ghostly:live-screen-problem", listener);
-  },
-
-  onLiveScreenStatusChanged: (cb: () => void): (() => void) => {
-    const listener = () => cb();
-    ipcRenderer.on("ghostly:live-screen-status-changed", listener);
-    return () =>
-      ipcRenderer.removeListener("ghostly:live-screen-status-changed", listener);
-  },
+  // ── One-shot local screen text ─────────────────────────────────────
+  //
+  // OCR of an image the renderer already captured (an attached screenshot).
+  // Returns TEXT, never pixels, and writes nothing to disk. Used when building
+  // a prompt that carries explicit screen context; cloud providers still
+  // receive the image itself. The automatic watcher is gone.
+  ocrImageText: (payload: { dataUrl: string }): Promise<{
+    ok: boolean;
+    text?: string;
+    code?: string;
+    message?: string;
+    width?: number;
+    height?: number;
+  }> => ipcRenderer.invoke("ghostly:ocr-image", payload),
 
   // Settings persistence
   getSettings: (): Promise<any> => ipcRenderer.invoke("get-settings"),
@@ -247,43 +243,14 @@ contextBridge.exposeInMainWorld("ghostly", {
     mode?: "primary" | "comparison";
   }> => ipcRenderer.invoke("parakeet:diagnostics"),
 
-  // ── NVIDIA NIM, executed in the MAIN process ─────────────────────────
+  // ── System memory, numbers only ──────────────────────────────────────
   //
-  // NVIDIA's API sends no `Access-Control-Allow-Origin` for this app's origin,
-  // so every renderer-side request failed with `TypeError: Failed to fetch`. The
-  // main process has no origin and is not subject to CORS, so the request runs
-  // there — and the API key is read from the main-process store, which is why
-  // there is no key parameter anywhere in this surface.
-  //
-  // Streaming is preserved deliberately: the orchestrator's hedge decision
-  // depends on seeing the first text arrive early, so buffering the answer in
-  // main would remove the very signal it needs.
-  nvidiaStreamStart: (payload: {
-    model: string;
-    messages: unknown[];
-    maxTokens?: number;
-  }): Promise<
-    | { ok: true; id: number }
-    | { ok: false; code: string; message: string }
-  > => ipcRenderer.invoke("nvidia:stream-start", payload),
-
-  nvidiaStreamAbort: (payload: { id: number }): Promise<{ ok: boolean }> =>
-    ipcRenderer.invoke("nvidia:stream-abort", payload),
-
-  onNvidiaStream: (
-    cb: (e: {
-      id: number;
-      type: "chunk" | "done" | "error";
-      text?: string;
-      code?: string;
-      status?: number;
-      message?: string;
-    }) => void,
-  ): (() => void) => {
-    const listener = (_: any, e: any): void => cb(e);
-    ipcRenderer.on("nvidia:stream-event", listener);
-    return () => ipcRenderer.removeListener("nvidia:stream-event", listener);
-  },
+  // Available/total physical RAM in MB for the renderer's ASR fallback guard:
+  // a Moonshine fallback load is refused below MIN_FALLBACK_AVAILABLE_MB so it
+  // can never push the machine into severe memory pressure. No processes, no
+  // paths, no transcripts — nothing sensitive crosses this bridge.
+  getSystemMemory: (): Promise<{ availableMb: number; totalMb: number }> =>
+    ipcRenderer.invoke("ghostly:get-system-memory"),
 
   // ── Dev-only screen visibility ───────────────────────────────────────
   // Runtime-only and dev-gated in the main process. Returns the mode that
@@ -302,6 +269,19 @@ contextBridge.exposeInMainWorld("ghostly", {
     const listener = (_: any, b64: string): void => cb(b64);
     ipcRenderer.on("ghostly:screenshot", listener);
     return () => ipcRenderer.removeListener("ghostly:screenshot", listener);
+  },
+
+  // Ctrl+Shift+S — Capture Screen.
+  //
+  // The main process registers the GLOBAL shortcut and forwards it here, where
+  // the renderer runs the SAME `captureScreen` callback the Capture Screen
+  // BUTTON runs → same `ghostly:capture-fullscreen` IPC → same
+  // `captureFullScreen()`. One implementation, two triggers — deliberately NOT
+  // a second capture path like the tray/hide hotkey uses.
+  onCaptureScreen: (cb: () => void): (() => void) => {
+    const listener = (): void => cb();
+    ipcRenderer.on("ghostly:capture-screen", listener);
+    return () => ipcRenderer.removeListener("ghostly:capture-screen", listener);
   },
 
   onSolve: (cb: (payload: SolveHotkeyPayload) => void): (() => void) => {
