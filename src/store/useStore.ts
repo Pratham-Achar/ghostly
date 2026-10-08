@@ -5,6 +5,9 @@ import type { DeepgramTelemetry } from "../lib/deepgramProtocol";
 import type { GroqAsrTelemetry } from "../lib/groqWhisper";
 import { DEFAULT_PRIMARY_ASR, type PrimaryAsr } from "../lib/primaryAsr";
 import {
+  DEFAULT_ANSWER_INSTRUCTIONS,
+} from "../lib/prompts";
+import {
   EMPTY_SESSION_CONTEXT,
   type SessionContext,
 } from "../lib/sessionContext";
@@ -37,7 +40,22 @@ export interface Solution {
 export interface SessionMessage {
   id: string;
   role: "user" | "assistant";
+  /**
+   * What the model was actually SENT — for a screenshot/follow-up turn that is
+   * the fully assembled prompt (screen text fence + candidate context). It is
+   * INTERNAL: it exists so the next screenshot solve can send its own history
+   * verbatim, and it must never be rendered.
+   */
   content: string;
+  /**
+   * The DISPLAY text for a user message, when `content` is not display-safe.
+   *
+   * The answer panel renders this instead of `content` when present, so the
+   * request prompt (OCR text, `<<<SCREEN_TEXT_START>>>`, resume/JD context) can
+   * never appear inside the visible Answer. Absent means `content` is already a
+   * short label and is safe to show.
+   */
+  displayText?: string;
   screenshotBase64?: string;
 }
 
@@ -133,6 +151,28 @@ export interface AsrComparison {
   timestamp: number;
 }
 
+/**
+ * What local OCR read off the LAST screenshot solve.
+ *
+ * Held in its own slice, never persisted: it is the recognised screen text plus
+ * the numbers that produced the GOOD/POOR verdict. The text is editable in the
+ * overlay (see the "Text read from screen" preview) so an OCR slip such as
+ * `==` → `=` can be corrected and resent without re-capturing.
+ *
+ * In-memory only, like the screenshots themselves. Never written to disk and
+ * never logged (only its character COUNT is).
+ */
+export interface ScreenshotOcr {
+  text: string;
+  quality: "good" | "poor";
+  /** Closed-vocabulary reason from the quality gate. Safe to log. */
+  reason: string;
+  /** Byte length of the image OCR read. Never the pixels. */
+  imageBytes: number;
+  /** OCR duration in ms. */
+  ocrMs: number;
+}
+
 /** A run that produced nothing usable — surfaced with a Retry action. */
 export interface AnswerIssue {
   /** `empty` = no provider returned text, `partial` = text was kept after a failure. */
@@ -150,10 +190,22 @@ export interface Settings {
   models: Record<ProviderName, string>;
   /**
    * Providers live interview answers try, in order (first with a key wins).
-   * Groq → Gemini by default; the selection is filtered to providers that
-   * actually have an API key.
+   *
+   * Default: `gemini → openrouter`. Groq is optional — it is kept out of the
+   * chain unless the user turns it on (see `lib/providerDiagnostics.ts`),
+   * because every member of the chain is waited on and a broken member taxes
+   * every question. Whichever providers are actually attempted is filtered per
+   * run to the ones that have an API key. The Local Qwen fallback and NVIDIA
+   * no longer exist in the registry, so a persisted order containing them is
+   * filtered out by `isProviderName` on load.
    */
   providerOrder: ProviderName[];
+  /**
+   * Which generation of the default chain policy this store was last migrated
+   * to. See `CURRENT_CHAIN_POLICY_VERSION` in `App.tsx`. Opaque to every
+   * consumer; it exists purely so the one-time migration cannot repeat.
+   */
+  chainPolicyVersion?: number;
   interviewType:
     | "dsa"
     | "system_design"
@@ -163,11 +215,39 @@ export interface Settings {
     | "general";
   language: "python" | "javascript" | "typescript" | "java" | "cpp" | "go";
   apiKeys: Record<ProviderName, string>;
-  customInstructions?: string;
+  /**
+   * Key slots 2 and 3, per provider.
+   *
+   * ── Why slot 1 lives in `apiKeys` instead of here ────────────────────────
+   * `apiKeys` predates the pool and is read by the settings migration, the
+   * provider-chain diagnostics and the "does this provider have a key" filter.
+   * Keeping it as slot 1 means none of those had to change, and
+   * `keyPool()` in `lib/keyHealth.ts` is the single place that joins the two.
+   *
+   * Slot 0 of this map is intentionally ignored for that reason — the array here
+   * holds SLOTS 2 AND 3 ONLY.
+   */
+  apiKeyPool?: Partial<Record<ProviderName, string[]>>;
   // Pre-interview context (set before "Start Interview" in the overlay)
   resumeText?: string;
   companyName?: string;
   jobDescription?: string;
+  /**
+   * PROJECT & INTERNSHIP CONTEXT — free-form detail the resume omits or
+   * shortens.
+   *
+   * ── Why this is separate from the resume ──────────────────────────────────
+   * A resume is a summary, and the follow-up question that decides an interview
+   * is almost always about the part the summary left out: what the candidate
+   * personally built, which problem it solved, what broke, what the trade-off
+   * was. Without a place to put that, the model's only options are to be vague
+   * or to invent — and inventing candidate experience is the single worst
+   * failure this app can produce.
+   *
+   * Persisted locally with the rest of the settings. Never logged, and never
+   * uploaded anywhere except as part of a prompt the user's own action produced.
+   */
+  projectContext?: string;
   /** Shapes how the answer is rendered on screen (tone, length, format). */
   answerInstructions?: string;
   micDeviceId?: string;
@@ -292,6 +372,9 @@ export interface Settings {
   /**
    * When on, the answering agent fires by itself as soon as the interviewer
    * finishes a clear question — no hotkey. Manual triggers keep working.
+   *
+   * (Audio auto-answer only. The screen-watcher setting `autoDetectQuestion`
+   * and the local-model settings were removed with their features.)
    */
   autoAnswer?: boolean;
 }
@@ -301,6 +384,70 @@ interface GhostlyStore {
   currentSolution: string;
   isStreaming: boolean;
   screenshots: string[]; // accumulated screenshots (multiple Ctrl+H)
+  /**
+   * Wall-clock capture instant for each entry of `screenshots`, same index,
+   * kept in lockstep by every mutator below.
+   *
+   * Diagnostic only — recorded so a capture's age can be logged, and so the
+   * strip can order entries. The solve target is NOT derived from these; it is
+   * derived from `screenshotArmed` (see `lib/solveTarget.ts`).
+   */
+  screenshotTimestamps: number[];
+  /**
+   * True when the user has explicitly captured a screenshot that no Solve has
+   * consumed yet.
+   *
+   * ── Why an arm and not a timestamp comparison ─────────────────────────────
+   * "Which input is newer" looks like it answers "did the user just capture
+   * something?", and it does not. ASR commits an utterance only after it has
+   * decoded, so the interviewer's last sentence routinely lands in the
+   * transcript AFTER the user pressed Capture. A recency comparison then hands
+   * Solve to a sentence that was already on screen when the capture happened,
+   * and the capture is ignored — the exact "screenshot taken, audio won, no
+   * answer" failure. An explicit capture is a deliberate user ACTION, so it is
+   * recorded as a flag that the Solve run consumes.
+   *
+   * Cleared by `consumeScreenshotArm` when a Solve targets the screenshot, by
+   * Clear Chat / Reset Interview, and when the last screenshot is removed — so
+   * a stale capture can never hijack a later, purely-spoken question.
+   * IN-MEMORY ONLY, never persisted, like the screenshots themselves.
+   */
+  screenshotArmed: boolean;
+  /**
+   * OCR result for the most recent screenshot solve (recognised text + the
+   * numbers behind the GOOD/POOR verdict). In-memory only, like the
+   * screenshots; powers the "Text read from screen" preview and Resend.
+   */
+  screenshotOcr: ScreenshotOcr | null;
+  /**
+   * The ACTIVE problem context, as recognised text from the screen.
+   *
+   * ── Why this is a SEPARATE slice from `screenshots` ──────────────────────
+   * They have different lifetimes, and that difference is the whole point:
+   *
+   *   screenshots[]      the IMAGE. Consumed by the Solve run that answers it,
+   *                      kept afterwards only as a thumbnail.
+   *   activeScreenText   the TEXT. Consumed by nothing — it survives the solve
+   *                      that produced it and answers every later follow-up.
+   *
+   * Deriving one from the other is what produced the reported failure: because a
+   * screenshot kept existing after its solve, every later interview request
+   * re-attached that image (`solveTarget=interview` with `image=image/png`), and
+   * no follow-up could ever refer to the problem the screen had shown.
+   *
+   * So `screenshotPresent` says nothing about this, and consuming an image says
+   * nothing about it either. A new screenshot REPLACES it (never merges), an
+   * Edit REPLACES it, and Ctrl+G / Clear drops it — but an ordinary Solve that
+   * consumes the image does not.
+   *
+   * Holds only text that was good enough to reason about (a GOOD read, or the
+   * user's edited version). A POOR read stays visible in `screenshotOcr` for the
+   * preview and the manual "Retry with image", and never becomes context.
+   *
+   * IN-MEMORY ONLY and never persisted, like the screenshots themselves: a stale
+   * problem surviving a restart would be worse than none.
+   */
+  activeScreenText: string | null;
   currentScreenshot: string | null; // latest screenshot (for backward compat)
   error: string | null;
   sessionMessages: SessionMessage[];
@@ -370,7 +517,31 @@ interface GhostlyStore {
   appendToSolution: (chunk: string) => void;
   setIsStreaming: (v: boolean) => void;
   setCurrentScreenshot: (b64: string | null) => void;
+  /** Record a capture AND arm it, so the next Solve answers this image. */
   addScreenshot: (b64: string) => void;
+  /** Remember the OCR result for the screenshot answer preview / resend. */
+  setScreenshotOcr: (v: ScreenshotOcr | null) => void;
+  /**
+   * Replace the recognised text AND the active problem context in one write.
+   *
+   * This is the user's Edit. It deliberately cannot update only the preview: an
+   * edited OCR text that the follow-ups do not use would mean the answer on
+   * screen and the answer to the next question came from different problems.
+   */
+  updateScreenshotOcrText: (text: string) => void;
+  /**
+   * Set (or clear, with `null`) the active screen problem context.
+   *
+   * The ONLY write path a screenshot solve uses, so "which problem the follow-ups
+   * are about" has exactly one answer in the store.
+   */
+  setActiveScreenText: (text: string | null) => void;
+  /**
+   * Consume the explicit-capture arm. Called by Solve once a run has targeted
+   * the screenshot, so the NEXT Solve with no new capture returns to the live
+   * transcript rather than answering a stale image forever.
+   */
+  consumeScreenshotArm: () => void;
   clearScreenshots: () => void;
   removeScreenshot: (index: number) => void;
   setError: (err: string | null) => void;
@@ -389,7 +560,7 @@ interface GhostlyStore {
   addAsrComparison: (comparison: AsrComparison) => void;
   /** Append one turn's latency record, evicting the oldest past the cap. */
   addLatencyTurn: (turn: TurnTimings) => void;
-  /** Drop every latency record (the report's "Clear"). */
+  /** Drop every latency record (the Debug panel's "Clear"). */
   clearLatencyTurns: () => void;
   /** Drop all comparison records. */
   clearAsrComparisons: () => void;
@@ -425,6 +596,10 @@ export const useStore = create<GhostlyStore>((set, get) => ({
   currentSolution: "",
   isStreaming: false,
   screenshots: [],
+  screenshotTimestamps: [],
+  screenshotArmed: false,
+  screenshotOcr: null,
+  activeScreenText: null,
   currentScreenshot: null,
   error: null,
   sessionMessages: [],
@@ -440,10 +615,16 @@ export const useStore = create<GhostlyStore>((set, get) => ({
   history: [],
   mouseEnabled: false,
   settings: {
-    // OpenRouter is the single gateway for every AI call (interview answers,
-    // screenshots and follow-ups all route through it).
-    activeProvider: "openrouter",
+    // The default chain is Gemini → OpenRouter (see
+    // `lib/providerDiagnostics.ts`). Groq stays fully integrated and
+    // configurable, but is OPTIONAL: not in the chain unless the user adds it,
+    // because a provider that fails on every request costs every question an
+    // attempt slot and a timeout for nothing. Local Qwen and NVIDIA are gone.
+    activeProvider: "gemini",
     models: {
+      // The registry's own curated default for Gemini (`listModels()[0]`) —
+      // VERIFIED against the live API with the app's exact streaming path
+      // (HTTP 200, first text 1.2–1.4s). Never chosen from memory.
       gemini: "gemini-2.5-flash",
       openai: "gpt-4o",
       anthropic: "claude-3-5-sonnet-20241022",
@@ -452,12 +633,8 @@ export const useStore = create<GhostlyStore>((set, get) => ({
       // concrete available free model per request, so a single unavailable
       // model can no longer take the interview path down.
       openrouter: "openrouter/free",
-      nvidia: "meta/llama-3.3-70b-instruct",
     },
-    // The full interview chain. All four are always represented so the
-    // architecture stays visible and configurable; which ones actually run is
-    // decided per run by whether they have an API key.
-    providerOrder: ["openrouter", "groq", "nvidia", "gemini"],
+    providerOrder: ["gemini", "openrouter"],
     interviewType: "dsa",
     language: "python",
     apiKeys: {
@@ -466,13 +643,18 @@ export const useStore = create<GhostlyStore>((set, get) => ({
       anthropic: "",
       groq: "",
       openrouter: "",
-      nvidia: "",
     },
-    customInstructions: "",
+    // Slots 2 and 3 only — see the `apiKeyPool` doc comment. Empty by default:
+    // extra credentials are something the user authorizes, never something the
+    // app assumes.
+    apiKeyPool: {},
     resumeText: "",
     companyName: "",
     jobDescription: "",
-    answerInstructions: "",
+    projectContext: "",
+    // Seeded with the documented default guidance so the field is useful out of
+    // the box. It is a normal editable string from here on — the user owns it.
+    answerInstructions: DEFAULT_ANSWER_INSTRUCTIONS,
     micDeviceId: "default",
     whisperModel: "onnx-community/moonshine-base-ONNX",
     asrEngine: "moonshine",
@@ -481,9 +663,10 @@ export const useStore = create<GhostlyStore>((set, get) => ({
     // Dev-only, and OFF by default: the Parakeet model is ~631 MB and costs
     // several hundred MB of resident memory.
     asrCompareParakeet: false,
-    // Moonshine stays the code default so a settings blob written before
-    // Parakeet existed resolves to a working engine on upgrade. Selecting
-    // Parakeet is a UI action, never a source edit.
+    // Parakeet is the code default (see src/lib/primaryAsr.ts). Moonshine is
+    // kept as the local fallback for any segment Parakeet cannot decode, and an
+    // explicit "moonshine" selection is preserved. A pre-Parakeet settings blob
+    // with no `primaryAsr` key resolves to Parakeet.
     primaryAsr: DEFAULT_PRIMARY_ASR,
     // Off by default: ~740 MB of resident memory for a panel the user may only
     // glance at. See the `parakeetPreload` doc comment for the measurement.
@@ -511,15 +694,54 @@ export const useStore = create<GhostlyStore>((set, get) => ({
       }
       return {
         screenshots: [...s.screenshots, b64],
+        screenshotTimestamps: [...s.screenshotTimestamps, Date.now()],
+        // ARMED. Every capture path (Capture Screen, Ctrl+Shift+S, Ctrl+H, and
+        // the tray) funnels through this action, so this is the one place that
+        // has to record the explicit user instruction "answer what I just
+        // captured". It is what a Solve press then consumes.
+        screenshotArmed: true,
         currentScreenshot: b64,
       };
     }),
-  clearScreenshots: () => set({ screenshots: [], currentScreenshot: null }),
+  consumeScreenshotArm: () => set({ screenshotArmed: false }),
+  setScreenshotOcr: (v) => set({ screenshotOcr: v }),
+  setActiveScreenText: (text) =>
+    set({ activeScreenText: typeof text === "string" && text.trim() ? text : null }),
+  updateScreenshotOcrText: (text) =>
+    set((s) =>
+      s.screenshotOcr
+        ? {
+            screenshotOcr: { ...s.screenshotOcr, text },
+            // The edit IS the user's correction of the problem statement, so the
+            // follow-ups must reason about the corrected text. Written together so
+            // the preview and the context can never disagree.
+            activeScreenText:
+              typeof text === "string" && text.trim() ? text : null,
+          }
+        : {},
+    ),
+  clearScreenshots: () =>
+    set({
+      screenshots: [],
+      screenshotTimestamps: [],
+      screenshotArmed: false,
+      currentScreenshot: null,
+      // NOT cleared. Removing the IMAGE does not retract the problem the screen
+      // showed: the thumbnail is a display concern, `activeScreenText` is the
+      // conversation's subject, and a follow-up must still be answerable after
+      // the picture is gone.
+    }),
   removeScreenshot: (index) =>
     set((s) => {
       const next = s.screenshots.filter((_, i) => i !== index);
       return {
         screenshots: next,
+        screenshotTimestamps: s.screenshotTimestamps.filter(
+          (_, i) => i !== index,
+        ),
+        // Removing the LAST screenshot removes the thing the arm points at, so
+        // the arm goes with it rather than lingering over an empty strip.
+        screenshotArmed: next.length > 0 ? s.screenshotArmed : false,
         currentScreenshot: next.length > 0 ? next[next.length - 1] : null,
       };
     }),
@@ -528,6 +750,10 @@ export const useStore = create<GhostlyStore>((set, get) => ({
     set({
       currentSolution: "",
       screenshots: [],
+      screenshotTimestamps: [],
+      screenshotArmed: false,
+      screenshotOcr: null,
+      activeScreenText: null,
       currentScreenshot: null,
       error: null,
       sessionMessages: [],

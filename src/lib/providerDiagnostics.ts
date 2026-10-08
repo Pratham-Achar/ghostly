@@ -4,22 +4,62 @@ import { isOpenRouterFreeModel, OPENROUTER_FREE_MODEL } from "./ai/openrouter";
 /**
  * The interview provider chain.
  *
- * OpenRouter is the PRIMARY gateway. Groq, NVIDIA and Gemini are INDEPENDENT
- * secondary providers — Ghostly calls them directly, and never lets OpenRouter
- * call them on our behalf. Keeping them independently controllable is the whole
- * point: each has its own key, its own quota and its own failure mode.
+ * ── The default chain ───────────────────────────────────────────────────────
+ *   Gemini → OpenRouter
  *
- * All four are always represented in `providerOrder`. Whether one is actually
- * *used* is decided at run time by whether it has credentials — so the
- * architecture is visible and configurable even on a machine that only has one
- * key, and the log can always explain why a provider was skipped.
+ * Gemini leads because it is a first-party endpoint with a fast time-to-first-
+ * token and, unlike the free routers, a quota that a single interview cannot
+ * exhaust. OpenRouter is the fallback because it is a gateway: when a direct
+ * provider is down, rate-limited or out of quota, OpenRouter can usually route
+ * around it without any change on our side.
+ *
+ * The LOCAL Qwen fallback and NVIDIA NIM have been REMOVED entirely (provider,
+ * model, download, IPC and UI) — never confuse the local Qwen LLM with
+ * Parakeet ASR, which is untouched and remains the interview's speech engine.
+ *
+ * ── What is NOT in it, and why ──────────────────────────────────────────────
+ * `OPTIONAL_PROVIDER_ORDER` holds providers that remain fully integrated and
+ * configurable but are NOT attempted by default:
+ *
+ *   • **Groq** — fast, but redundant with OpenRouter for fallback purposes.
+ *     The user opts it in from Settings; when they do, it sits after
+ *     OpenRouter and is waited on like any other chain member.
+ *
+ * The distinction matters for latency, not tidiness: anything in the chain is
+ * waited on. A broken member of the chain is a tax on every question, so the
+ * default chain contains only providers that are expected to work.
+ *
+ * All of them are always REPORTED by {@link describeProviderChain}, so the log
+ * can always say why a provider was or was not used — a provider that silently
+ * vanishes is indistinguishable from one that is broken.
  */
+
 export const INTERVIEW_PROVIDER_ORDER: ProviderName[] = [
-  "openrouter",
-  "groq",
-  "nvidia",
   "gemini",
+  "openrouter",
 ];
+
+/** Integrated and configurable, but never attempted unless explicitly added. */
+export const OPTIONAL_PROVIDER_ORDER: ProviderName[] = ["groq"];
+
+/** Every provider the interview path can ever use, in reporting order. */
+export const ALL_INTERVIEW_PROVIDERS: ProviderName[] = [
+  ...INTERVIEW_PROVIDER_ORDER,
+  ...OPTIONAL_PROVIDER_ORDER,
+];
+
+/**
+ * The provider the chain leads with by policy, whatever keys exist.
+ *
+ * Kept separate from the *resolved* chain on purpose: "which provider is
+ * primary" is a configuration fact and must be stable even when the user has no
+ * key yet, whereas "which providers will actually run" depends on credentials.
+ * Conflating them is what produced a UI that claimed OpenRouter was configured
+ * while the interview ran on Groq.
+ */
+export function primaryInterviewProvider(): ProviderName {
+  return INTERVIEW_PROVIDER_ORDER[0];
+}
 
 export type ProviderAvailability =
   /** In the chain with a credential — will be attempted. */
@@ -27,7 +67,9 @@ export type ProviderAvailability =
   /** In the chain but no API key saved — skipped. */
   | "missing-api-key"
   /** Has a key but is not in the configured chain — skipped. */
-  | "not-in-chain";
+  | "not-in-chain"
+  /** Integrated but optional, and the user has not added it. */
+  | "optional";
 
 export interface ProviderStatus {
   provider: ProviderName;
@@ -38,10 +80,12 @@ export interface ProviderStatus {
 }
 
 export interface ChainDescription {
-  /** Every provider in the configured order, e.g. `openrouter(openrouter/free) → groq(x)`. */
+  /** Every provider in the configured order, e.g. `gemini(gemini-2.5-flash) → …`. */
   configured: string;
   /** Only the providers that will actually be attempted. */
   resolved: string;
+  /** The provider the chain leads with by policy. See the function comment. */
+  primary: ProviderName;
   status: ProviderStatus[];
   /** Ready-to-log lines, including the per-provider reasons. */
   lines: string[];
@@ -63,23 +107,26 @@ const withModel = (p: ProviderName, model: string) =>
  *
  * Guarantees, in order of precedence:
  *  1. every entry is a provider that actually exists in the registry;
- *  2. OpenRouter comes FIRST whenever it has a key — it is the primary gateway
- *     and an old store must never silently route around it;
- *  3. every other known provider is present, so the documented
- *     OpenRouter → Groq → NVIDIA → Gemini chain is always fully expressed
- *     regardless of which keys happen to be saved today.
+ *  2. the DEFAULT chain leads, in its documented order — Gemini, then
+ *     OpenRouter — regardless of what the store happened to contain, so an old
+ *     store cannot silently keep routing the interview somewhere else;
+ *  3. OPTIONAL providers are retained only if the user's saved order already had
+ *     them, so opting in survives a restart while never being opted into by
+ *     default;
+ *  4. anything else valid the user had (a provider added after this table was
+ *     written) is preserved, appended.
  *
- * Providers without a key are still kept if the user already had them in their
- * saved order (so an intentional slot is never dropped); whether they are used
- * is decided per run.
+ * Point 3 is what replaced the previous behaviour of force-including every
+ * known provider. That made NVIDIA part of every chain, so a provider that 404s
+ * on every request was waited on by every interview. Whether a provider is
+ * actually *attempted* is still decided per run by the key filter; this only
+ * decides what the user's enabled chain contains.
  */
 export function normalizeProviderOrder(
   saved: unknown,
   apiKeys: Partial<Record<ProviderName, string>> | undefined,
 ): ProviderName[] {
-  const keys = apiKeys ?? {};
-  const hasKey = (p: ProviderName) => Boolean(keys[p]?.trim());
-  void hasKey;
+  void apiKeys;
 
   const valid = Array.isArray(saved) ? saved.filter(isProviderName) : [];
 
@@ -88,19 +135,18 @@ export function normalizeProviderOrder(
     if (!result.includes(p)) result.push(p);
   };
 
-  // 1 + 2 + 3. The canonical architecture, always, in its documented order:
-  //    OpenRouter → Groq → NVIDIA → Gemini.
-  //
-  // `providerOrder` is the user's ENABLED chain, not a list of things that
-  // happen to work today, so every known provider is expressed regardless of
-  // whether a key exists yet. That keeps the architecture visible in Settings
-  // and keeps the order stable when a key is added later. Whether a provider
-  // is actually attempted is decided per run by the key filter, and the startup
-  // diagnostic always states the reason it was skipped.
+  // 1 + 2. The default chain always leads, in its documented order.
   for (const p of INTERVIEW_PROVIDER_ORDER) add(p);
 
-  // Anything else the user had (a provider added after this table was
-  // written) is preserved, appended.
+  // 3. Optional providers survive only if they were already opted into. Their
+  //    documented relative order is used, so a user who had both gets a stable
+  //    chain rather than whatever order the JSON happened to be written in.
+  for (const p of OPTIONAL_PROVIDER_ORDER) {
+    if (valid.includes(p)) add(p);
+  }
+
+  // 4. Anything else the user had (a provider added after this table was
+  //    written) is preserved, appended, in the order they saved it.
   for (const p of valid) add(p);
 
   return result;
@@ -123,24 +169,35 @@ export function describeProviderChain(settings: ChainSettings): ChainDescription
     const configured = models[p]?.trim();
     if (configured) return configured;
     // The gateway default is always valid even without a saved model.
-    return p === "openrouter" ? OPENROUTER_FREE_MODEL : "unset";
+    if (p === "openrouter") return OPENROUTER_FREE_MODEL;
+    return "unset";
   };
 
-  const status: ProviderStatus[] = INTERVIEW_PROVIDER_ORDER.map((p) => {
+  const optional = new Set<ProviderName>(OPTIONAL_PROVIDER_ORDER);
+
+  const status: ProviderStatus[] = ALL_INTERVIEW_PROVIDERS.map((p) => {
     const model = modelFor(p);
     const inChain = order.includes(p);
+    const hasKey = Boolean(keys[p]?.trim());
 
+    // Availability is decided in this order, and the ORDER IS THE POLICY:
+    // a provider that is not in the chain is never "ready", no matter how good
+    // its key is, because being in the chain is the user's decision.
     if (!inChain) {
+      const wasOptedIn = optional.has(p);
       return {
         provider: p,
         model,
-        availability: keys[p]?.trim() ? "not-in-chain" : "not-in-chain",
-        detail: keys[p]?.trim()
-          ? "not in the configured chain"
-          : "not in the configured chain; no API key",
+        availability: wasOptedIn ? "optional" : "not-in-chain",
+        detail: wasOptedIn
+          ? "optional — add it in Settings to enable it"
+          : hasKey
+            ? "not in the configured chain"
+            : "not in the configured chain; no API key",
       };
     }
-    if (!keys[p]?.trim()) {
+    // ── No credential → not ready ────────────────────────────────────────────
+    if (!hasKey) {
       return {
         provider: p,
         model,
@@ -166,11 +223,22 @@ export function describeProviderChain(settings: ChainSettings): ChainDescription
     .map((s) => withModel(s.provider, s.model))
     .join(" → ");
 
+  // The PRIMARY is a configuration fact, so it is stated from the default chain
+  // and not from the resolved one: a user with no Gemini key must still be told
+  // that Gemini leads, otherwise the very next thing they do is add a key to
+  // the wrong provider.
+  const primary =
+    order.includes(primaryInterviewProvider())
+      ? primaryInterviewProvider()
+      : (order[0] ?? primaryInterviewProvider());
+
   return {
     configured,
     resolved: resolved || "(none — no provider has an API key)",
+    primary,
     status,
     lines: [
+      `[AI] primary provider=${primary}`,
       `[AI] configured provider chain: ${configured || "(empty)"}`,
       `[AI] resolved interview provider chain: ${resolved}`,
       "[AI] provider status:",

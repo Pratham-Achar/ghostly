@@ -233,6 +233,45 @@ checkTrue(
 );
 
 // ─────────────────────────────────────────────────────────────────────────────
+// 16. Capture Screen — ONE visible action, ONE documented shortcut, one path
+// ─────────────────────────────────────────────────────────────────────────────
+const topBar = fs.readFileSync("src/components/TopBar.tsx", "utf8");
+const settings = fs.readFileSync("src/components/SettingsPanel.tsx", "utf8");
+
+checkTrue(
+  "16: Ctrl+Shift+S is registered as a global accelerator",
+  hotkeys.includes('"CommandOrControl+Shift+S"'),
+);
+checkTrue(
+  "16b: it forwards an EVENT to the renderer — no capture logic in main",
+  hotkeys.includes('win.webContents.send("ghostly:capture-screen")') &&
+    /Capture Screen registered: Ctrl\+Shift\+S/.test(hotkeys),
+);
+checkTrue(
+  "16c: preload exposes the channel, and Home runs the SAME callback the button runs",
+  preload.includes('"ghostly:capture-screen"') &&
+    /window\.ghostly\.onCaptureScreen\(/.test(home) &&
+    /onCaptureScreen=\{captureScreen\}/.test(topBar + home),
+);
+check(
+  "16d: exactly ONE capture action is wired in the TopBar",
+  (topBar.match(/onCaptureScreen\(\)/g) ?? []).length,
+  1,
+);
+checkTrue(
+  "16e: the old Capture hotkey hint is gone from the overlay",
+  !/label="Capture"/.test(topBar) && !/\["Ctrl", "H"\]/.test(topBar),
+);
+checkTrue(
+  "16f: Settings documents Capture Screen = Ctrl+Shift+S",
+  /\{ label: "Capture Screen", keys: \["Ctrl", "Shift", "S"\] \}/.test(settings),
+);
+checkTrue(
+  "16g: Settings no longer advertises the old Ctrl+H Screenshot entry",
+  !/label: "Screenshot"/.test(settings) && !/\["Ctrl", "H"\]/.test(settings),
+);
+
+// ─────────────────────────────────────────────────────────────────────────────
 console.log(`\n${pass} passed, ${fail} failed`);
 if (failures.length) {
   console.log("\nFAILURES:\n" + failures.map((f) => `  - ${f}`).join("\n"));

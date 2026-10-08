@@ -325,6 +325,21 @@ const FOLLOW_UP_CUE_GROUPS: Array<{ reason: string; re: RegExp }> = [
     reason: "asks about robustness",
     re: /\bedge\s+cases?\b|\bfail(?:ure|s|ing)?\b.*\b(?:when|if)\b|\bwhat\s+if\b/i,
   },
+  {
+    // ── Trade-offs ──────────────────────────────────────────────────────────
+    // This group exists so the two follow-up layers AGREE. `conversationThread`
+    // has always treated trade-offs as a follow-up cue; this one did not, so the
+    // same sentence attached the thread in one layer and not the problem in the
+    // other. "What are the trade-offs?" is the canonical system-design follow-up
+    // and appears verbatim in the Redis drill-down, so it must resolve the same
+    // way on both paths.
+    //
+    // The risk is contained: with no active problem the verdict is still
+    // "no active problem", and the cue only decides what happens when one is
+    // already held — which is exactly when a trade-off question belongs to it.
+    reason: "asks about trade-offs or drawbacks",
+    re: /\btrade[-\s]?offs?\b|\bdrawbacks?\b|\bdownsides?\b|\blimitations?\b|\bpros\s+and\s+cons\b/i,
+  },
 ];
 
 /** Why a context was or was not attached. Stable strings — they go in the log. */

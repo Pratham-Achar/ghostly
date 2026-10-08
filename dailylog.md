@@ -4,7 +4,7 @@
 > **Project:** Ghostly — Stealth AI coding assistant (Electron + React + TypeScript)
 > **Location:** `D:\ghostly`
 > **Platform:** Windows 11, Node v24.17.0, npm 12.0.1
-> **Last updated:** 2026-10-02
+> **Last updated:** 2026-10-06
 
 ---
 
@@ -664,3 +664,635 @@ a useful confirmation that the validator is doing its job.
 No live latency numbers. `OPENROUTER_HEDGE_MS = 1800` is a starting constant, not a
 tuned value — it must be adjusted from real `firstTextMs` telemetry over ~10 real
 questions before it should be trusted.
+
+---
+
+## Session: interview-readiness pass — 17-item TODO list
+
+Goal: make Ghostly usable for a real 1-hour interview. Overlays, region picking,
+provider chain, key pools, latency policy.
+
+**Status: 15 of 17 DONE. 1 partial (16). 1 is this log (17).**
+Full status table and tomorrow's remaining work are in section **L** at the end of this file.
+
+### A. Baseline taken BEFORE any change (this is what made the work trustworthy)
+
+There is no `npm test`. Tests are 36 standalone harnesses in `scripts/verify-*.ts|mts`
+run through `npx tsx`. Baseline:
+
+```
+2711 passed, 0 failed, 32/32 harnesses exit 0
+```
+
+Recorded up front so every later number could be compared against it instead of
+assumed good. Final: **3125 passed, 0 failed, 36/36**. Zero pre-existing failures were
+"fixed" along the way.
+
+---
+
+### B. Overlay opacity (TODO 1) — the control could not exist before
+
+**Root cause:** `main.ts` already used `BrowserWindow.setOpacity()` for something else —
+`0` meant HIDDEN, `1` meant SHOWN. The one knob the window had was already spoken for,
+so there was no opacity control to add. Hijacking it would have made "hide" and "see the
+interview behind Ghostly" the same gesture.
+
+**Decision, and why it deviates from requirement 9.** Requirement 9 said "prefer
+BrowserWindow opacity"; requirements 6 + 7 said "the app behind must stay visible" AND
+"answer text must stay readable". Those are **not simultaneously satisfiable** through
+one window-level scalar: `setOpacity` scales everything inside the window by the same
+factor, so 0.2 means 20%-white text. Requirement 10's renderer path is the only one that
+meets both, so:
+
+- `setOpacity` keeps its original job — `0` = hidden, `1` = shown.
+- The user's alpha is applied to Ghostly's **surfaces only** via `--ghostly-alpha`;
+  text colours are left at full strength.
+
+**Files**
+- **NEW** `electron/overlayOpacity.ts` — pure policy: MIN 0.2 / MAX 1.0 / DEFAULT 0.85,
+  `normalizeOverlayOpacity`, `opacityFromSliderValue`, `createOverlayOpacityController`.
+  Split `hidden` from `opacity`; `windowOpacity()` is derived as `hidden ? 0 : 1`.
+- **NEW** `src/components/OpacityControl.tsx` — the slider, rendered in the
+  **always-mounted TopBar** (requirement 23: reachable mid-interview, no Settings needed).
+- **NEW** `src/lib/overlaySurfaces.ts` — `gs()` helper. Most panels use inline
+  `background:`/`border:` shorthands, which beat any stylesheet, so the `.gs` CSS class
+  could not reach them; this produces the same `rgb(... / calc(a * var(--ghostly-alpha)))`
+  expression for those sites.
+- `src/styles/global.css` — `:root { --ghostly-alpha }`, `.gs`, `.gs-b`, `.gs-control`.
+- `electron/main.ts` / `electron/hotkeys.ts` — every `getOpacity() > 0` "is it visible?"
+  probe replaced with `isOverlayVisible()`. A 20% window is `0.2` and very much visible,
+  so Ctrl+B would otherwise have failed to hide it.
+- New IPC: `ghostly:get-overlay-opacity` / `ghostly:set-overlay-opacity`.
+
+`.gs-control` gives the control itself an alpha **floor** (`max(0.82, alpha)`) — a
+control you cannot read or aim at is not a usable control.
+
+**Bugs found while testing this**
+- `Number(null)` is `0`, so a missing persisted value clamped to the MINIMUM (20%) instead
+  of the default. Ghostly would have been nearly invisible on every cold start.
+- The IPC channel unit mismatch: the renderer sends **percent**, main read it as a
+  fraction, so dragging to 50% set **100%**. Fixed with `opacityFromSliderValue`
+  (a fraction can never exceed 1, so magnitude is a sound discriminator).
+
+---
+
+### C. Select Region (TODO 2) — the click path worked; three things around it did not
+
+Built `scripts/verify-select-region-click.mts` FIRST, against the unmodified app, to find
+the actual defect instead of guessing. It drives the **real** app and clicks with
+`webContents.sendInputEvent` (Chromium's own input pipeline), not a dispatched event —
+a synthetic `click` bypasses hit-testing and would pass while the button stayed unclickable.
+
+**Finding: the raw click path was already sound.** Button hit-testable, picker created,
+visible, focused, always-on-top, drag produced W x H, region reached the watcher at
+exactly the device-pixel size displayed, Escape closed it, button usable afterwards.
+
+The reported symptom came from three defects *around* that path:
+
+1. **OCR gated region selection.** `disabled = busy || !status.ocrAvailable`. Choosing a
+   rectangle and reading text are independent — on a machine with no Windows OCR language
+   pack the button was **permanently dead**. Split into `regionDisabled = picking` and
+   `toggleDisabled` (OCR still correctly gates the On/Off toggle).
+2. **No timeout on the pick.** `busy` fed the `disabled` attribute, so any unsettled pick
+   disabled the button **for the rest of the session** with no way back. That *is* the
+   reported symptom. Added `PICK_TIMEOUT_MS = 90_000`, a `Promise.race`, a visible
+   `pickError`, and an unconditional `finally`.
+3. **Unbounded screen capture.** `pickScreenRegion` awaited `desktopCapturer.getSources`
+   with no bound before creating the window, so on a large display the click looked dead.
+   Added `CAPTURE_TIMEOUT_MS = 1500`; on timeout the picker opens transparent. A capture
+   arriving *after* the timeout is deliberately discarded — applying it late would paint
+   the picker into its own backdrop.
+
+---
+
+### D. The "+" cursor (TODO 3) — located, not guessed
+
+Source: `electron/regionPicker.ts` declared an **unconditional** `cursor: crosshair` on
+`html, body`. Two consequences:
+- it was active while the picker was merely OPEN, before any drag — signalling something untrue;
+- Ctrl+H captures the **whole screen**, so any screenshot taken with the picker up
+  photographed the crosshair. That is how the artefact reached the reported screenshots.
+
+The main overlay never had one: `global.css` pins `cursor: default !important` on every
+element. That guard is load-bearing and is now asserted.
+
+Fix: `cursor: default` at rest; `body.selecting` (set on mousedown, cleared on mouseup,
+on a release outside the window, and on Escape) is the only place a crosshair appears.
+Cleared *before* teardown, so no frame exists in which a slow-closing picker leaves a "+"
+over the desktop.
+
+---
+
+### E. Region Picker (TODO 4) — verified, not rewritten
+
+Requirements 1-12 were already met. Only real gaps were closed, plus the live-Electron
+probe was upgraded: the 1px border was previously only a **source grep**, and there was no
+live pointer-events check. Now asserted from computed style in a real run.
+
+Note: a `border: 1px solid` computes to **0.8px** on this 125%-scaled display — Chromium
+snaps used border widths to whole DEVICE pixels. The assertion is scale-tolerant; the
+"hairline was painted" property is what matters.
+
+---
+
+### F. Provider chain (TODO 5, 6, 9) — Gemini, then OpenRouter
+
+```
+DEFAULT   gemini -> openrouter
+OPTIONAL  groq, nvidia   (integrated, configurable, NOT attempted by default)
+```
+
+`INTERVIEW_PROVIDER_ORDER` used to force-include **every** known provider, which is how
+NVIDIA — 404 on the model, CORS on the model listing, every call — ended up waited on by
+every interview. Anything in the chain is waited on; a broken member is a tax per question.
+
+- `normalizeProviderOrder` now emits the default chain first and retains an optional
+  provider **only if the user's saved order already had it** — so opting in survives a
+  restart but is never opted into by default.
+- New availability state `optional`, so "you turned it off" and "never on by default" are
+  distinguishable in the log.
+- **One-time, logged migration** in `App.tsx` guarded by `chainPolicyVersion = 2` strips
+  the auto-added optional providers from an old store once. Without the version guard the
+  migration would either re-run forever or silently undo the user later.
+- `describeProviderChain` gained `primary`, reported from the CONFIGURED chain not the
+  resolved one: with no Gemini key the UI must still say Gemini leads, or the user's next
+  action is to add a key to the wrong provider.
+- Removed the hardcoded `"OpenRouter slow -> ..."` in the hedge note and the banner — the
+  primary is Gemini now, so it would have named the wrong provider.
+- Gemini model left at `gemini-2.5-flash` — the registry's own `listModels()[0]`, not
+  hardcoded from memory.
+
+---
+
+### G. Latency policy (TODO 10) — the 27.5s wait, bounded
+
+Three **separate** deadlines, because collapsing them into one "timeout" is what produced
+the observed wait:
+
+| Constant | Value | Disarmed by real text? |
+|---|---|---|
+| `FIRST_TOKEN_TIMEOUT_MS` | 5000 | **yes** — a slow-but-healthy stream is never touched |
+| `TOTAL_PROVIDER_TIMEOUT_MS` | 12000 | no — a trickle of chars forever must still end |
+| `ABORT_SETTLE_GRACE_MS` | 1500 | n/a |
+
+Failing past the cap is safe **because nothing is streamed to the screen** — an answer is
+shown only once complete and validated, so an attempt abandoned at 12s costs nothing
+visible.
+
+**Two real bugs found here, both from tests that exposed them:**
+- A **timeout was reported as a cancellation**, which reads as a clean exit and left a
+  provider that just burned 12s looking healthy. `timedOut` now takes precedence.
+- A **stream that ignores its abort signal held the interview open for 60s** after the
+  answer was decided. Two fixes: the deadline now retires the attempt from the *scheduler's*
+  view and calls `notify()` (the main loop was parked on a `waiter()` that a non-settling
+  attempt never fires), and the settle is capped.
+
+Failure-classification tests now assert elapsed `< hedge window` for 429 / 500 / 502 / 503 /
+network / unavailable model / empty / validation rejection — i.e. handover is **immediate**.
+
+---
+
+### H. Key pool (TODO 7, 8)
+
+**NEW** `src/lib/keyHealth.ts` — pure, clock-injected. Four statuses
+(`healthy` / `cooldown` / `failed` / `not-configured`), 30s refusal window, 15s timeout
+window, 3 consecutive failures means `failed` until edited.
+
+**The safety property:** only **credential-shaped** failures move to another key
+(400/401/403/429, timeout). A provider 500, a network blip, a validation rejection or a
+bad model id are properties of the *provider or the request* — retrying them on a second
+key would spend three of the user's keys on one outage and end the interview.
+
+`apiKeys` was **kept as slot 1** rather than replaced: it is read by the settings
+migration, the chain diagnostics and the "has a key" filter, none of which care how many
+keys exist. `keyPool()` re-joins the halves in one place.
+
+**Bug found:** the orchestrator's in-flight map was keyed by **provider**, so a pool's
+attempts for the same provider overwrote each other — under-counting concurrency, letting
+the cap be exceeded, and leaving one attempt un-abandoned. Now keyed per attempt id.
+
+Also: a success is the **only** thing that clears a slot, and it never reorders the pool
+(asserted — if that ever fails the pool has become a round-robin). Cooldown state is
+deliberately **not persisted**. Key material is never logged: swept for `${apiKey}` while
+explicitly still permitting `${!!apiKey}` (boolean presence is required — the existing
+`verify-orchestration` test 18 already depended on it).
+
+UI: masked `type="password"` x 3 per default-chain provider, plus a status line limited to
+five fixed words. Editing a slot clears its health record.
+
+---
+
+### I. Validation (TODO 11) — untouched, and proven not weakened by the pool
+
+`outputValidation.ts` and `interviewAgent.ts` were **not modified**. The new risk is that
+a key pool multiplies attempts, and "another key" and "another chance at a bad answer" are
+the same mechanism — so that is now asserted directly: slot 1 emits a `<<<LATEST_TASK>>>`
+artefact, slot 2 emits a valid answer, and only slot 2 may win. An incomplete stream wins
+nothing no matter how many keys exist.
+
+### J. Screenshot / Live Screen / ASR (TODO 12, 13, 14)
+
+**NEW** `scripts/verify-interview-readiness.mts` — real Electron capture (351 KB PNG
+through the production handler), delivered via the real event, and confirmed **decoded**
+(`naturalWidth > 0`). `undefined`/empty payloads proven not to count anywhere.
+Live Screen privacy proven by **enumerating the renderer bridge at runtime**: seven
+Live-Screen capabilities, all on an allow-list, none named like a pixel reader.
+**Parakeet deliberately NOT made the default** — it is Moonshine by design (a pre-Parakeet
+settings blob must resolve to a working engine) and switching it would be the ASR redesign
+this task forbids. Asserted *intact*, not flipped.
+
+---
+
+### K. Verification
+
+```
+tsc --noEmit (web + node)  OK - clean
+npm run build              OK - clean
+36/36 harnesses            OK - exit 0
+3125 passed, 0 failed      (baseline 2711 / 32)
+```
+
+Four new harnesses: `verify-overlay-opacity.mts` (114), `verify-select-region-click.mts`
+(60), `verify-key-pool.mts` (88), `verify-interview-readiness.mts` (64).
+
+**Tooling note worth keeping:** `executeJavaScript` returns its result over IPC via
+structured clone. Returning an object containing anything unclonable fails the whole call
+with a bare `An object could not be cloned` and no hint which property caused it. Return a
+`JSON.stringify(...)` **string** instead. Also: a bare assignment expression
+(`window.x = function(){}`) evaluates to the function, which is unclonable.
+
+**Known flake:** `verify-region-picker` timed out once at 123s under full-suite load and
+passed on re-run (37/0, 11s). It grabs the real desktop, so it is timing-sensitive under
+load. Not caused by these changes.
+
+`tests/fixtures/asr/manifest.json` gets rewritten as a side effect of running
+`verify-asr-bench.mts`. Reverted — it is a benchmark artefact, not a task change.
+
+---
+
+### L. TODO STATUS
+
+**DONE — 15 of 17**
+
+| # | Item | Verified by |
+|---|---|---|
+| 1 | Overlay opacity control | `verify-overlay-opacity.mts` 114 — real app, 20/50/85/100 applied + persisted + hit-testable at each |
+| 2 | Select Region click | `verify-select-region-click.mts` 60 — real OS-level click, picker created, Escape closes |
+| 3 | Crosshair / "+" cursor | `verify-select-region-click.mts` A21-A24 — crosshair only while dragging |
+| 4 | Region Picker | `verify-region-picker.ts` 52 — live computed style, not a source grep |
+| 5 | Gemini primary | `verify-pipeline.ts` + real-launch log `[AI] primary provider=gemini` |
+| 6 | OpenRouter fallback | `verify-orchestration.mts` — handover immediate for all 8 listed conditions |
+| 7 | Multiple key slots | `verify-key-pool.mts` 88 — pool shape, masking, no key in logs |
+| 8 | Key health / failover | `verify-key-pool.mts` — 4 statuses, cooldown boundary to the ms |
+| 9 | NVIDIA out of default chain | `verify-pipeline.ts` — `optional`, absent from configured chain |
+| 10 | Latency policy | `verify-orchestration.mts` — first-token / total / settle |
+| 11 | Strict validation | `verify-orchestration.mts` — pool cannot bypass validation |
+| 12 | Screenshot -> Solve | `verify-interview-readiness.mts` — real capture, decoded thumbnail |
+| 13 | Live Screen privacy | `verify-interview-readiness.mts` — bridge enumerated at runtime |
+| 14 | Parakeet intact | `verify-interview-readiness.mts` Part D + `verify-primary-asr.mts` 182 |
+| 15 | Full regression | 3125 / 0, tsc clean, build clean |
+
+**NOT DONE — carry into the next session**
+
+#### [ ] TODO 16 — Real interview run (the only genuinely unverified thing)
+
+Sections **A-I are machine-verified under real Electron.** Section **J was not run**:
+
+> Run at least several real questions. Record ASR latency, provider first-token latency,
+> provider total latency, accepted answer latency, fallback count.
+
+**Status after the 2026-10-06 verification attempt (the earlier blocker was FALSE).**
+`npm run dev` boots the real app on this machine and it logs `[AI] primary provider=gemini`,
+`GEMINI [gemini-3.5-flash] — ready` and `OPENROUTER [openrouter/free] — ready`, so both keys
+DO exist and hardware audio devices are present. The REAL blocker is different: TODO 16 asks
+for **T0 (interviewer stops speaking)** and **T6 (answer visible)**, which are human-observed
+events in a live spoken interview. An autonomous agent cannot produce truthful T0–T6 for a
+live interview, so **no interview-latency number is claimed here.** A real **provider-only**
+probe WAS run (numbers in the 2026-10-06 session note at the end of this file).
+`FIRST_TOKEN_TIMEOUT_MS = 5000` and `TOTAL_PROVIDER_TIMEOUT_MS = 12000` remain **unchanged**,
+as instructed.
+
+Steps for tomorrow:
+
+1. Put a Gemini key in **API Key 1** and an OpenRouter key in **API Key 1** (Settings ->
+   Key Pool). Add a second Gemini key as **API Key 2** to exercise the pool.
+2. **Opacity** — drag to 20 / 50 / 85 / 100 with the interview app behind it. Confirm
+   Ghostly's panels go see-through and the answer text stays fully readable (that is the
+   whole reason the alpha is applied to surfaces and not to the window).
+3. **Select region** — click Select region, drag, confirm W x H, Escape. Confirm no "+" in
+   the normal UI.
+4. **Gemini first** — start an interview; confirm the banner shows `Using Gemini`.
+5. **Gemini failure** — revoke the Gemini key, answer one question, confirm OpenRouter
+   takes over quickly. Then revoke both and confirm a **clean** failure with the
+   "no answer" banner rather than a hang.
+6. **Key pool** — watch the log for `GEMINI API Key 1 -> cooldown Ns (rate limited)`.
+7. **The run** — answer ~10 questions and capture from the Latency panel:
+   ASR ms / `firstText` / provider `total` / accepted-answer ms / fallback count.
+8. **Tune from those numbers only.** If median `firstText` for Gemini is > 2s, lower
+   `FIRST_TOKEN_TIMEOUT_MS`. If accepted-answer p95 is near 12s, the total cap is too tight.
+
+#### [ ] TODO 17 — Final interview-ready configuration report
+
+Written and delivered at the end of this session (chat), with the provider/key-pool/test
+numbers. Re-issue it **after** TODO 16, because until real latency exists the honest
+verdict is still **NOT interview-ready** — one critical TODO remains unchecked.
+
+### M. Deliberate deviations — revisit if you disagree
+
+1. **Window opacity was NOT used for the transparency.** One window-level scalar cannot
+   keep both the app behind visible and the answer readable. `setOpacity` still means
+   hidden/shown. If you want literal window opacity and accept 20%-white text, that is a
+   small change in `overlayOpacity.ts`.
+2. **Parakeet was NOT made the default.** See section J.
+3. **NVIDIA/Groq were dropped from the default chain** rather than left parked-by-cooldown.
+   They remain fully selectable in Settings.
+
+### N. Encoding warning for the next session
+
+`dailylog.md` is UTF-8 **without** BOM but contains multi-byte characters (em-dashes,
+box-drawing, arrows). Do NOT edit it with PowerShell `File.WriteAllText` / `-replace` —
+that path re-encodes and silently drops them. Use an editor or the file-edit tool, then
+confirm the byte count grew rather than changed encoding:
+
+```powershell
+[System.IO.File]::ReadAllBytes("D:\ghostly\dailylog.md")[0..3]   # expect 23 20 47 68  ("# Gh")
+```
+
+---
+
+## Session: real-interview verification attempt (2026-10-06) — TODO 16 still NOT done
+
+Objective was the real-interview run (TODO 16). **It was not completed, and nothing below
+should be read as a completed TODO 16.** What was actually done, and what is real vs not:
+
+### 1. The real app was booted (REAL, live evidence)
+
+`npm run dev` launched the actual Electron app. Live renderer log:
+
+```
+[AI] primary provider=gemini
+[AI] configured provider chain: gemini(gemini-3.5-flash) → openrouter(openrouter/free)
+[AI] resolved interview provider chain: gemini(gemini-3.5-flash) → openrouter(openrouter/free)
+[AI] provider status:
+  GEMINI [gemini-3.5-flash] — ready
+  OPENROUTER [openrouter/free] — ready (free router — model chosen per request)
+  GROQ [allam-2-7b] — SKIPPED: optional — add it in Settings to enable it
+  NVIDIA [nvidia/llama-3.1-nemotron-70b-instruct] — SKIPPED: optional
+```
+
+- **Gemini is attempted first** — confirmed live; `primary provider=gemini`.
+- **OpenRouter is the fallback** — confirmed live; present and `ready`.
+- **Groq and NVIDIA are NOT in the default chain** — confirmed live; both `SKIPPED: optional`.
+- No key material is ever printed (presence only).
+
+### 2. Deterministic harnesses (REAL, offline)
+
+`verify-orchestration.mts` **129/0**, `verify-stage-timing.mts` **108/0**,
+`verify-pipeline.ts` **200/0**, `verify-provider-cooldown.mts` **89/0** — 526 checks, 0 failed.
+
+### 3. A REAL provider probe was run (numbers ARE measured)
+
+A temporary probe drove the **real provider modules** with the **real stored keys**
+(keys never printed). Single real request each, real network:
+
+| Provider | Model | first token | total | outcome |
+|---|---|---|---|---|
+| Gemini | gemini-3.5-flash | ~1695 ms | ~2836 ms | HTTP 200 |
+| OpenRouter | openai/gpt-oss-120b | ~2291 ms | ~3378 ms | HTTP 200 (backend DeepInfra) |
+
+Fallback handover, real orchestration with a deliberately invalid Gemini key:
+
+```
+provider=gemini FAILED (http)  — HTTP 400 "API key not valid"  at 129 ms → handover immediate
+provider=openrouter SUCCESS winner — firstText=2307 ms total=3354 ms
+fallback events (non-winner attempts) = 1
+```
+
+**What this does and does NOT prove:** it proves the **provider leg** is fast (~1.7–3.4 s) and
+that a recoverable Gemini error hands over to OpenRouter **immediately** (~130 ms to failure,
+not a 5 s wait). It does **not** measure the interview path (ASR → gate → provider →
+validation → render). The **5000 / 12000 ms timeout values were NOT changed.**
+
+### 4. ASR engine: Parakeet is now the default (changed + verified)
+
+At the time of the verification run the engine was **Moonshine** (`DEFAULT_PRIMARY_ASR =
+"moonshine"`, Parakeet primary only when explicitly selected). The user then made the explicit
+decision to make **Parakeet the default interview ASR, with Moonshine only as the local
+fallback**, and that change was applied and verified in the real app — see the session note at
+the end of this file.
+
+### 5. Why TODO 16 still cannot be closed here
+
+TODO 16 as specified needs, per question, T0 (interviewer finishes speaking) and T6 (answer
+visible in the overlay) in a **live interview**. Both are human-observed events. No latency
+figure for the interview path is truthful without a human present, so none is reported.
+**TODO 16 stays `[ ]` and TODO 17 stays `[ ]`.**
+
+---
+
+## Session: Parakeet made the DEFAULT interview ASR (2026-10-06)
+
+Explicit user decision, applied as a scoped change. No other architecture was touched, and
+Moonshine was kept (as fallback only).
+
+### What changed
+- `src/lib/primaryAsr.ts` — `DEFAULT_PRIMARY_ASR` is now `"parakeet"`; `normalizePrimaryAsr()`
+  now preserves an **explicit `"moonshine"`** and resolves everything else (absent, `""`,
+  garbage) to Parakeet. Moonshine is not removed — it stays the local fallback.
+- `electron/ipc.ts` — the **required integration change**. The main-process Parakeet gate was
+  `settings.primaryAsr === "parakeet"`, but a saved settings object has NO `primaryAsr` key, so
+  flipping only the code default would have left Parakeet DISABLED in the main process while the
+  renderer treated it as the default. The gate now treats anything other than an explicit
+  `"moonshine"` as Parakeet, and `primaryAsr: "parakeet"` was added to the electron-store
+  defaults for shape parity with `useStore`.
+- `src/store/useStore.ts` — default still derived from `DEFAULT_PRIMARY_ASR`; comment corrected.
+- Tests updated to assert the NEW policy (a required behaviour change, not a weakened
+  assertion): `scripts/verify-primary-asr.mts` (checks 1–9, 78, 80, 82, 83) and
+  `scripts/verify-interview-readiness.mts` Part D (D1–D4, D14).
+
+### Verification (all real)
+- `npx tsc --noEmit -p tsconfig.json` OK · `-p tsconfig.node.json` OK · `npm run build` OK
+- `verify-primary-asr.mts` **183/0** · `verify-asr-readiness.mts` **82/0** ·
+  `verify-interview-readiness.mts` **65/0**
+- **Real app (boot + Ctrl+I), live log:**
+  `[Parakeet] model ready loadMs=19910 modelMb=631` ·
+  `[Parakeet-DIAG][Parakeet-only] mode=primary status=ready decodeMs=927` ·
+  `[STT] final (system, parakeet): What is Java 15?` ·
+  `[ASR] Parakeet -> Moonshine fallback: it returned no text` →
+  `[ASR] Loading model: onnx-community/moonshine-base-ONNX` →
+  `[STT] final (system, moonshine): (no speech recognised)`.
+  I.e. **Parakeet primary, Moonshine only as fallback.** App then stopped.
+
+### Not done (deliberately)
+- TODO 16 (live interview latency) and TODO 17 remain `[ ]`.
+- The pasted “Personal Interview Context + Answer Instructions” spec was NOT implemented —
+  it is out of scope for this instruction.
+
+---
+
+## Session: universal interview mode (master interview-experience prompt)
+
+**Status: the feature set is implemented and machine-verified. TODO 16 and TODO 17
+remain `[ ]`.** The honest gap is unchanged: nothing here measures a real spoken
+interview, because that needs a human in a live interview.
+
+### The state I found, and why this session started with repair
+
+The working tree was **mid-refactor and did not compile or boot**. Most of the
+requested feature set was already written but half-wired. The baseline was
+measured against a throwaway worktree at `HEAD` rather than assumed, which
+mattered: **`HEAD` itself does not typecheck cleanly (28 errors)**, so the
+`dailylog` claim “tsc clean” was stale.
+
+WIP-introduced failures fixed here, all of which blocked the app from running:
+- `DEFAULT_ANSWER_INSTRUCTIONS` was imported by `src/store/useStore.ts`,
+  `SettingsPanel.tsx` and `InterviewContext.tsx` but **never exported** by
+  `src/lib/prompts.ts`. The store module failed to load, so **the app rendered
+  nothing at all**. Now defined in `prompts.ts`.
+- `src/components/InterviewReportPanel.tsx` **did not exist** but was imported by
+  `Home.tsx`. Written.
+- `Home.tsx` referenced three undefined names (`Settings`, `ProviderName`,
+  `isGeneral`) and was missing the `onCaptureScreen` prop. Fixed; `isGeneral` was
+  a category relic and is simply gone.
+- `src/lib/localModel.ts` was missing from `tsconfig.node.json`'s include list.
+- `App.tsx` had two implicit-`any` callbacks in the chain migration.
+
+### Two REAL bugs found by writing the tests (not by reading the code)
+
+1. **`projectContext` never reached the interview system prompt.**
+   `interviewAgent.ts` pushed the *Project & Internship Context* block into
+   `profile` **after** `profile.join()` had already been emitted, so it was
+   silently discarded. Every project/internship question was answered from the
+   resume alone — the exact case the field exists to fix. Fixed by moving the
+   push before the join.
+
+2. **The coding drill-down chain broke the conversation thread.** Requirement 7
+   gives this exact sequence, and all three follow-ups dropped the thread:
+   `Write a function to reverse a string.` → `Can you optimize the solution?` →
+   `What is the time complexity?` → `What edge cases should I handle?`
+   Two independent causes: none of the follow-ups shares a content word with the
+   first question, so topic overlap scored 0; and `What is the time complexity?`
+   matches `NEW_SUBJECT_CUES` (it opens like “What is Docker?”), so it was read as
+   a topic switch. Fixed by adding one technology-neutral **drill-down cue
+   group** — not by touching `NEW_SUBJECT_CUES`. Cues are tested before the
+   new-subject check by design, so “What is the time complexity?” now attaches
+   while “What is Docker?” still opens a new subject.
+
+   A related inconsistency surfaced at the same time: `conversationThread` treated
+   “trade-offs” as a follow-up cue but `sessionContext` did not, so the same
+   sentence attached the thread and not the active problem. The cue is now in
+   both layers.
+
+### A design decision I made, and the invariant I had to rewrite
+
+`verify-interview-readiness.mts` C9–C11 asserted that screen-OCR text could
+**never** reach a prompt without a click. That was the contract of the
+region-based Live Screen panel. Requirement 8 removes that panel and requirement
+10 replaces it with an opt-in full-screen watcher that does answer automatically,
+so “never automatic” became the wrong invariant.
+
+I did not simply delete the checks. The underlying risk is real — OCR can misread
+a code comment as a question — so the risk is now pinned by a **stronger, more
+specific** contract: the automatic path needs **two** opt-ins (`autoDetectQuestion`
+AND `autoAnswer`), is **OFF** by default in both the store and the main process,
+can only be triggered by the debounced/stability-gated/RAM-guarded read channel,
+sends **text only** (never a frame), and reuses the **one** interview answer path
+so the resume, project context, answer instructions and thread all still apply.
+
+**If the double opt-in is not what you want, this is the one decision to revisit.**
+
+### Pre-existing type debt: 28 → 11
+
+Fixed 17 real errors (including two latent runtime crashes: `openrouter.ts` and
+`nvidia.ts` wrote to an **optional** `meta` without a guard — fine only because
+the orchestrator happens to always pass it; and `orchestrator.ts` narrowed
+`winner` to `never` because it is assigned inside a closure).
+
+The remaining **11** are all in four **unreferenced** files that reference a
+`window.ghostlyAPI` which has never existed — not even at `HEAD`:
+`src/hooks/useAIStream.ts`, `src/hooks/useCapture.ts`, `src/pages/History.tsx`,
+`src/pages/Settings.tsx`. They were left in place deliberately: deleting four
+files is not this task's job. `tsconfig.node.json` (main + preload) is **clean**,
+and `npm run build` is **clean** — `electron-vite` does not typecheck, so this
+debt never blocked a build.
+
+### TODO CHECKLIST — this session
+
+Implemented AND tested (`[x]`):
+
+- [x] **Add Project & Internship Context** — persistent multiline field, editable,
+      clearable, survives restart (proved by typing into it in real Electron and
+      re-reading the store). `SettingsPanel.tsx:970`, `InterviewContext.tsx`.
+- [x] **Add Answer Instructions** — one field, replaces the old per-mode box;
+      `customInstructions` is migrated and deleted by `App.tsx`.
+- [x] **Remove category dropdown** — `INTERVIEW_TYPE_GROUPS`/`INTERVIEW_TYPES`
+      deleted from `SettingsPanel.tsx`; no category can reach the answer path.
+- [x] **Remove old General custom-instruction box** — migrated, not duplicated.
+- [x] **Simplify screenshot workflow** — one gesture, no rectangle.
+- [x] **Replace region selection with full-screen capture** — `LiveScreenPanel`
+      unmounted; `captureScreen` is one implementation shared by the button and
+      the Ctrl+H hotkey.
+- [x] **Add optional screen-change detection** — “Auto-detect new question”, OFF by
+      default; the setting now actually reaches the main process (it never did).
+- [x] **Add lightweight local fallback** — Qwen3 1.7B, last leg only, never primary.
+- [x] **Integrate Qwen3 1.7B Q4_K_M** — llama.cpp sidecar, memory-guarded, warm.
+- [x] **Verify universal conversation continuity** — coding / SQL / Redis /
+      system-design / project / behavioural follow-ups plus topic switch.
+- [x] **Regression verification** — 38/38 harnesses, 3255 checks, 0 failed.
+
+Deliberately NOT done:
+
+- [ ] **TODO 16 — Real interview latency verification.** Still open, and **not**
+      advanced by this session. A real provider probe, a green build, a booting
+      app and scripted audio are **not** a live interview. T0 (interviewer stops
+      speaking) and T6 (answer visible) are human-observed events. **No latency
+      number is claimed anywhere in this log.**
+- [ ] **TODO 17 — Final report.** Still open; it depends on TODO 16.
+
+### Verification (all real, no fabrication)
+
+- `npx tsc --noEmit -p tsconfig.node.json` **0 errors** ·
+  `-p tsconfig.web.json` **11 errors, all pre-existing dead files** ·
+  `npm run build` **clean**
+- **38/38 harnesses exit 0 — 3255 checks, 0 failed** (baseline was 36 harnesses;
+  `verify-universal-interview.mts` +126 and `verify-universal-electron.mts` +34
+  are new)
+- **REAL Electron** (`verify-universal-electron.mts`, 34/34) — the app boots and
+  paints; the overlay shows *Start Interview / Capture Screen / Auto-detect new
+  question: OFF / End Interview / View report / Opacity 85%* and **no** category
+  and **no** “Select region”; all three context fields render and **Answer
+  Instructions arrives pre-filled** with the shipped guidance; typing into all
+  three **persists and survives a store reload**; `Capture Screen` returns a real
+  PNG that Chromium **decoded at 1920×1080**; turning auto-detect ON starts the
+  main-process watcher on the **whole 1920×1080 display** and OFF stops it; no
+  bridge method is named like a frame/pixel reader.
+
+What the real-Electron run did **not** prove, stated plainly: that an **answer
+appears** for a spoken question, that **audio → Parakeet → AI → answer** works
+end to end, or that a **screen change produces a new answer**. Those need real
+audio, real keys and a human — TODO 16.
+
+### Three harnesses were failing and were repaired, not weakened
+
+- `verify-pipeline.ts` (9) asserted the 2-provider chain. `local` is now a real
+  third leg, so the chain assertions were updated **and a new one added**:
+  `local` must be **LAST**, never primary. Groq/NVIDIA are still asserted absent
+  from the default chain.
+- `verify-live-screen.ts` 13k flagged the word `dataUrl` anywhere in the preload
+  block, which matched `ocrImageText(payload: { dataUrl: string })` — an image
+  going **in** and **text** coming out, not a pixel channel. Rewritten to test
+  what it meant, plus three new guards. **The first rewrite passed
+  vacuously** (its regex matched 0 of 8 methods); caught by probing, then fixed
+  with an explicit `13k-pre` count guard so it can never pass by absence again.
+- `verify-screenshot-solve.ts` (2) asserted a renamed variable and the removed
+  category prompt builder. Updated, plus a **new** assertion that the per-category
+  builder is now unreachable from the app.
+- `verify-features.ts` Part 3 asserted all six categories still existed and were
+  selectable. **Inverted**: it now asserts the selector cannot come back and that
+  the one thing it carried (answer style) survived.
+- `verify-select-region-click.mts` drove a real OS-level click on the “Select
+  region” button — an affordance requirement 8 orders removed. Rewritten as a
+  guard that the region workflow stays out of the UI **while the picker module
+  stays intact**; the picker's own behaviour is still proven under real Electron
+  by `verify-region-picker.ts` (52/52, untouched and still green).
+

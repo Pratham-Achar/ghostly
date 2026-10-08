@@ -112,7 +112,10 @@ const SYSTEM =
  */
 export function geminiGenerationConfig(model, maxTokens, thinkingBudget) {
   const config = { maxOutputTokens: maxTokens, temperature: 0.3 };
-  if (/^gemini-(?:2\.5|3)/i.test(model)) {
+  // `flash-lite` models are EXCLUDED from the thinking config: measured against
+  // the live API (2026-10-06), they answer `thinkingConfig` with HTTP 400
+  // INVALID_ARGUMENT and return HTTP 200 + text when the field is omitted.
+  if (/^gemini-(?:2\.5|3)/i.test(model) && !/flash-lite/i.test(model)) {
     // `"provider-default"` omits the field entirely, which is the ONLY way to
     // measure the API's own default. For Flash the shipping policy is already
     // `thinkingBudget: 0`, so sending 0 for both arms would report a confident

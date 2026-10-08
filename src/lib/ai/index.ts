@@ -3,16 +3,18 @@ import { OpenAIProvider } from "./openai";
 import { AnthropicProvider } from "./anthropic";
 import { GroqProvider } from "./groq";
 import { OpenRouterProvider } from "./openrouter";
-import { NvidiaProvider } from "./nvidia";
 import type { AIProvider } from "./types";
 
-export type ProviderName =
-  | "gemini"
-  | "openai"
-  | "anthropic"
-  | "groq"
-  | "openrouter"
-  | "nvidia";
+/**
+ * The providers Ghostly can call.
+ *
+ * Local Qwen (the llama.cpp sidecar) and NVIDIA NIM were removed entirely —
+ * provider, model, download, IPC, status and UI. The normal interview chain is
+ * Gemini → OpenRouter (→ Groq when the user opts it in); see
+ * `lib/providerDiagnostics.ts`. Parakeet ASR and the Moonshine fallback are
+ * unrelated to this registry and were not touched.
+ */
+export type ProviderName = "gemini" | "openai" | "anthropic" | "groq" | "openrouter";
 
 const providers: Record<ProviderName, AIProvider> = {
   gemini: new GeminiProvider(),
@@ -20,7 +22,6 @@ const providers: Record<ProviderName, AIProvider> = {
   anthropic: new AnthropicProvider(),
   groq: new GroqProvider(),
   openrouter: new OpenRouterProvider(),
-  nvidia: new NvidiaProvider(),
 };
 
 /**
@@ -29,6 +30,8 @@ const providers: Record<ProviderName, AIProvider> = {
  * Never hardcode this list elsewhere. It previously lived as a literal array
  * in `App.tsx`, where it silently fell behind the registry and caused the
  * persisted-settings migration to discard "openrouter" from `providerOrder`.
+ * Persisted stores that still contain `local` or `nvidia` are filtered out by
+ * `isProviderName` — that is the removal path for old settings blobs.
  */
 export const PROVIDER_NAMES = Object.keys(providers) as ProviderName[];
 

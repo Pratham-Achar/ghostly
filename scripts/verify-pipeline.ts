@@ -33,9 +33,15 @@ import {
 } from "../src/lib/audioStatus";
 import {
   INTERVIEW_PROVIDER_ORDER,
+  OPTIONAL_PROVIDER_ORDER,
+  ALL_INTERVIEW_PROVIDERS,
+  primaryInterviewProvider,
   describeProviderChain,
   normalizeProviderOrder,
 } from "../src/lib/providerDiagnostics";
+import { isProviderName } from "../src/lib/ai";
+import { existsSync, readFileSync } from "node:fs";
+import path from "node:path";
 
 let pass = 0;
 let fail = 0;
@@ -452,20 +458,20 @@ const buildChain = (
 check(
   "chain includes only providers with keys",
   buildChain(
-    ["openrouter", "nvidia", "gemini"],
-    { openrouter: "k1", nvidia: "", gemini: "k3" },
-    { openrouter: OPENROUTER_FREE_MODEL, nvidia: "meta/llama-3.3-70b-instruct", gemini: "gemini-2.5-flash" },
+    ["openrouter", "groq", "gemini"],
+    { openrouter: "k1", groq: "", gemini: "k3" },
+    { openrouter: OPENROUTER_FREE_MODEL, groq: "llama-3.3-70b-versatile", gemini: "gemini-2.5-flash" },
   ).map((a) => a.provider),
   ["openrouter", "gemini"],
 );
 check(
   "openrouter is first when configured",
   buildChain(
-    ["openrouter", "groq", "nvidia"],
-    { openrouter: "k1", groq: "k2", nvidia: "k3" },
-    { openrouter: OPENROUTER_FREE_MODEL, groq: "g", nvidia: "n" },
+    ["openrouter", "groq", "gemini"],
+    { openrouter: "k1", groq: "k2", gemini: "k3" },
+    { openrouter: OPENROUTER_FREE_MODEL, groq: "g", gemini: "gemini-2.5-flash" },
   ).map((a) => a.provider),
-  ["openrouter", "groq", "nvidia"],
+  ["openrouter", "groq", "gemini"],
 );
 check(
   "free router never gets a catalog-wide fallback",
@@ -543,111 +549,318 @@ check("disconnect detail preserved", getAudioStatusSnapshot().detail, "device re
 resetAudioStatus();
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 13. FULL FOUR-PROVIDER CHAIN — OpenRouter → Groq → NVIDIA → Gemini
+// 13. THE INTERVIEW CHAIN — Gemini → OpenRouter, with Groq opt-in only.
+//
+// The Local Qwen fallback and NVIDIA NIM were REMOVED entirely (provider, model,
+// IPC and UI), so the default chain is exactly two legs. Anything in the chain
+// is waited on by every question, so nothing that 404s may be a default leg.
 // ─────────────────────────────────────────────────────────────────────────────
 check(
-  "canonical interview chain order",
+  "the default chain is Gemini, then OpenRouter",
   INTERVIEW_PROVIDER_ORDER,
-  ["openrouter", "groq", "nvidia", "gemini"],
+  ["gemini", "openrouter"],
+);
+check(
+  "Groq remains integrated as the ONLY optional provider",
+  OPTIONAL_PROVIDER_ORDER,
+  ["groq"],
+);
+check(
+  "every provider is reported, default chain first",
+  ALL_INTERVIEW_PROVIDERS,
+  ["gemini", "openrouter", "groq"],
+);
+check("the declared primary is Gemini", primaryInterviewProvider(), "gemini");
+
+// The removed providers must not merely be out of the chain — they must not
+// exist in the registry at all, so no migration, panel or run can resurrect them.
+check("local is not a provider any more", isProviderName("local"), false);
+check("nvidia is not a provider any more", isProviderName("nvidia"), false);
+check(
+  "the removed providers are absent from the report",
+  (ALL_INTERVIEW_PROVIDERS as string[]).filter((p) => p === "local" || p === "nvidia"),
+  [],
 );
 
-// A legacy store holding ["groq","gemini"] with an OpenRouter key must be
-// rewritten so OpenRouter leads and NVIDIA is present.
-const migrated = normalizeProviderOrder(["groq", "gemini"], {
-  openrouter: "k-or",
-  groq: "k-groq",
-  gemini: "k-gem",
-});
 check(
-  "legacy order migrates to the full chain",
-  migrated,
-  ["openrouter", "groq", "nvidia", "gemini"],
+  "Groq is NOT in the default chain",
+  INTERVIEW_PROVIDER_ORDER.includes("groq"),
+  false,
 );
 
-// Without an OpenRouter key, the chain still reads in canonical order; OpenRouter
-// is skipped at run time by the key filter, not by being removed from settings.
+// A store written by an older build, which force-added the optional providers.
+// The migration in App.tsx strips them BEFORE normalising; the normalizer alone
+// keeps whatever the user deliberately had.
 check(
-  "no OpenRouter key => canonical order preserved",
-  normalizeProviderOrder(["groq", "gemini"], { groq: "k" }),
-  ["openrouter", "groq", "nvidia", "gemini"],
+  "a chain with only default providers stays exactly as it is",
+  normalizeProviderOrder(["gemini", "openrouter"], {
+    gemini: "k",
+    openrouter: "k",
+  }),
+  ["gemini", "openrouter"],
+);
+check(
+  "an empty/absent saved order yields the bare default chain",
+  normalizeProviderOrder(undefined, { gemini: "k" }),
+  ["gemini", "openrouter"],
+);
+// A store written before the removal still contains local/nvidia. The
+// normalizer must strip both, or an old install keeps waiting on dead legs.
+check(
+  "a legacy store containing local/nvidia is stripped of both",
+  normalizeProviderOrder(["local", "nvidia", "gemini", "openrouter"], {
+    gemini: "k",
+    openrouter: "k",
+  }),
+  ["gemini", "openrouter"],
 );
 
-// Unknown/removed providers are dropped; known ones the user already had are kept.
+// A deliberate opt-in must survive a restart — that is what makes "optional"
+// mean opt-in rather than "removed".
 check(
-  "unknown providers dropped",
-  normalizeProviderOrder(["whisper", "groq", "openrouter"], { groq: "k" }),
-  ["openrouter", "groq", "nvidia", "gemini"],
+  "an opted-in optional provider is preserved, after the default chain",
+  normalizeProviderOrder(["groq", "gemini", "openrouter"], {
+    gemini: "k",
+    openrouter: "k",
+    groq: "k",
+  }),
+  ["gemini", "openrouter", "groq"],
+);
+check(
+  "an opted-in optional provider with no key is still preserved",
+  normalizeProviderOrder(["groq", "gemini", "openrouter"], { gemini: "k" }),
+  ["gemini", "openrouter", "groq"],
+);
+
+// An old store's order is rewritten so Gemini leads — a persisted OpenRouter-
+// first chain must not keep steering the interview.
+check(
+  "a legacy OpenRouter-first chain is rewritten to Gemini-first",
+  normalizeProviderOrder(["openrouter", "gemini"], {
+    openrouter: "k-or",
+    gemini: "k-gem",
+  }),
+  ["gemini", "openrouter"],
+);
+
+// Unknown providers are dropped; anything else valid the user had is kept.
+check(
+  "unknown providers dropped, known ones preserved",
+  normalizeProviderOrder(["whisper", "openai", "gemini"], { gemini: "k" }),
+  ["gemini", "openrouter", "openai"],
 );
 
 // ── Diagnostics must explain WHY a provider was skipped ───────────────────
 const full = describeProviderChain({
-  providerOrder: ["openrouter", "groq", "nvidia", "gemini"],
+  providerOrder: ["gemini", "openrouter"],
   models: {
+    gemini: "gemini-2.5-flash",
     openrouter: OPENROUTER_FREE_MODEL,
     groq: "openai/gpt-oss-120b",
-    nvidia: "meta/llama-3.3-70b-instruct",
-    gemini: "gemini-2.5-flash",
   },
-  apiKeys: { openrouter: "k", nvidia: "k" },
+  apiKeys: { gemini: "k", openrouter: "k", groq: "k" },
 });
 
 check(
-  "configured chain shows all four",
+  "configured chain is Gemini then OpenRouter",
   full.configured,
-  "openrouter(openrouter/free) → groq(openai/gpt-oss-120b) → nvidia(meta/llama-3.3-70b-instruct) → gemini(gemini-2.5-flash)",
+  "gemini(gemini-2.5-flash) → openrouter(openrouter/free)",
 );
 check(
-  "resolved chain only contains providers with keys",
+  "resolved chain contains only providers with keys",
   full.resolved,
-  "openrouter(openrouter/free) → nvidia(meta/llama-3.3-70b-instruct)",
+  "gemini(gemini-2.5-flash) → openrouter(openrouter/free)",
 );
+check("the reported primary is Gemini", full.primary, "gemini");
 const byName = Object.fromEntries(full.status.map((s) => [s.provider, s]));
+check("gemini ready", byName.gemini.availability, "ready");
 check("openrouter ready", byName.openrouter.availability, "ready");
-check("groq skipped for missing key", byName.groq.availability, "missing-api-key");
-check("groq reason is explicit", byName.groq.detail, "no API key");
-check("nvidia ready", byName.nvidia.availability, "ready");
-check("gemini skipped for missing key", byName.gemini.availability, "missing-api-key");
+// Groq has a key but is out of the chain. That must be distinguishable from a
+// provider that is merely missing a key, or the log will not explain the wait.
+check("groq is OPTIONAL, not merely disabled", byName.groq.availability, "optional");
 check(
-  "every provider appears in the log lines",
-  full.lines.some((l) => l.includes("GROQ") && l.includes("SKIPPED")),
+  "optional reason is explicit",
+  byName.groq.detail,
+  "optional — add it in Settings to enable it",
+);
+// Three providers are reported: the two default-chain legs plus the optional
+// one. The removed providers (local, nvidia) appear nowhere in this list.
+check("every provider appears in the log lines", full.status.length, 3);
+check(
+  "optional providers are reported in the log",
+  full.lines.some((l) => l.includes("GROQ") && l.includes("optional")),
   true,
 );
+
+// The required log line, verbatim.
+check("the primary line is the documented one", full.lines[0], "[AI] primary provider=gemini");
 check(
-  "log states the configured chain first",
-  full.lines[0].startsWith("[AI] configured provider chain:"),
+  "log states the configured chain",
+  full.lines[1].startsWith("[AI] configured provider chain:"),
   true,
 );
 check(
   "log states the resolved chain",
-  full.lines[1].startsWith("[AI] resolved interview provider chain:"),
+  full.lines[2].startsWith("[AI] resolved interview provider chain:"),
   true,
 );
 
-// A provider with a key but disabled in the chain is reported differently.
+// The primary must be a CONFIGURATION fact: with no keys at all it must still
+// say Gemini, otherwise the user's next action is to add a key to the wrong
+// provider.
+{
+  const noGeminiKey = describeProviderChain({
+    providerOrder: ["gemini", "openrouter"],
+    models: {},
+    apiKeys: {},
+  });
+  check(
+    "primary is still Gemini with no keys configured",
+    noGeminiKey.primary,
+    "gemini",
+  );
+  check(
+    "and the required log line says so",
+    noGeminiKey.lines[0],
+    "[AI] primary provider=gemini",
+  );
+  check(
+    "no keys => resolved chain says none",
+    noGeminiKey.resolved,
+    "(none — no provider has an API key)",
+  );
+  check(
+    "a keyed-but-disabled default provider is missing-api-key, not optional",
+    Object.fromEntries(
+      noGeminiKey.status.map((s) => [s.provider, s.availability]),
+    ).gemini,
+    "missing-api-key",
+  );
+}
+
+// A provider with a key but removed from the chain by the user (as opposed to
+// never being default) is "not in the configured chain", not "optional".
 const offChain = describeProviderChain({
-  providerOrder: ["openrouter"],
-  models: { openrouter: OPENROUTER_FREE_MODEL, groq: "g" },
-  apiKeys: { openrouter: "k", groq: "k" },
+  providerOrder: ["gemini"],
+  models: {
+    gemini: "gemini-2.5-flash",
+    openrouter: OPENROUTER_FREE_MODEL,
+    groq: "openai/gpt-oss-120b",
+  },
+  apiKeys: { gemini: "k", openrouter: "k", groq: "k" },
 });
 const offByName = Object.fromEntries(offChain.status.map((s) => [s.provider, s]));
-check("keyed but disabled => not-in-chain", offByName.groq.availability, "not-in-chain");
+check(
+  "a default provider the user removed => not-in-chain",
+  offByName.openrouter.availability,
+  "not-in-chain",
+);
 check(
   "not-in-chain reason is explicit",
-  offByName.groq.detail,
+  offByName.openrouter.detail,
   "not in the configured chain",
 );
-
-// No keys at all must not crash or claim a working chain.
-const noKeys = describeProviderChain({
-  providerOrder: ["openrouter", "groq", "nvidia", "gemini"],
-  models: {},
-  apiKeys: {},
-});
 check(
-  "no keys => resolved chain says none",
-  noKeys.resolved,
-  "(none — no provider has an API key)",
+  "an optional provider is still 'optional' when out of the chain",
+  offByName.groq.availability,
+  "optional",
 );
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 14. THE REMOVED FEATURES CANNOT COME BACK THROUGH A HIDDEN STARTUP PATH
+//
+// Deleting a module is only half the job: a stale import in main.ts, a leftover
+// bridge method or an auto-discovered model file would resurrect the feature at
+// runtime while every source file "looks" deleted. So this checks the files,
+// the startup wiring and the bridge — the three places a ghost feature hides.
+// ─────────────────────────────────────────────────────────────────────────────
+{
+  const root = process.cwd();
+  const read = (p: string) => readFileSync(path.join(root, p), "utf8");
+  const strip = (src: string) =>
+    src.replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|[^:])\/\/.*$/gm, "$1");
+  const code = (p: string) => strip(read(p));
+
+  // (a) Every deleted module stays deleted.
+  const REMOVED = [
+    "src/lib/ai/local.ts",
+    "src/lib/ai/localBridge.ts",
+    "src/lib/ai/nvidia.ts",
+    "src/lib/ai/nvidiaBridge.ts",
+    "src/lib/localModel.ts",
+    "electron/localAi.ts",
+    "electron/localModel.ts",
+    "electron/nvidiaAi.ts",
+    "electron/liveScreen.ts",
+    "electron/regionPicker.ts",
+    "src/lib/liveScreenContext.ts",
+    "src/components/LiveScreenPanel.tsx",
+    "src/lib/interviewReport.ts",
+    "src/components/InterviewReportPanel.tsx",
+    "src/components/InterviewContext.tsx",
+    "src/components/SessionContextChip.tsx",
+    "src/components/ScreenCapturePanel.tsx",
+  ];
+  check(
+    "every removed source file is really gone",
+    REMOVED.filter((p) => existsSync(path.join(root, p))),
+    [],
+  );
+
+  // (b) No startup wiring references one of them (comments stripped first —
+  //     the codebase deliberately documents what was removed).
+  const boot = [
+    "electron/main.ts",
+    "electron/ipc.ts",
+    "electron/preload.ts",
+    "electron/hotkeys.ts",
+  ]
+    .map(code)
+    .join("\n");
+  check(
+    "no startup path imports or calls a removed feature",
+    boot.match(/localAi|localModel|nvidiaAi|liveScreen|regionPicker|disposeLocalAi|initLiveScreen/gi) ?? [],
+    [],
+  );
+  check(
+    "no discovery/download of a local LLM model at boot",
+    /localModelStatus|modelDownload\(|llamaServer|gguf/i.test(boot),
+    false,
+  );
+
+  // (c) The bridge exposes no way to reach them either.
+  const preloadSrc = read("electron/preload.ts");
+  check(
+    "the renderer cannot call a removed channel",
+    /localModelStatus|nvidiaStatus|liveScreenStatus|interviewReport|readReportInputs/.test(
+      preloadSrc,
+    ),
+    false,
+  );
+  check(
+    "but the ONE capture path still exists end to end",
+    /ghostly:capture-fullscreen/.test(read("electron/ipc.ts")) &&
+      /ghostly:capture-fullscreen/.test(preloadSrc) &&
+      /ghostly:capture-screen/.test(read("electron/hotkeys.ts")) &&
+      /ghostly:capture-screen/.test(preloadSrc),
+    true,
+  );
+
+  // (d) A store written before the Gemini cleanup cannot keep a 404ing model.
+  const appSrc = code("src/App.tsx");
+  check(
+    "the boot migration retires every Gemini id that answered 404",
+    ["gemini-2.5-flash-lite", "gemini-2.0-flash", "gemini-1.5-pro"].every((id) =>
+      appSrc.includes(`"${id}"`),
+    ),
+    true,
+  );
+  check(
+    "the shipped Gemini default is an id verified against the live API",
+    /gemini: "gemini-2\.5-flash"/.test(read("electron/ipc.ts")),
+    true,
+  );
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 console.log(`\n${pass} passed, ${fail} failed`);

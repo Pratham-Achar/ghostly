@@ -96,6 +96,19 @@ check("B1 a payload-less screenshot never enters the store", useStore.getState()
 store.addScreenshot(IMG);
 check("B2 a real screenshot does enter the store", useStore.getState().screenshots, [IMG]);
 check("B3 the store exposes it as the current screenshot", useStore.getState().currentScreenshot, IMG);
+// ── The explicit-capture ARM ───────────────────────────────────────────────
+// A capture is a deliberate user action, and it is recorded as one. These are
+// the store-level halves of the rule the solver applies below.
+check("B4 a capture ARMS the screenshot for the next Solve", useStore.getState().screenshotArmed, true);
+useStore.getState().consumeScreenshotArm();
+check("B5 solving consumes the arm", useStore.getState().screenshotArmed, false);
+store.addScreenshot(IMG2);
+check("B6 a new capture re-arms it", useStore.getState().screenshotArmed, true);
+store.removeScreenshot(0);
+check("B7 removing one of two screenshots keeps the arm", useStore.getState().screenshotArmed, true);
+store.removeScreenshot(0);
+// The arm points AT an image; with no image left there is nothing for it to mean.
+check("B8 removing the LAST screenshot disarms it", useStore.getState().screenshotArmed, false);
 store.clearScreenshots();
 
 // ── C. What a Solve press answers ──────────────────────────────────────────
@@ -126,6 +139,72 @@ check(
   { target: "interview", reason: "screenshot solve is not possible" },
 );
 
+// ── Cb. The EXPLICIT-CAPTURE rule ──────────────────────────────────────────
+// Capture Screen → Solve must solve the capture, even though a live question is
+// gated as answerable. That is the reported failure shape: screenshot taken →
+// Solve → the transcript stole the run → no answer.
+//
+// The signal is the ARM, not a timestamp. A transcript only needs to be NEWER
+// than the capture for a "which is newer" check to lose the run, and ASR commit
+// lag produces exactly that on its own: the interviewer's earlier sentence is
+// still decoding when the user presses Capture, and it lands in the transcript
+// afterwards. These checks pin the behaviour that survives that.
+check(
+  "Cb1 an explicit capture wins over a live question",
+  decideSolveTarget({
+    hasTurn: true,
+    gateSaysAnswer: true,
+    usableScreenshots: 1,
+    screenshotArmed: true,
+  }),
+  { target: "screenshot", reason: "the screenshot was captured explicitly and is not yet solved" },
+);
+check(
+  "Cb2 the SAME state without the arm leaves the audio path exactly as it was",
+  decideSolveTarget({
+    hasTurn: true,
+    gateSaysAnswer: true,
+    usableScreenshots: 1,
+    screenshotArmed: false,
+  }),
+  { target: "interview", reason: "interview question wins" },
+);
+check(
+  "Cb3 an armed capture with no speech at all still solves the screenshot",
+  decideSolveTarget({
+    hasTurn: false,
+    gateSaysAnswer: false,
+    usableScreenshots: 1,
+    screenshotArmed: true,
+  }),
+  { target: "screenshot", reason: "the screenshot was captured explicitly and is not yet solved" },
+);
+check(
+  "Cb4 with no arm the ORIGINAL rule is preserved exactly",
+  decideSolveTarget({ hasTurn: true, gateSaysAnswer: true, usableScreenshots: 1 }),
+  { target: "interview", reason: "interview question wins" },
+);
+check(
+  "Cb5 an arm cannot conjure a screenshot that was never captured",
+  decideSolveTarget({
+    hasTurn: true,
+    gateSaysAnswer: true,
+    usableScreenshots: 0,
+    screenshotArmed: true,
+  }),
+  { target: "interview", reason: "interview question wins" },
+);
+check(
+  "Cb6 with no arm a screenshot is still the fallback when no question is live",
+  decideSolveTarget({
+    hasTurn: true,
+    gateSaysAnswer: false,
+    usableScreenshots: 1,
+    screenshotArmed: false,
+  }),
+  { target: "screenshot", reason: "no live question — solving the screenshot" },
+);
+
 // ── D. The wiring that actually reaches the answer-generation call ─────────
 
 const home = read("src/pages/Home.tsx");
@@ -142,20 +221,70 @@ checkTrue(
   /runAIStream\(shots,\s*decision\.target === "interview" \? turn : undefined\)/.test(home),
 );
 checkTrue(
+  // The variable was renamed `latestScreenshot` -> `attachedScreenshot` so the
+  // image is resolved ONCE per run, before the prompt is built, and the identical
+  // one is used for the prompt and every attempt. The behaviour asserted here is
+  // unchanged: the newest attachable screenshot is the one that answers.
   "D3 the screenshot actually attached to the run is the newest usable one",
-  /const latestScreenshot = lastUsableScreenshot\(screenshotList\)/.test(home),
+  /const attachedScreenshot = lastUsableScreenshot\(screenshotList\)/.test(home),
 );
 checkTrue(
   "D4 the 'capture a screenshot first' guard counts attachable screenshots",
   /usableScreenshots\(screenshotList\)\.length === 0/.test(home),
 );
 checkTrue(
-  "D5 the attached image is what reaches the orchestrator",
-  /base64Image: latestScreenshot/.test(home),
+  // The OCR-first feature changed WHERE the image goes, and the OCR-context work
+  // then narrowed WHEN it goes at all. Asserted as the positive rule rather than
+  // deleted: "the image never reaches a provider unless this exact request asked
+  // for it" is the stronger property, and it is the one that stops a follow-up
+  // from re-sending the same screenshot forever.
+  "D5 the image reaches the orchestrator only on an explicit vision screenshot solve",
+  /const imageAttached =[\s\S]{0,200}?solveTarget === "screenshot"[\s\S]{0,200}?=== "vision"/.test(
+    home,
+  ) && /base64Image: imageAttached \? latestScreenshot : undefined/.test(home),
 );
 checkTrue(
   "D6 the store refuses a payload-less screenshot",
   /if \(typeof b64 !== "string" \|\| b64\.length === 0\)/.test(storeSrc),
+);
+checkTrue(
+  "D7 the Solve handler feeds the explicit-capture arm into the decision",
+  /const armed = useStore\.getState\(\)\.screenshotArmed/.test(home) &&
+    /screenshotArmed: armed/.test(home),
+);
+checkTrue(
+  "D7a the Solve handler CONSUMES the arm once a run targets the screenshot",
+  /decision\.target === "screenshot"[\s\S]{0,500}?consumeScreenshotArm\(\)/.test(home),
+);
+checkTrue(
+  "D7b nothing in the decision is derived from capture timestamps any more",
+  !/lastScreenshotAt/.test(home) && !/lastSpeechAt/.test(home),
+);
+checkTrue(
+  "D7c the capture path arms it, and the arm is in-memory only",
+  /addScreenshot[\s\S]{0,900}?screenshotArmed: true/.test(storeSrc) &&
+    /consumeScreenshotArm: \(\) => set\(\{ screenshotArmed: false \}\)/.test(storeSrc) &&
+    // `clearSolution` (Ctrl+G) drops every session slice, including the ones the
+    // OCR context added; the list may grow, so the assertion is "the arm is
+    // cleared here", not a verbatim snapshot of the object.
+    /screenshotArmed: false,[\s\S]{0,300}?currentScreenshot: null,[\s\S]{0,120}?error: null,/.test(
+      storeSrc,
+    ),
+);
+checkTrue(
+  "D7d the request builder traces whether an image is attached, per attempt",
+  /const imageTrace = opts\.base64Image/.test(read("src/lib/ai/orchestrator.ts")) &&
+    /image=\$\{imageTrace\}/.test(read("src/lib/ai/orchestrator.ts")),
+);
+checkTrue(
+  "D8 screenshot payloads and their capture instants stay in lockstep",
+  /addScreenshot[\s\S]{0,700}?screenshotTimestamps: \[\.\.\.s\.screenshotTimestamps, Date\.now\(\)\]/.test(
+    storeSrc,
+  ) &&
+    /clearScreenshots[\s\S]{0,300}?screenshotTimestamps:\s*\[\]/.test(storeSrc) &&
+    /removeScreenshot[\s\S]{0,300}?screenshotTimestamps: s\.screenshotTimestamps\.filter/.test(
+      storeSrc,
+    ),
 );
 
 // ── E. Screenshot capture always produces an image ─────────────────────────
@@ -193,8 +322,17 @@ checkTrue(
     /runAIStream\(shots,/.test(home),
 );
 checkTrue(
-  "F2 the screenshot prompt is the existing one, not a new code path",
-  /buildPrompt\(settings\.interviewType, settings\.language\)/.test(home),
+  // F2's INTENT is "Solve reuses the existing prompt path — there is no second,
+  // screenshot-only code path". With the category dropdown removed the shared
+  // builder is `buildUniversalPrompt`, so the same property is asserted against
+  // it, PLUS the stronger claim that the per-category builder is now unreachable
+  // from the app: a screenshot solve can no longer pick a template by category.
+  "F2 the screenshot prompt is the shared universal prompt, not a category path",
+  /prompt = buildUniversalPrompt\(settings\.language\)/.test(home),
+);
+checkTrue(
+  "F2a the legacy per-category prompt builder is not reachable from the app",
+  !/buildPrompt\(/.test(home) && !/buildPrompt\(/.test(read("src/pages/Home.tsx")),
 );
 const solveTargetSrc = read("src/lib/solveTarget.ts");
 checkTrue(

@@ -24,7 +24,6 @@
     "src/lib/parakeetModelFacts.ts",
     "src/lib/systemMemory.ts",
     "src/lib/debugClipSave.ts",
-    "src/lib/liveScreenContext.ts",
     "src/lib/sessionContext.ts",
     "src/lib/conversationThread.ts"
   ]

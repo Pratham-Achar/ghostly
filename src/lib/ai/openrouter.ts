@@ -1,4 +1,4 @@
-import type { AIProvider, AIRequestOptions } from "./types";
+import type { AIProvider, AIRequestOptions, AIStreamMeta } from "./types";
 import {
   fetchWithDiagnostics,
   withModelHint,
@@ -122,7 +122,7 @@ export class OpenRouterProvider implements AIProvider {
       .map((m: any) => m.id as string)
       // Keep only chat-capable text models.
       .filter(
-        (id) =>
+        (id: string) =>
           id &&
           typeof id === "string" &&
           /^[a-z0-9-]+?\/[a-z0-9-_]+$/.test(id),
@@ -143,6 +143,12 @@ export class OpenRouterProvider implements AIProvider {
       signal,
       meta,
     } = options;
+
+    // `meta` is optional in `AIRequestOptions`, and the per-chunk reporting below
+    // is only guarded for `httpMs`. A caller that omits it would have thrown on
+    // the first chunk. One local object is written to instead, so a missing
+    // reporter costs a discarded object rather than a crash mid-answer.
+    const report: AIStreamMeta = meta ?? {};
 
     const imageUrl = base64Image?.startsWith("data:")
       ? base64Image
@@ -204,7 +210,7 @@ export class OpenRouterProvider implements AIProvider {
     console.log(
       `[OpenRouter] http=${Math.round(performance.now() - startedAt)}ms status=${response.status} ${response.statusText}`,
     );
-    if (meta) meta.httpMs = Math.round(performance.now() - startedAt);
+      report.httpMs = Math.round(performance.now() - startedAt);
 
     if (!response.ok) {
       const err = await response
@@ -249,8 +255,8 @@ export class OpenRouterProvider implements AIProvider {
       }
       // The concrete model OpenRouter served. Essential for `openrouter/free`,
       // where this differs from what we requested on almost every request.
-      if (parsed.model && parsed.model !== meta.model) {
-        meta.model = parsed.model;
+      if (parsed.model && parsed.model !== report.model) {
+        report.model = parsed.model;
         if (isOpenRouterFreeModel(model)) {
           console.log(
             `[OpenRouter] resolvedModel=${parsed.model} (requested=${model})`,
@@ -258,18 +264,18 @@ export class OpenRouterProvider implements AIProvider {
         }
       }
       if (parsed.provider) {
-        meta.provider = parsed.provider;
+        report.provider = parsed.provider;
         // OpenRouter can route mid-stream; log only on an actual change so a
         // long answer doesn't print one line per token.
         if (parsed.provider !== lastProvider) {
           lastProvider = parsed.provider;
           console.log(
-            `[OpenRouter] backend=${parsed.provider} (resolvedModel=${meta.model ?? model})`,
+            `[OpenRouter] backend=${parsed.provider} (resolvedModel=${report.model ?? model})`,
           );
         }
       }
       if (parsed.finishReason) {
-        meta.finishReason = parsed.finishReason;
+        report.finishReason = parsed.finishReason;
         console.log(
           `[OpenRouter] finishReason=${parsed.finishReason}`,
         );
@@ -286,15 +292,19 @@ export class OpenRouterProvider implements AIProvider {
       buffer = lines.pop() || "";
 
       for (const line of lines) {
-        const text = consume(line);
-        if (text) yield text;
+        // Every SSE frame is YIELDED, including frames with no answer text in
+        // them (routing metadata, reasoning-only deltas, keep-alives). An empty
+        // yield is the heartbeat the orchestrator's first-token budget needs:
+        // a frame-blind timer reported "timeout" on streams that were
+        // demonstrably alive and framing the whole time. The orchestrator
+        // accumulates only non-empty text, so nothing about the answer changes.
+        yield consume(line);
       }
     }
 
     // The stream can end without a trailing newline, leaving a partial frame.
     if (buffer.trim()) {
-      const text = consume(buffer);
-      if (text) yield text;
+      yield consume(buffer);
     }
 
     console.log(

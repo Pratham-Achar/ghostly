@@ -1,6 +1,7 @@
 import React, { useEffect, useState, useCallback, useRef } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import { useStore } from "../store/useStore";
+import { useStore, type Settings } from "../store/useStore";
+import type { ProviderName } from "../lib/ai";
 import { getProvider } from "../lib/ai";
 import {
   orchestrateAnswer,
@@ -15,6 +16,8 @@ import {
   buildCooldownSummary,
   useProviderCooldown,
 } from "../lib/useProviderCooldown";
+import { useKeyHealth } from "../lib/useKeyHealth";
+import { keyPool } from "../lib/keyHealth";
 import {
   buildContextBlock,
   classifyFollowUp,
@@ -24,9 +27,15 @@ import {
   startProblem,
   touchProblem,
   SESSION_CONTEXT_TTL_MS,
-  type ProblemSource,
 } from "../lib/sessionContext";
-import { buildPrompt, buildInterviewContext } from "../lib/prompts";
+import {
+  buildUniversalPrompt,
+  buildInterviewContext,
+  appendScreenText,
+  sanitizeScreenText,
+} from "../lib/prompts";
+import { readScreenTextDetailed } from "../lib/screenText";
+import { assessOcrText, measureOcrText } from "../lib/ocrQuality";
 import {
   buildInterviewSystemPrompt,
   buildInterviewUserPrompt,
@@ -40,8 +49,7 @@ import {
   type SubmitRecord,
 } from "../lib/interviewAgent";
 import { validateAnswerOutput } from "../lib/outputValidation";
-import { SessionContextChip } from "../components/SessionContextChip";
-import { LiveScreenPanel } from "../components/LiveScreenPanel";
+import { gs, withSurface } from "../lib/overlaySurfaces";
 import { describeDrain, drainInterviewAsr } from "../lib/asrDrain";
 import { forceEndpointOnSubmit } from "../lib/forceEndpointRunner";
 import { shadowOverlapCheck, type ShadowOverlap } from "../lib/outputValidation";
@@ -64,8 +72,14 @@ import {
   decideSolveTarget,
   lastUsableScreenshot,
   usableScreenshots,
+  type SolveTarget,
 } from "../lib/solveTarget";
 import { correctQuestionWithCandidate } from "../lib/candidateCorrection";
+import {
+  buildTruncatedFollowupAnswers,
+  followupContextBudget,
+  truncateToCharLimit,
+} from "../lib/followupContext";
 import {
   getInterviewControls,
   planInterviewToggle,
@@ -79,6 +93,28 @@ import {
  */
 const AUTO_ANSWER_SETTLE_MS = 600;
 
+/**
+ * Answer budget for the OCR → Groq text path.
+ *
+ * The screenshot text path asks Groq for a spoken-style answer, which is short
+ * by design. A smaller cap than the shared 4096 also keeps the request inside
+ * tight per-minute token limits (a 4096-token ask against a metered gateway is
+ * exactly what produced HTTP 402 / 400 rejections). Named so the number has one
+ * explanation rather than being a bare literal.
+ */
+export const OCR_ANSWER_MAX_TOKENS = 2048;
+
+/**
+ * Marker put on a question that came off the screen rather than off the mic.
+ *
+ * It is a label on the stored session message, never anything the model sees: the
+ * question itself is sent through the ordinary interview prompt. `interviewReport`
+ * reads this prefix so a screen question is reported as a screen question — such a
+ * question never passed the audio gate, so claiming it was audio would put an
+ * unmeasured latency in front of the user.
+ */
+const SCREEN_SOURCE_PREFIX = "🖥️ ";
+
 /** Friendly provider name for the overlay / logs. */
 const providerLabel = (provider: string): string =>
   provider === "groq"
@@ -91,25 +127,52 @@ const providerLabel = (provider: string): string =>
           ? "Anthropic"
           :provider === "openrouter"
         ? "OpenRouter"
-        : provider === "nvidia"
-          ? "NVIDIA"
-          : provider;
+        : provider;
+
+// Follow-up context capping (MAX_FOLLOWUP_CONTEXT_CHARS and friends) lives in
+// `lib/followupContext.ts` so the same helpers can be measured by the harness
+// without importing this component.
 
 const logTruncate = (text: string, max: number): string => {
   const clean = text.replace(/\s+/g, " ").trim();
   return clean.length <= max ? clean : `${clean.slice(0, max)}…`;
 };
+
 import { v4 as uuidv4 } from "uuid";
 import { TopBar } from "../components/TopBar";
 import { SettingsPanel } from "../components/SettingsPanel";
 import { SolutionCard } from "../components/SolutionCard";
 import { InterviewModal } from "../components/InterviewModal";
 
+/**
+ * The user's key pool for one provider: slot 1 from `apiKeys`, slots 2 and 3
+ * from `apiKeyPool`.
+ *
+ * `apiKeys` is kept as the canonical slot-1 map rather than being replaced,
+ * because it is read by the settings migration, the provider diagnostics and the
+ * "which providers have a key" filter — all of which predate the pool and none of
+ * which care how many keys there are. `keyPool` in `lib/keyHealth.ts` owns the
+ * joining, so the two halves cannot be assembled inconsistently.
+ */
+const keyHealthKeys = (settings: Settings): ((p: ProviderName) => string[]) =>
+  (p) => keyPool(settings.apiKeys, settings.apiKeyPool, p);
+
 export const Home: React.FC = () => {
   const {
     currentSolution,
     isStreaming,
     screenshots,
+    screenshotOcr,
+    setScreenshotOcr,
+    updateScreenshotOcrText,
+    /**
+     * The active screen problem, as recognised TEXT. Read here rather than from
+     * `screenshots` because the two have independent lifetimes: the image is
+     * consumed by the Solve run that answers it, while this text is what every
+     * later follow-up is about.
+     */
+    activeScreenText,
+    setActiveScreenText,
     error,
     settings,
     sessionMessages,
@@ -136,6 +199,7 @@ export const Home: React.FC = () => {
     setAnswerIssue,
     openRouterBackendProvider,
     setOpenRouterBackendProvider,
+    latencyTurns,
   } = useStore();
 
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -143,6 +207,10 @@ export const Home: React.FC = () => {
   // Collapsed = the transcript panel shrinks to one bar so the answer has room.
   const [interviewCollapsed, setInterviewCollapsed] = useState(false);
   const [followUpText, setFollowUpText] = useState("");
+  // "Text read from screen" preview: collapsed by default; `ocrDraft` is the
+  // user-editable copy of the recognised text (Edit → Resend).
+  const [ocrOpen, setOcrOpen] = useState(false);
+  const [ocrDraft, setOcrDraft] = useState("");
   const screenshotsRef = useRef<string[]>(screenshots);
   const interviewOpenRef = useRef(interviewOpen);
   const abortControllerRef = useRef<AbortController | null>(null);
@@ -177,6 +245,11 @@ export const Home: React.FC = () => {
    */
   const pendingRecorderRef = useRef<StageRecorder | null>(null);
   const outcomeRef = useRef<RunOutcome>("answered");
+  /**
+   * `performance.now()` at which the OCR-first screenshot path began reading the
+   * screen. Used only to publish the `[SHOT-TIMING]` breakdown for that run.
+   */
+  const shotOcrStartRef = useRef<number | null>(null);
   const providersRef = useRef<ProviderTiming[]>([]);
   /**
    * True when this turn's question was submitted with a phrase still open in the
@@ -194,24 +267,10 @@ export const Home: React.FC = () => {
   // a ref so it survives re-renders and holds its cooldown state.
   const shortcutGuardRef = useRef(createShortcutGuard());
 
-  /**
-   * A ticking clock for the context chip.
-   *
-   * Exists purely so an EXPIRED context stops being displayed as active. Without
-   * it the chip would keep showing a problem that `pruneSessionContext` has
-   * already dropped, which is worse than showing nothing: the user would be told
-   * the model still has context when it does not.
-   *
-   * 30s, not 1s — the TTL is 30 minutes, so sub-second freshness buys nothing
-   * and a 1s interval would re-render the overlay forever.
-   */
-  const [ctxTick, setCtxTick] = useState(() => Date.now());
-  // Bumped by Reset Interview so Live Screen forgets the watched region too.
-  const [liveScreenReset, setLiveScreenReset] = useState(0);
-  useEffect(() => {
-    const t = setInterval(() => setCtxTick(Date.now()), 30_000);
-    return () => clearInterval(t);
-  }, []);
+  // NOTE: the context chip's `ctxTick` clock and Live Screen's `liveScreenReset`
+  // signal are gone with their features (visible context box / auto screen
+  // watcher). The INTERNAL session context is untouched — it still feeds
+  // follow-up answers through `selectContextBlock`.
 
   /**
    * Provider cooldown — "do not call this one again for N minutes".
@@ -224,6 +283,17 @@ export const Home: React.FC = () => {
    */
   const cooldown = useProviderCooldown();
 
+  /**
+   * Per-KEY health for the authorized key pools.
+   *
+   * Deliberately separate from `cooldown` above, and the two are not merged:
+   * a provider cooldown means "this PROVIDER is unusable right now", a key
+   * cooldown means "this CREDENTIAL was refused". Conflating them would park a
+   * whole provider because one of the user's three keys hit a quota — and that
+   * is how a key pool would become an outage amplifier.
+   */
+  const keyHealth = useKeyHealth();
+
   // Keep refs in sync
   useEffect(() => {
     screenshotsRef.current = screenshots;
@@ -232,6 +302,13 @@ export const Home: React.FC = () => {
   useEffect(() => {
     interviewOpenRef.current = interviewOpen;
   }, [interviewOpen]);
+
+  // Seed the editable OCR draft from the latest recognised text. Deliberately
+  // keyed on the OCR slice so a fresh solve (or a Resend) refreshes it, while
+  // typing inside the preview does NOT clobber itself.
+  useEffect(() => {
+    if (screenshotOcr) setOcrDraft(screenshotOcr.text);
+  }, [screenshotOcr]);
 
   // Auto-scroll chat
   useEffect(() => {
@@ -264,8 +341,13 @@ export const Home: React.FC = () => {
       /**
        * Who triggered this run. `retry` bypasses the duplicate-submit guard and
        * re-asks the same question on purpose.
+       *
+       * `screen` is a question read off the screen by the local OCR engine. It is
+       * reported separately from `auto` only so the stored message is labelled
+       * honestly (see SCREEN_SOURCE_PREFIX); the answer path is otherwise the
+       * ordinary interview path, gate and all.
        */
-      origin: "auto" | "manual" | "retry" = "manual",
+      origin: "auto" | "manual" | "retry" | "screen" = "manual",
       /**
        * Candidate repeated-word correction signal. When present, it is applied
        * to the interviewer's final question AFTER the local gate has confirmed
@@ -275,38 +357,100 @@ export const Home: React.FC = () => {
        * hard guard. The voice path (useInterviewAudio) also supplies this.
        */
       candidateSignal?: { text: string; timestamp?: number },
+      /**
+       * Screenshot-input options. Additive: an absent object means the existing
+       * behaviour exactly. `mode` picks the input source for a screenshot-only
+       * solve — `"ocr"` (default) recognises the screen locally and sends TEXT
+       * to Groq, `"vision"` keeps the original image path for the manual
+       * fallback. `textOverride` is the user's EDITED OCR text (Resend).
+       */
+      screenshotOpts?: { mode?: "ocr" | "vision"; textOverride?: string },
     ) => {
-      // We only strictly require screenshots for the FIRST dsa/code question if no followUp or transcript
-      const isGeneral = settings.interviewType === "general";
       const isFollowUp = !!followUpQuery;
+      // True for a screenshot-only run answered from locally recognised TEXT
+      // (no image is sent). Drives the request's image omission and history.
+      let isScreenshotOcr = false;
+      // Numbers only, for the `[SCREEN]` metadata line below. Never the text.
+      let ocrChars = 0;
+      let ocrMs = 0;
       // Utterances the VAD split are re-joined first, so "Can you explain" +
       // "… the CAP theorem" counts as one complete question.
       const interviewTurn = turn ? normalizeTurn(turn) : undefined;
       const isInterview = !!interviewTurn;
-      // `retry` is shown exactly like a manual run in the overlay.
+      // ── What THIS request is answering ─────────────────────────────────
+      //
+      // Three states, deliberately not collapsed into one another:
+      //
+      //   solveTarget     which input answers this press. Chosen by
+      //                   `decideSolveTarget` in the Solve handler.
+      //   imageAttached   whether THIS provider request carries pixels. Decided
+      //                   HERE, from the solve target and the explicit mode —
+      //                   never from "is there a screenshot in the list".
+      //   activeScreenText the recognised screen problem that later follow-ups
+      //                   are about. Independent of both.
+      //
+      // The image used to be attached whenever a screenshot existed, so a
+      // follow-up question was sent as `solveTarget=interview` AND
+      // `image=image/png …` — the same picture re-sent on every turn, which the
+      // orchestrator had no way to know was stale.
+      // A TYPED follow-up is an interview follow-up, not a screenshot solve: it
+      // answers a question the user wrote, so it takes the interview target and
+      // the text-only rule with it. Before this, a typed follow-up reported
+      // `solveTarget=screenshot` and looked, in the logs, like a screenshot run.
+      const solveTarget: SolveTarget =
+        isInterview || isFollowUp ? "interview" : "screenshot";
+      // The newest ATTACHABLE screenshot for this run, resolved ONCE and early.
+      //
+      // Two reasons it is no longer resolved just before the orchestration call:
+      // resolving it once means the identical image is used for the prompt and
+      // for every attempt, instead of two lookups that could disagree.
+      //
+      // It is a CANDIDATE, not a decision. `imageAttached` below decides whether
+      // it is actually sent.
+      const attachedScreenshot = lastUsableScreenshot(screenshotList);
+      // `retry` is shown exactly like a manual run in the overlay. A screen
+      // question was not asked by the user in this moment, so it presents as auto.
       const displayMode: "auto" | "manual" =
-        origin === "auto" ? "auto" : "manual";
+        origin === "auto" || origin === "screen" ? "auto" : "manual";
 
       // Ordered provider chain.
       //
-      // A live interview goes through OpenRouter ONLY — it is the single
-      // gateway, and OpenRouter itself owns provider routing/fallback. The
-      // screenshot / follow-up flow stays on whatever provider is chosen in
-      // Settings, which also defaults to OpenRouter.
-      const attempts: AttemptSpec[] = (
-        isInterview
-          ? (settings.providerOrder ?? []).map((provider) => ({
-              provider,
-              apiKey: settings.apiKeys[provider] ?? "",
-            }))
-          : [
-              {
-                provider: settings.activeProvider,
-                apiKey: settings.apiKeys[settings.activeProvider] ?? "",
-              },
-            ]
-      )
-        .filter((a) => a.apiKey.trim())
+      // ── One attempt per (provider, healthy key) ──────────────────────────
+      // The chain is the providers in order; within a provider it is the
+      // user's authorized key slots in order, skipping any that are on cooldown
+      // or already failed. So a chain of two providers with three keys each
+      // becomes up to six attempts, and a Gemini 429 on Key 1 costs a single
+      // immediate hop to Gemini Key 2 rather than a full fallback to another
+      // provider.
+      //
+      // Slots are skipped, not rotated: a SUCCESS never changes which key comes
+      // next, it only clears that key's failure record. That is what stops this
+      // from turning into a round-robin across the user's quota.
+      const chainKeys = keyHealthKeys(settings);
+      // ── BOTH paths use the ordered interview chain ────────────────────────
+      // This used to branch: an interview turn walked `settings.providerOrder`,
+      // while a SCREENSHOT solve tried `settings.activeProvider` and nothing
+      // else. That is what made a manual screenshot silently produce no answer:
+      // with `activeProvider` on a flaky provider there was no second attempt to
+      // fall back to, so one slow or mis-routed reply ended the run with nothing
+      // on screen.
+      //
+      // `activeProvider` keeps its real job — the provider whose key and model the
+      // Settings panel is editing — and no longer silently becomes the only
+      // provider allowed to answer. Ordering is unchanged: Gemini → OpenRouter →
+      // local, first VALID COMPLETE answer wins.
+      const chain: ProviderName[] =
+        settings.providerOrder?.length
+          ? settings.providerOrder
+          : [settings.activeProvider];
+      const attempts: AttemptSpec[] = chain
+        .map((provider) => ({ provider, keys: chainKeys(provider) }))
+        .flatMap(({ provider, keys }) =>
+          keyHealth
+            .gate.eligible(provider, keys)
+            .map((keyIndex) => ({ provider, keyIndex, key: keys[keyIndex] })),
+        )
+        .filter((a) => a.key.trim())
         .map((a) => {
           const provider = getProvider(a.provider);
           const models = provider.listModels();
@@ -315,22 +459,33 @@ export const Home: React.FC = () => {
           // `openrouter/free` is a ROUTER, not a model. OpenRouter resolves it
           // per request, so swapping in some other id on failure would defeat
           // the entire point (and silently pin us to one model again). If the
-          // free router is unavailable the run moves to the NEXT PROVIDER —
-          // the configured fallback policy, not a hidden substitution.
+          // free router is unavailable the run moves to the NEXT attempt —
+          // another key, then the next provider — which is the configured
+          // failover policy, not a hidden substitution.
           //
           // There is deliberately no per-provider "try these other model ids"
-          // list: with hedging in place the next provider is a faster answer
+          // list: with hedging in place the next attempt is a faster answer
           // than retrying the same gateway on a different model.
           return {
             provider: a.provider,
+            keyIndex: a.keyIndex,
             model:
               a.provider === "openrouter" && isOpenRouterFreeModel(configured)
                 ? OPENROUTER_FREE_MODEL
                 : configured,
-            apiKey: a.apiKey,
+            apiKey: a.key,
             maxTokens: 4096,
+            onKeyOutcome: (ok: boolean, info: { reason?: string; status?: number | undefined }) =>
+              keyHealth.gate.reportOutcome(a.provider, a.keyIndex, ok, info),
           };
         });
+
+      // The attempts actually attempted by THIS run. For every path except the
+      // OCR screenshot path this is the configured chain, unchanged. For the
+      // OCR path it is narrowed to the configured text providers
+      // (Gemini → OpenRouter → Groq) when the prompt is built; the GLOBAL
+      // provider order in settings is deliberately NOT touched.
+      let activeAttempts: AttemptSpec[] = attempts;
 
       // Resolved-chain diagnostic. The runtime previously reported OpenRouter as
       // configured while the interview path actually ran on Groq, so the chain
@@ -347,16 +502,25 @@ export const Home: React.FC = () => {
       console.log(
         `[AI] ${isInterview ? "interview" : "screenshot"} attempts: ${
           attempts.length
-            ? attempts.map((a) => `${a.provider}(${a.model})`).join(" → ")
+            ? attempts
+                .map((a) => `${a.provider}#${a.keyIndex}(${a.model})`)
+                .join(" → ")
             : "(none — no provider has an API key)"
         }`,
       );
 
       if (attempts.length === 0) {
+        // Name the providers that actually had no usable credential, rather than
+        // blaming whichever one happened to be selected in the Settings panel.
+        // This used to say "OpenRouter" for an interview and
+        // `activeProvider` for a screenshot, which described the OLD single
+        // provider path and pointed the user at the wrong box.
+        const missing = chain
+          .filter((p) => !chainKeys(p).some((k) => k.trim()))
+          .map((p) => providerLabel(p));
         setError(
-          isInterview
-            ? "No API key for OpenRouter. Open Settings (⚙) to add one."
-            : `No API key for ${settings.activeProvider}. Open Settings (⚙) to add one.`,
+          `No API key for ${missing.length ? missing.join(" or ") : "any provider in the chain"}. ` +
+            `Open Settings (⚙) to add one.`,
         );
         setIsStreaming(false);
         outcomeRef.current = "no-provider";
@@ -366,14 +530,13 @@ export const Home: React.FC = () => {
       // Without a screenshot there is nothing to solve. Previously the code fell
       // through to the generic "solve the problem on screen" prompt here, which
       // is what made the model invent a question out of thin air.
-      if (
-        !isGeneral &&
-        !isInterview &&
-        !isFollowUp &&
-        usableScreenshots(screenshotList).length === 0
-      ) {
+      //
+      // With the category dropdown gone there is no `general` path left: a run is
+      // either the live interview, a typed follow-up, or a screenshot solve, and
+      // only the last of those needs an image to exist.
+      if (!isInterview && !isFollowUp && usableScreenshots(screenshotList).length === 0) {
         setError(
-          "No screenshots yet. Press Ctrl+H or Ctrl+Shift+C to capture a screenshot first.",
+          "No screenshots yet. Press Capture Screen (or Ctrl+Shift+S) first.",
         );
         setIsStreaming(false);
         return;
@@ -532,9 +695,14 @@ export const Home: React.FC = () => {
       // Raw chat history is only used by the screenshot flow. For a live turn the
       // background is embedded (and explicitly labelled) inside the prompt, so no
       // old assistant message can act as a continuation prompt.
-      let historyContext: { role: "user" | "assistant"; content: string }[];
+      let historyContext: { role: "user" | "assistant"; content: string }[] = [];
       // What the chat bubble shows/stores. Never the full template.
       let userMessageContent: string;
+      // What the chat bubble RENDERS. Set only when `userMessageContent` is the
+      // assembled request prompt, which carries the OCR fence and the candidate
+      // context: that text is INPUT, and it stays internal so the answer panel
+      // shows the answer alone.
+      let userMessageDisplay: string | undefined;
       let prompt = "";
 
       if (isInterview && interviewTurn) {
@@ -545,7 +713,7 @@ export const Home: React.FC = () => {
         // The question the AI answers. The raw question is preserved in the
         // transcript as normal; a candidate correction only changes what the AI
         // receives (e.g. "What is mango?" + "MongoDB" → "What is MongoDB?").
-        userMessageContent = `🎙️ ${(finalQuestion ?? latest?.text.trim()) ?? "(no audio captured)"}`;
+        userMessageContent = `${origin === "screen" ? SCREEN_SOURCE_PREFIX : "🎙️ "}${(finalQuestion ?? latest?.text.trim()) ?? "(no audio captured)"}`;
         systemInstruction = buildInterviewSystemPrompt(settings);
 
         // ── Session context ───────────────────────────────────────────────
@@ -636,14 +804,45 @@ export const Home: React.FC = () => {
           }
         }
 
+        // ── Screen context ─────────────────────────────────────────────────
+        //
+        // The active screen problem, as TEXT — read once, locally, when the
+        // screenshot was solved, and reused from then on.
+        //
+        // This used to re-run the OCR against whatever screenshot still existed,
+        // on EVERY interview turn. That was wrong twice over: it made the old
+        // picture the subject of the conversation (so a follow-up could never
+        // move on), and it paid a full-screen OCR on the latency-critical audio
+        // path. Now the image is spent by its own solve and the text carries the
+        // problem forward, so an ordinary spoken question costs nothing.
+        //
+        // It is sanitised because it is UNTRUSTED DATA: OCR can emit a `<<<`
+        // opener and the interview prompt's own sections are delimited with
+        // exactly that vocabulary. The block itself already tells the model not
+        // to read instructions out of it.
+        // ── Retained follow-up context (capped) ───────────────────────────
+        // The problem text on screen is the CONTEXT follow-ups are about: it
+        // must survive, but it must not accumulate with anything else. Budget
+        // it against the retained answer so screen + answers ≤
+        // MAX_FOLLOWUP_CONTEXT_CHARS together. The latest question is never
+        // truncated — it lives in its own section below.
+        const followupAnswers = buildTruncatedFollowupAnswers(sessionMessages);
+        const screenBlock = activeScreenText?.trim()
+          ? truncateToCharLimit(
+              sanitizeScreenText(activeScreenText).trim(),
+              followupContextBudget(followupAnswers),
+            )
+          : undefined;
+
         prompt = buildInterviewUserPrompt(interviewTurn, {
           questionIndex,
           contextBlock: ctxBlock,
-          previousAnswers: sessionMessages
-            .filter((m) => m.role === "assistant")
-            .slice(-2)
-            .map((m) => m.content),
+          screenBlock,
+          previousAnswers: followupAnswers,
         });
+        console.log(
+          `[CTX] followupPreviousAnswers=${followupAnswers.length} inputChars=${prompt.length}`,
+        );
         // The user prompt's latest-question block must reflect the corrected
         // question too, so the model cannot confuse the raw transcript for the
         // current question.
@@ -658,23 +857,164 @@ export const Home: React.FC = () => {
         });
 
         if (followUpQuery) {
+          // ── Follow-up payload: minimal context only ──────────────────────
+          // The request carries exactly: the latest follow-up question (never
+          // truncated), the active screen/problem context, and AT MOST the
+          // latest relevant answer — never the whole accumulated conversation.
+          // Sending `sessionMessages.slice(-6)` verbatim (the previous
+          // behaviour) is what produced a ~12,335-token follow-up that exceeded
+          // Groq's input-token-per-minute limit.
+          const followupAnswers = buildTruncatedFollowupAnswers(sessionMessages);
+          const screenBudget = followupContextBudget(followupAnswers);
           prompt = followUpQuery;
+          // The bubble shows the question the user TYPED, never the assembled
+          // prompt it becomes two lines below.
+          userMessageDisplay = followUpQuery.trim();
+          prompt += contextBlock;
+          // The active screen problem travels with a TYPED follow-up too, in the
+          // SAME fenced data block the screenshot solve uses. Without it, "why did
+          // you choose this approach?" typed into the overlay had no idea what the
+          // approach was — the problem only existed as an image the follow-up
+          // deliberately does not send. Budgeted so problem + answer together stay
+          // under MAX_FOLLOWUP_CONTEXT_CHARS.
+          prompt = appendScreenText(
+            prompt,
+            truncateToCharLimit(activeScreenText ?? "", screenBudget),
+          );
+          historyContext = followupAnswers.map((content) => ({
+            role: "assistant" as const,
+            content,
+          }));
+          console.log(
+            `[CTX] followupPreviousAnswers=${followupAnswers.length} inputChars=${prompt.length}`,
+          );
         } else {
-          prompt =
-            settings.interviewType === "general"
-              ? settings.customInstructions ||
-                "Please answer the general question."
-              : buildPrompt(settings.interviewType, settings.language);
+          // ── The screenshot solve ──────────────────────────────────────────
+          // There is no category to select any more. The question itself
+          // decides what shape the answer takes, and `buildUniversalPrompt`
+          // says so to the model rather than guessing from keywords here.
+          //
+          // DEFAULT is the OCR-first path: recognise the screen LOCALLY and send
+          // the TEXT to Groq. `vision` keeps the original image path, used only
+          // by the explicit manual "Retry with image" action.
+          const ocrMode = screenshotOpts?.mode ?? "ocr";
+          // Both solve modes answer from a prompt that carries the screen text
+          // and the candidate context, so the bubble shows only a provenance
+          // label. The recognised text itself is already on screen in the
+          // existing "Text read from screen" block.
+          userMessageDisplay = `${SCREEN_SOURCE_PREFIX}Screenshot problem`;
+          if (ocrMode === "vision") {
+            prompt = buildUniversalPrompt(settings.language);
+            prompt += contextBlock;
+          } else {
+            isScreenshotOcr = true;
+            shotOcrStartRef.current = performance.now();
+            const overrideText = screenshotOpts?.textOverride;
+            // OCR runs in the MAIN process (Windows.Media.Ocr); this is only an
+            // await on the IPC round trip, so the renderer never blocks.
+            const ocr = await readScreenTextDetailed(attachedScreenshot ?? "");
+            const text = (overrideText ?? ocr.text).trim();
+            ocrChars = text.length;
+            ocrMs = ocr.ms;
+            const verdict = overrideText
+              ? {
+                  quality: "good" as const,
+                  reason: "user-edited",
+                  metrics: measureOcrText(text),
+                }
+              : assessOcrText(text);
+            setScreenshotOcr({
+              text,
+              quality: verdict.quality,
+              reason: verdict.reason,
+              imageBytes: ocr.imageBytes,
+              ocrMs: ocr.ms,
+            });
+            // Safe metadata only: counts and timings, never the recognised text.
+            console.log(
+              `[OCR] success=${ocr.ok && verdict.quality === "good"} imageBytes=${
+                ocr.imageBytes
+              } textChars=${text.length} lines=${verdict.metrics.lines} ocrMs=${
+                ocr.ms
+              }${ocr.code ? ` code=${ocr.code}` : ""}`,
+            );
+
+            if (!ocr.ok || verdict.quality === "poor" || text.length === 0) {
+              // POOR OCR: never call a vision model automatically. The message
+              // and the manual "Retry with image" action are rendered inside the
+              // existing answer area from the `screenshotOcr` slice (see the
+              // "Text read from screen" block), so nothing is sent anywhere.
+              outcomeRef.current = "empty";
+              setIsStreaming(false);
+              // A POOR read is never promoted to context, and a read of
+              // Ghostly's OWN interface never replaces a real problem: doing
+              // either would make every later follow-up answer about the wrong
+              // thing. The preview still shows the text, so the user can fix it
+              // with Edit, which DOES become context.
+              console.log(
+                `[OCR] poor — offered manual vision fallback (reason=${
+                  ocr.ok ? verdict.reason : ocr.code ?? "unknown"
+                })`,
+              );
+              return;
+            }
+
+            // GOOD read (or the user's edited text): this becomes the ACTIVE
+            // SCREEN PROBLEM CONTEXT. It REPLACES whatever was there — a new
+            // screenshot is a new problem, never a merge with the previous one —
+            // and it outlives the image, which this very run is about to finish
+            // spending. Every later follow-up is answered against it, with the
+            // image NOT attached.
+            setActiveScreenText(text);
+
+            // The OCR path walks the EXISTING configured text chain — Gemini
+            // → OpenRouter → Groq in the order `settings.providerOrder`
+            // already defines — instead of Groq alone. This narrows THIS run
+            // only: the attempts still come from the prebuilt `attempts` chain,
+            // so key pools, cooldown gating and the orchestrator's ordered
+            // fallback are all the existing machinery. The image is never
+            // attached here (see `imageAttached` below), so every provider in
+            // this chain receives OCR text only. The GLOBAL provider order in
+            // settings is deliberately NOT touched.
+            const ocrAttempts: AttemptSpec[] = attempts
+              .filter(
+                (a) =>
+                  a.provider === "gemini" ||
+                  a.provider === "openrouter" ||
+                  a.provider === "groq",
+              )
+              .map((a) => ({ ...a, maxTokens: OCR_ANSWER_MAX_TOKENS }));
+            if (ocrAttempts.length === 0) {
+              outcomeRef.current = "no-provider";
+              setIsStreaming(false);
+              setError(
+                "Screenshot OCR needs a Gemini, OpenRouter, or Groq API key. Add one in Settings, or press Retry with image.",
+              );
+              return;
+            }
+            activeAttempts = ocrAttempts;
+            // Reuse the EXISTING screenshot prompt and append the recognised
+            // text as fenced, untrusted DATA. No second prompt architecture.
+            prompt = appendScreenText(
+              buildUniversalPrompt(settings.language),
+              text,
+            );
+            prompt += contextBlock;
+          }
         }
-        prompt += contextBlock;
         userMessageContent = prompt;
         // Prompt assembled. The system message is built above this line and is
         // excluded from the user-side assembly time on purpose.
         recorderRef.current?.since("submit", "prompt_built");
-        historyContext = sessionMessages.slice(-6).map((msg) => ({
-          role: msg.role,
-          content: msg.content,
-        }));
+        // The screenshot solve keeps its existing raw history. A TYPED follow-up
+        // already set its capped history above (the latest relevant answer only,
+        // never the accumulated conversation) and must not be overwritten here.
+        if (!isFollowUp) {
+          historyContext = sessionMessages.slice(-6).map((msg) => ({
+            role: msg.role,
+            content: msg.content,
+          }));
+        }
       }
 
       try {
@@ -683,10 +1023,37 @@ export const Home: React.FC = () => {
         // for the question-echo signal only.
         let answeredQuestion = "";
 
-        // Use the newest ATTACHABLE screenshot. `screenshotList[screenshotList.length - 1]`
-        // was used before, so one payload-less entry at the end silently sent
-        // no image while the prompt still said "the problem in the screenshot".
-        const latestScreenshot = lastUsableScreenshot(screenshotList);
+        // Already resolved at the top of this run, so the prompt and the
+        // attached image are guaranteed to be the same picture.
+        const latestScreenshot = attachedScreenshot;
+
+        // ── Does THIS request carry an image? ──────────────────────────────────
+        //
+        // The one rule that keeps a stale screenshot out of an interview answer:
+        //
+        //   solveTarget === "screenshot" AND the explicit manual vision mode
+        //        → the image is attached.
+        //   everything else
+        //        → image=none.
+        //
+        // Note what is NOT a reason to attach: `screenshotPresent`, a non-empty
+        // screenshot list, or `screenshotBytes > 0`. Those describe the UI, not
+        // the request. The OCR path sends the recognised TEXT — that is the whole
+        // point of it — and an interview turn is answered from the transcript
+        // plus the active screen text.
+        // An interview/follow-up request never carries an image even when a
+        // screenshot is present. The image is attached ONLY on the explicit
+        // manual vision retry for a screenshot solve.
+        const imageAttached =
+          solveTarget === "screenshot" &&
+          (screenshotOpts?.mode ?? "ocr") === "vision";
+
+        // Metadata only. Safe to log: booleans and byte/character counts.
+        console.log(
+          `[SCREEN] solveTarget=${solveTarget} attachImage=${
+            imageAttached && !!latestScreenshot
+          } imageBytes=${latestScreenshot?.length ?? 0} ocrChars=${ocrChars} ocrMs=${ocrMs} inputChars=${prompt.length}`,
+        );
 
         if (isInterview && interviewTurn) {
           // A candidate correction can change the raw question (e.g.
@@ -713,16 +1080,21 @@ export const Home: React.FC = () => {
         // meaningful and makes a cross-provider overwrite structurally
         // impossible.
         console.log(
-          `[AI:${turnId}] orchestrating — chain=${attempts.map((a) => `${a.provider}(${a.model})`).join(" → ")}`,
+          `[AI:${turnId}] orchestrating — chain=${activeAttempts
+            .map((a) => `${a.provider}#${a.keyIndex}(${a.model})`)
+            .join(" → ")}`,
         );
         recorderRef.current?.since("submit", "orchestration_start");
         const run = await orchestrateAnswer({
-          attempts,
+          attempts: activeAttempts,
           prompt,
           system: systemInstruction,
           messages: historyContext,
-          base64Image: latestScreenshot,
-          mimeType: latestScreenshot ? "image/png" : undefined,
+          // The image reaches a provider ONLY on the explicit manual vision
+          // fallback ("Retry with image"). The OCR-first path and every
+          // interview turn send text alone — see `imageAttached` above.
+          base64Image: imageAttached ? latestScreenshot : undefined,
+          mimeType: imageAttached && latestScreenshot ? "image/png" : undefined,
           signal,
           log: (line) => console.log(line),
           // Only a completed, validated answer may win. This is the same
@@ -753,7 +1125,7 @@ export const Home: React.FC = () => {
                 : providerLabel(status.provider ?? "");
             const note =
               status.state === "hedging"
-                ? (status.note ?? `OpenRouter slow → ${who}`)
+                ? (status.note ?? `ANSWERING… · ${who}`)
                 : status.state === "completed"
                   ? `${who}`
                   : `ANSWERING… · ${who}`;
@@ -996,6 +1368,9 @@ export const Home: React.FC = () => {
           id: uuidv4(),
           role: "user",
           content: userMessageContent,
+          // Present only when `content` is the assembled prompt: the panel
+          // renders this instead, so no OCR/context text reaches the Answer.
+          displayText: userMessageDisplay,
           screenshotBase64: latestScreenshot,
         });
 
@@ -1010,13 +1385,18 @@ export const Home: React.FC = () => {
         const entry = {
           id: uuidv4(),
           timestamp: Date.now(),
-          screenshotBase64: latestScreenshot,
+          // The OCR path keeps the screenshot LOCAL: it is never persisted
+          // into history. (The in-memory chat bubble still shows it for the
+          // duration of the session.) The rule is the same one the request used,
+          // so what is stored and what was sent cannot disagree.
+          screenshotBase64: imageAttached ? latestScreenshot : undefined,
           solution: fullSolution,
           provider: run.provider ?? settings.activeProvider,
           model: run.resolvedModel ?? run.model,
-          interviewType: isInterview
-            ? "live-interview"
-            : settings.interviewType,
+          // The category is gone, so the history entry records the ONE mode —
+          // except for live turns, which stay labelled as such because they came
+          // from the interviewer rather than from a capture or a typed question.
+          interviewType: isInterview ? "live-interview" : "universal",
           language: settings.language,
         };
         addToHistory(entry);
@@ -1024,6 +1404,33 @@ export const Home: React.FC = () => {
         // This is the end of the cross-process metric — `Date.now()` at this
         // instant minus the main process' press instant.
         recorderRef.current?.since("submit", "committed");
+        // ── [SHOT-TIMING] ──────────────────────────────────────────────────
+        // Real measurements for the OCR screenshot path, not targets. `capture`
+        // is 0 here because the capture happens before this run's clock starts —
+        // it is measured by the existing turn recorder as press → submit. Every
+        // other stage is a renderer-local `performance.now()` delta from the
+        // instant OCR began, so the numbers are directly comparable.
+        if (isScreenshotOcr) {
+          const start = shotOcrStartRef.current;
+          const winner =
+            providersRef.current.find((p) => p.winner) ??
+            providersRef.current[0] ??
+            null;
+          const ocrMs = useStore.getState().screenshotOcr?.ocrMs ?? 0;
+          const validatedMs =
+            start != null ? Math.round(performance.now() - start) : 0;
+          setTimeout(() => {
+            const renderedMs =
+              start != null ? Math.round(performance.now() - start) : 0;
+            console.log(
+              `[SHOT-TIMING] capture=0 ocr=${ocrMs} request=${
+                winner?.httpMs ?? 0
+              } firstToken=${winner?.firstTextMs ?? 0} complete=${
+                winner?.completeMs ?? 0
+              } validated=${validatedMs} rendered=${renderedMs}`,
+            );
+          }, 0);
+        }
         // `rendered` is the next task after the commit, which is as close to
         // "painted" as a synchronous React 18 update can be measured without
         // instrumenting the reconciler. Stated in the report as an upper bound.
@@ -1113,8 +1520,9 @@ export const Home: React.FC = () => {
       screenshotList: string[],
       turn?: InterviewTurn,
       followUpQuery?: string,
-      origin: "auto" | "manual" | "retry" = "manual",
+      origin: "auto" | "manual" | "retry" | "screen" = "manual",
       candidateSignal?: { text: string; timestamp?: number },
+      screenshotOpts?: { mode?: "ocr" | "vision"; textOverride?: string },
     ) => {
       // Adopt the hotkey's recorder when there is one — the drain and the
       // force-endpoint are stages that happened before this call, and they would
@@ -1139,6 +1547,7 @@ export const Home: React.FC = () => {
           followUpQuery,
           origin,
           candidateSignal,
+          screenshotOpts,
         );
       } catch (err) {
         outcomeRef.current = "aborted";
@@ -1190,6 +1599,66 @@ export const Home: React.FC = () => {
     setInterviewOpen(false);
   }, [clearInterviewMessages]);
 
+  /**
+   * End Interview.
+   *
+   * The post-interview performance REPORT was removed with the rest of the
+   * report feature (View report / InterviewReportPanel / report IPC). What
+   * remains is exactly what the button says: stop the live capture session and
+   * close the panel — through the SAME controls the panel's Stop button and the
+   * Ctrl+I shortcut use (`lib/interviewControls`), so there is one capture
+   * lifecycle and no second stop path. The answered chat and the latency
+   * records stay where they are.
+   */
+  const endInterview = useCallback(() => {
+    getInterviewControls()?.stop();
+    closeInterview();
+  }, [closeInterview]);
+
+  /**
+   * Capture the WHOLE screen and use it as the question.
+   *
+   * This is the single screen gesture, and it is the same capture the Ctrl+H
+   * hotkey performs — one implementation, two triggers, so the button and the
+   * hotkey can never drift. It replaces the region workflow entirely: the user
+   * no longer selects a rectangle, because choosing which part of the screen
+   * holds the question is exactly the judgement the feature should make for
+   * them, and it went stale every time the interview moved to another window.
+   *
+   * The captured image is stored like any other screenshot, so the existing
+   * screenshot → solve path, the thumbnail strip and `lastUsableScreenshot` all
+   * keep working unchanged. Local OCR is applied later, when the prompt is
+   * built — not here — so nothing extra is paid for a capture that is never
+   * used.
+   */
+  const captureScreen = useCallback(async () => {
+    try {
+      const dataUrl = await window.ghostly.captureFullscreen();
+      if (!dataUrl) {
+        // The exact point a capture is LOST: the main process resolved without
+        // an image, so nothing is ever stored and Solve later reports an empty
+        // screenshot list. Metadata only — never pixels.
+        console.error("[SHOT] capture captured=false bytes=0 reason=empty-payload");
+        return;
+      }
+      addScreenshot(dataUrl);
+      // Safe metadata only: byte length, never the image itself.
+      const after = useStore.getState();
+      console.log(
+        `[SHOT] capture captured=true bytes=${dataUrl.length} statePresent=${
+          after.screenshots.length > 0
+        } armed=${after.screenshotArmed}`,
+      );
+    } catch (err) {
+      console.error("[SCREEN] full-screen capture failed:", err);
+      setError(
+        err instanceof Error
+          ? err.message
+          : "Could not capture the screen.",
+      );
+    }
+  }, [addScreenshot, setError]);
+
   /** Re-ask the last question (used by the empty / partial answer banner). */
   const retryAnswer = useCallback(() => {
     const lastTurn = lastInterviewTurnRef.current;
@@ -1206,6 +1675,48 @@ export const Home: React.FC = () => {
     },
     [followUpText, isStreaming, runAIStream],
   );
+
+  /**
+   * Resend the recognised (possibly edited) screen text through the SAME OCR →
+   * Groq text path. This is how a user fixes an OCR slip such as `==` → `=`
+   * without re-capturing. No image is ever attached here.
+   */
+  const resendOcrText = useCallback(
+    (text: string) => {
+      const edited = text.trim();
+      if (!edited || isStreaming) return;
+      setAnswerIssue(null);
+      setError(null);
+      runAIStream([], undefined, undefined, "manual", undefined, {
+        mode: "ocr",
+        textOverride: edited,
+      });
+    },
+    [runAIStream, isStreaming, setAnswerIssue, setError],
+  );
+
+  /**
+   * Explicit MANUAL vision fallback for a poor OCR read.
+   *
+   * This is the ONLY path in the OCR feature that attaches the image, and it
+   * runs only when the user presses it — never automatically. It uses the
+   * existing screenshot Solve path (`mode: "vision"`), so there is no second
+   * vision architecture.
+   */
+  const retryWithImage = useCallback(() => {
+    if (isStreaming) return;
+    const shots = screenshotsRef.current;
+    if (lastUsableScreenshot(shots) === undefined) {
+      setError("No screenshot is available to send.");
+      return;
+    }
+    setAnswerIssue(null);
+    setError(null);
+    setScreenshotOcr(null);
+    runAIStream(shots, undefined, undefined, "manual", undefined, {
+      mode: "vision",
+    });
+  }, [runAIStream, isStreaming, setAnswerIssue, setError, setScreenshotOcr]);
 
   // ── Auto-answer mode ────────────────────────────────────────────────────
   // Fires by itself once the interviewer finishes a clear question. Only
@@ -1279,6 +1790,14 @@ export const Home: React.FC = () => {
     setDetectedQuestion,
   ]);
 
+  // NOTE: the automatic screen watcher subscription (onLiveScreenProblem)
+  // was removed with "Auto-detect new question" — there is no automatic OCR,
+  // no polling timer and no auto-promotion of screen text into problems. The
+  // ONLY screen path left is the manual Capture Screen button / Ctrl+Shift+S
+  // → screenshot → Solve.
+
+
+
   /**
    * Start / Stop Interview shortcut (Ctrl+I).
    *
@@ -1349,6 +1868,15 @@ export const Home: React.FC = () => {
     // Ctrl+H — screenshot captured (multiple accumulate)
     const offScreenshot = window.ghostly.onScreenshot((b64: string) => {
       addScreenshot(b64);
+    });
+
+    // Ctrl+Shift+S — Capture Screen. The main-process global shortcut forwards
+    // ONE event here and this runs the SAME `captureScreen` callback the TopBar
+    // button calls → same `ghostly:capture-fullscreen` IPC → same
+    // `captureFullScreen()`. One implementation, two triggers; this handler is
+    // deliberately NOT a second capture path.
+    const offCaptureScreen = window.ghostly.onCaptureScreen(() => {
+      void captureScreen();
     });
 
     // Ctrl+Enter — solve. While the interview panel is open, prefer the live
@@ -1435,23 +1963,37 @@ export const Home: React.FC = () => {
         setInterviewCollapsed(true);
       }
 
-      // ── What this press answers ──────────────────────────────────────────
-      // A live question always wins. But when the panel is open and the gate
-      // found nothing answerable, the old code still took the live path and
-      // stopped at the WAIT notice — so a screenshot that was sitting in the
-      // strip was never sent to any provider and Solve looked broken. A
-      // screenshot IS a question: fall back to it rather than requiring an
-      // audio submission. See `lib/solveTarget.ts`.
+      // ── What this press answers ──────────────────────────────────────
+      // An EXPLICIT CAPTURE outranks the transcript (see `lib/solveTarget.ts`):
+      // Capture Screen / Ctrl+Shift+S sets an ARM on the screenshot, and the
+      // next Solve answers that image even though a live question exists. The
+      // arm — not a timestamp comparison — is the signal, because ASR commits an
+      // utterance only AFTER it has decoded, so the interviewer's last sentence
+      // routinely lands in the transcript after the user pressed Capture. A
+      // "which is newer" check then hands the run to a sentence that was already
+      // on screen when the picture was taken — the reported failure.
+      const armed = useStore.getState().screenshotArmed;
       const decision = decideSolveTarget({
         hasTurn: Boolean(turn),
         gateSaysAnswer: turn
           ? evaluateInterviewTurn(normalizeTurn(turn)).action === "answer"
           : false,
         usableScreenshots: usableScreenshots(shots).length,
+        screenshotArmed: armed,
       });
+      // Safe metadata only: target, presence, payload size — never pixels.
       console.log(
-        `[AI] solve target=${decision.target} (${decision.reason})`,
+        `[AI] solve target=${decision.target} (${decision.reason}) screenshotPresent=${
+          usableScreenshots(shots).length > 0
+        } screenshotBytes=${lastUsableScreenshot(shots)?.length ?? 0} armed=${armed}`,
       );
+      if (decision.target === "screenshot") {
+        // CONSUMED. Without this the arm would answer every later Solve with the
+        // same image, and a genuinely spoken question could never reach the AI
+        // again. Consuming it here is what makes the behaviour "explicit capture
+        // wins for THIS press" rather than "a capture permanently hijacks Solve".
+        useStore.getState().consumeScreenshotArm();
+      }
       await runAIStream(shots, decision.target === "interview" ? turn : undefined);
       // The turn's own timings are published by `runAIStream`; this only has to
       // stop the next hotkey press inheriting this one's instants.
@@ -1478,26 +2020,14 @@ export const Home: React.FC = () => {
       // the next question be answered as a follow-up to a conversation the user
       // just declared finished.
       clearSessionContext();
-      // The watched screen region goes with it: the region belonged to the
-      // problem that just been discarded, and leaving it watched would let the
-      // next session silently adopt a problem from the previous one's screen.
-      setLiveScreenReset((n) => n + 1);
+
     });
 
-    // Interview Type Shortcuts — Ctrl+Shift+1/2/3/4/5/6
-    const interviewTypes = [
-      "dsa",
-      "system_design",
-      "frontend",
-      "sql",
-      "behavioral",
-      "general",
-    ] as const;
-    const offInterviewType = interviewTypes.map((type) =>
-      window.ghostly.onInterviewType(type, () => {
-        updateSettings({ interviewType: type });
-      }),
-    );
+    // ── The category hotkeys are gone ─────────────────────────────────────
+    // Ctrl+Shift+1/2/3/4/5/6 used to change which CATEGORY prompt was used.
+    // There is only one mode now, so there is nothing for them to select, and
+    // leaving them bound would silently switch a setting that no longer affects
+    // anything.
 
     // Ctrl+I — Start / Stop Interview. The guard swallows key auto-repeat and
     // rapid double-fires of the same action.
@@ -1514,15 +2044,16 @@ export const Home: React.FC = () => {
 
     return () => {
       offScreenshot();
+      offCaptureScreen();
       offSolve();
       offStartOver();
-      offInterviewType.forEach((off) => off());
       offToggleInterview();
       offNextQuestion();
     };
   }, [
     runAIStream,
     addScreenshot,
+    captureScreen,
     clearSolution,
     setIsStreaming,
     updateSettings,
@@ -1538,6 +2069,7 @@ export const Home: React.FC = () => {
           onOpenSettings={() => setSettingsOpen(true)}
           settingsOpen={settingsOpen}
           onStartInterview={toggleInterview}
+          onCaptureScreen={captureScreen}
         />
       </div>
 
@@ -1593,8 +2125,7 @@ export const Home: React.FC = () => {
                   exit={{ opacity: 0 }}
                   className="px-3 py-2 rounded-xl pointer-events-auto flex-shrink-0"
                   style={{
-                    background: "rgba(255,255,255,0.04)",
-                    border: "1px solid rgba(255,255,255,0.08)",
+                    ...withSurface({}, gs("255 255 255", 0.04)),
                   }}
                 >
                   <div className="flex items-baseline justify-between gap-2">
@@ -1629,65 +2160,35 @@ export const Home: React.FC = () => {
             {/* Answer could not be produced (empty) or was cut short. */}
             <AnimatePresence>
               {/*
-                ── Session context chip ───────────────────────────────────────
-                Placed directly above the detected-question banner because that
-                is the only place the user reads the question they are about to
-                be asked, so it is also the only place where "what is this
-                referring to" is answerable at a glance.
-
-                The "Use as context" offer is only rendered when the Solve /
-                screenshot flow actually produced something, and it is a button:
-                nothing is ever attached without an explicit click.
+                The visible context chip (SessionContextChip) and the second
+                Capture Screen control with its "Auto-detect new question"
+                watcher UI (ScreenCapturePanel) were removed: exactly ONE
+                Capture Screen button lives in the TopBar, and screen capture
+                is MANUAL only. The internal session context still feeds
+                follow-up answers.
               */}
-              {(!settingsOpen || true) && (
-                <SessionContextChip
-                  key="session-context"
-                  context={sessionContext}
-                  now={ctxTick}
-                  onChange={setSessionContext}
-                  onClear={clearSessionContext}
-                  offerSolution={
-                    !sessionContext.activeProblem &&
-                    currentSolution?.trim()
-                      ? { label: "Use answer as context", source: "screenshot" as ProblemSource }
-                      : null
-                  }
-                  onUseSolution={(source) =>
-                    setSessionContext(
-                      startProblem(
-                        sessionContext,
-                        currentSolution.trim(),
-                        Date.now(),
-                        source,
-                      ),
-                    )
-                  }
-                />
-              )}
 
               {/*
-                Live Screen. It only WATCHES and PROPOSES: the panel offers a
-                problem it read off the screen, and installing it needs the
-                click below, exactly like "Use answer as context" above.
-                `isStreaming` is a proxy for "transcription is live" — the real
-                decode runs in a worker the renderer cannot see — and the
-                main-process RAM guard is what actually protects the machine.
+                End Interview — stop capture and close the panel, through the
+                same controls the panel's Stop button uses. The report feature
+                (View report / InterviewReportPanel / report IPC) was removed;
+                the answered chat and the latency records stay.
               */}
-              <LiveScreenPanel
-                key="live-screen"
-                asrBusy={isStreaming}
-                resetSignal={liveScreenReset}
-                onUseProblem={(text) =>
-                  setSessionContext(
-                    startProblem(
-                      sessionContext,
-                      text,
-                      Date.now(),
-                      "live-screen",
-                    ),
-                  )
-                }
-              />
+              <div
+                className="px-2 py-1.5 rounded-lg pointer-events-auto flex items-center gap-2"
+                style={{ ...gs("120 140 200", 0.08, "140 160 220", 0.18) }}
+                onMouseEnter={() => window.ghostly.enableMouse()}
+                onMouseLeave={() => window.ghostly.disableMouse()}
+              >
+                <button
+                  type="button"
+                  onClick={endInterview}
+                  className="px-2 py-0.5 rounded bg-white/10 hover:bg-white/20 text-[9px] font-mono text-white/80"
+                  title="Stop the live interview and close its panel."
+                >
+                  End Interview
+                </button>
+              </div>
 
               {answerIssue && (
                 <motion.div
@@ -1697,8 +2198,7 @@ export const Home: React.FC = () => {
                   exit={{ opacity: 0 }}
                   className="px-3 py-2 rounded-xl pointer-events-auto flex-shrink-0 flex items-center justify-between gap-3"
                   style={{
-                    background: "rgba(255, 90, 90, 0.08)",
-                    border: "1px solid rgba(255, 90, 90, 0.20)",
+                    ...withSurface({}, gs("255 90 90", 0.08, "255 90 90", 0.2)),
                   }}
                 >
                   <div className="min-w-0">
@@ -1745,8 +2245,7 @@ export const Home: React.FC = () => {
                   exit={{ opacity: 0 }}
                   className="p-3 rounded-xl pointer-events-auto flex-shrink-0"
                   style={{
-                    background: "rgba(255, 60, 60, 0.1)",
-                    border: "1px solid rgba(255, 60, 60, 0.15)",
+                    ...withSurface({}, gs("255 60 60", 0.1, "255 60 60", 0.15)),
                   }}
                 >
                   <p className="text-[11px] text-red-300/80 font-mono">
@@ -1765,8 +2264,7 @@ export const Home: React.FC = () => {
                   exit={{ opacity: 0 }}
                   className="px-3 py-2 rounded-xl pointer-events-auto flex-shrink-0 flex items-baseline gap-2"
                   style={{
-                    background: "rgba(255, 190, 60, 0.08)",
-                    border: "1px solid rgba(255, 190, 60, 0.18)",
+                    ...withSurface({}, gs("255 190 60", 0.08, "255 190 60", 0.18)),
                   }}
                 >
                   <span className="text-[10px] tracking-wider text-amber-200/80 font-mono">
@@ -1790,8 +2288,7 @@ export const Home: React.FC = () => {
                   className="pointer-events-auto rounded-xl p-3 flex-shrink-0"
                   style={{
                     cursor: "default",
-                    background: "rgba(20, 20, 23, 0.90)",
-                    border: "1px solid rgba(255,255,255,0.06)",
+                    ...withSurface({}, gs("20 20 23", 0.9, "255 255 255", 0.06)),
                   }}
                   onMouseEnter={() => window.ghostly.enableMouse()}
                   onMouseLeave={() => window.ghostly.disableMouse()}
@@ -1843,22 +2340,91 @@ export const Home: React.FC = () => {
                 </motion.div>
               )}
 
-            {/* Chat Container */}
-            {(sessionMessages.length > 0 || isStreaming) && (
+            {/* Chat Container. Also shown when OCR ran but produced no answer
+                path, so the "Text read from screen" preview (and the poor-OCR
+                message) have somewhere to appear. */}
+            {(sessionMessages.length > 0 || isStreaming || screenshotOcr) && (
               <div
                 className="pointer-events-auto rounded-2xl overflow-hidden flex flex-col flex-1"
                 style={{
                   cursor: "default",
-                  background: "rgba(20, 20, 23, 0.65)",
+                  // The answer panel. Its background scales with the user's
+                  // opacity; the text inside it does not — which is what lets
+                  // the interview stay visible behind Ghostly while the answer
+                  // itself stays readable.
+                  ...withSurface({}, gs("20 20 23", 0.65)),
                   backdropFilter: "blur(24px)",
                   WebkitBackdropFilter: "blur(24px)",
-                  border: "1px solid rgba(255,255,255,0.08)",
                 }}
                 onMouseEnter={() => window.ghostly.enableMouse()}
                 onMouseLeave={() => window.ghostly.disableMouse()}
               >
                 {/* Scrollable messages area */}
                 <div className="flex-1 overflow-y-auto p-4 space-y-4">
+                  {/* ── Text read from screen ──────────────────────────────
+                      The OCR result for the last screenshot solve. Collapsed by
+                      default, editable, and resendable through the SAME OCR →
+                      Groq text path. Deliberately inside the EXISTING answer
+                      area — no new panel, page, card system or component. */}
+                  {screenshotOcr && !isStreaming && (
+                    <div className="rounded-xl border border-white/[0.08] bg-black/20">
+                      <button
+                        type="button"
+                        onClick={() => setOcrOpen((v) => !v)}
+                        className="w-full flex items-center justify-between px-3 py-2 text-left"
+                      >
+                        <span className="text-[10px] uppercase tracking-wider text-white/50">
+                          {ocrOpen ? "▾" : "▸"} Text read from screen
+                        </span>
+                        <span className="text-[10px] text-white/30 font-mono">
+                          {screenshotOcr.quality === "poor"
+                            ? "unclear"
+                            : `${screenshotOcr.text.length} chars`}
+                        </span>
+                      </button>
+                      {screenshotOcr.quality === "poor" && (
+                        <div className="px-3 pb-2 flex items-center justify-between gap-3">
+                          <span className="text-[10px] text-amber-200/80">
+                            Couldn't read the text clearly.
+                          </span>
+                          <button
+                            type="button"
+                            onClick={retryWithImage}
+                            className="flex-none px-2 py-0.5 rounded bg-white/10 hover:bg-white/20 text-[10px] font-mono text-white/80"
+                          >
+                            Retry with image
+                          </button>
+                        </div>
+                      )}
+                      {ocrOpen && screenshotOcr.quality === "good" && (
+                        <div className="px-3 pb-3 space-y-2">
+                          <textarea
+                            value={ocrDraft}
+                            onChange={(e) => {
+                              // Keep BOTH the local draft and the store in sync,
+                              // so the preview is the single editable source of
+                              // truth for what Resend will send.
+                              setOcrDraft(e.target.value);
+                              updateScreenshotOcrText(e.target.value);
+                            }}
+                            rows={6}
+                            className="w-full bg-black/40 border border-white/[0.1] rounded-lg p-2 text-[11px] font-mono text-white/85 focus:outline-none focus:border-white/20"
+                            placeholder="No text recognised."
+                          />
+                          <div className="flex justify-end">
+                            <button
+                              type="button"
+                              onClick={() => resendOcrText(ocrDraft)}
+                              disabled={isStreaming || !ocrDraft.trim()}
+                              className="px-2.5 py-1 rounded-lg bg-white/10 hover:bg-white/20 disabled:opacity-30 text-[10px] font-mono text-white/80"
+                            >
+                              Resend
+                            </button>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  )}
                   {sessionMessages.map((msg, idx) => (
                     <div
                       key={msg.id}
@@ -1877,7 +2443,13 @@ export const Home: React.FC = () => {
                             "Here is a live interview transcript",
                           )
                             ? "🎙️ Live Transcript Submitted"
-                            : msg.content}
+                            : // The rendered text is the DISPLAY label when one
+                              // exists. `content` is the request prompt for a
+                              // screenshot / follow-up turn and stays internal:
+                              // rendering it is what used to put the OCR text,
+                              // the `<<<SCREEN_TEXT_START>>>` fence and the
+                              // candidate context inside the Answer.
+                              (msg.displayText ?? msg.content)}
                         </div>
                       ) : (
                         <div className="w-full">

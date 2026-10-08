@@ -24,7 +24,7 @@ export class OpenAIProvider implements AIProvider {
     // Keep only chat-capable models (drop embeddings, tts, whisper, image, etc.)
     return (data?.data ?? [])
       .map((m: any) => m.id as string)
-      .filter((id) => /^(gpt-|chatgpt|o[1-9])/.test(id))
+      .filter((id: string) => /^(gpt-|chatgpt|o[1-9])/.test(id))
       .sort();
   }
 

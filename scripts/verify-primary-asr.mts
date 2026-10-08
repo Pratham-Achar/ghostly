@@ -82,15 +82,16 @@ function checkFalse(name: string, actual: unknown) {
 console.log("\n── Engine selection is migration-safe ─────────────────────");
 // ═══════════════════════════════════════════════════════════════════════════
 
-check("1 the code default is Moonshine", DEFAULT_PRIMARY_ASR, "moonshine");
-check("2 an absent setting resolves to Moonshine", normalizePrimaryAsr(undefined), "moonshine");
-check("3 null resolves to Moonshine", normalizePrimaryAsr(null), "moonshine");
-check("4 an empty string resolves to Moonshine", normalizePrimaryAsr(""), "moonshine");
-check("5 a hand-edited garbage value resolves to Moonshine", normalizePrimaryAsr("whisper-large-v3"), "moonshine");
-check("6 an object resolves to Moonshine", normalizePrimaryAsr({}), "moonshine");
-check("7 a number resolves to Moonshine", normalizePrimaryAsr(7), "moonshine");
+check("1 the code default is Parakeet", DEFAULT_PRIMARY_ASR, "parakeet");
+check("2 an absent setting resolves to Parakeet", normalizePrimaryAsr(undefined), "parakeet");
+check("3 null resolves to Parakeet", normalizePrimaryAsr(null), "parakeet");
+check("4 an empty string resolves to Parakeet", normalizePrimaryAsr(""), "parakeet");
+check("5 a hand-edited garbage value resolves to Parakeet", normalizePrimaryAsr("whisper-large-v3"), "parakeet");
+check("6 an object resolves to Parakeet", normalizePrimaryAsr({}), "parakeet");
+check("7 a number resolves to Parakeet", normalizePrimaryAsr(7), "parakeet");
 check("8 parakeet is accepted verbatim", normalizePrimaryAsr("parakeet"), "parakeet");
-check("9 the value is case-sensitive on purpose", normalizePrimaryAsr("Parakeet"), "moonshine");
+check("9 an EXPLICIT moonshine is preserved", normalizePrimaryAsr("moonshine"), "moonshine");
+check("9b the value is case-sensitive on purpose", normalizePrimaryAsr("Moonshine"), "parakeet");
 
 // ═══════════════════════════════════════════════════════════════════════════
 console.log("\n── Fallback is Moonshine, and never the cloud ──────────────");
@@ -418,19 +419,29 @@ console.log("\n── The setting must actually reach the main process ───
   // The original bug, in its original shape: a control that updates renderer
   // state the main process never reads.
   checkTrue("78 the main process reads primaryAsr from electron-store",
-    /store\.get\("settings"\)/.test(ipc) && /primaryAsr\s*===\s*"parakeet"/.test(ipc));
+    /store\.get\("settings"\)/.test(ipc) && /primaryAsr\s*!==\s*"moonshine"/.test(ipc));
   checkTrue("79 the main process never reads primaryAsr from a renderer argument",
     !/event[^\n]*primaryAsr/.test(ipc));
 
-  checkTrue("80 primaryAsr is not a dev-only setting",
-    !/asrCompareParakeet[\s\S]{0,80}=== true[\s\S]{0,400}primaryAsr === "parakeet"[\s\S]{0,80}app\.isPackaged/.test(ipc));
+  {
+    // The primary branch must be decided BEFORE any packaged-only gate: an
+    // explicit "moonshine" is the only thing that turns the Parakeet host off,
+    // and `app.isPackaged` must not be able to disable the default engine.
+    const enabledBody = ipc.slice(
+      ipc.indexOf("isEnabled: () =>"),
+      ipc.indexOf("isPrimary:"),
+    );
+    const primaryReturn = enabledBody.indexOf('primaryAsr !== "moonshine") return true;');
+    checkTrue("80 primaryAsr as primary is decided before any packaged-only gate",
+      primaryReturn > -1 && primaryReturn < enabledBody.indexOf("app.isPackaged"));
+  }
   checkTrue("81 the comparison column is still hard-disabled when packaged",
     /!app\.isPackaged[\s\S]{0,200}asrCompareParakeet === true/.test(ipc));
 
-  checkTrue("82 the code default is Moonshine",
+  checkTrue("82 the store default is derived from the code default",
     /primaryAsr: DEFAULT_PRIMARY_ASR/.test(store));
-  checkTrue("83 the store's DEFAULT_PRIMARY_ASR is Moonshine",
-    /DEFAULT_PRIMARY_ASR: PrimaryAsr = "moonshine"/.test(
+  checkTrue("83 the code default constant is Parakeet",
+    /DEFAULT_PRIMARY_ASR: PrimaryAsr = "parakeet"/.test(
       await readFile("src/lib/primaryAsr.ts", "utf8"),
     ));
 

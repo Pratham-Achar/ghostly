@@ -1,12 +1,24 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { useStore } from "../store/useStore";
 import { getProvider, type ProviderName } from "../lib/ai";
-import { INTERVIEW_PROVIDER_ORDER } from "../lib/providerDiagnostics";
+import {
+  INTERVIEW_PROVIDER_ORDER,
+  ALL_INTERVIEW_PROVIDERS,
+} from "../lib/providerDiagnostics";
+import {
+  describeKeySlot,
+  keyPool,
+  summarizeKeys,
+  KEY_SLOTS_PER_PROVIDER,
+} from "../lib/keyHealth";
+import { useKeyHealth } from "../lib/useKeyHealth";
 import {
   findShortcutConflicts,
   INTERVIEW_SHORTCUTS,
 } from "../lib/interviewShortcuts";
 import { normalizePrimaryAsr, type PrimaryAsr } from "../lib/primaryAsr";
+import { DEFAULT_ANSWER_INSTRUCTIONS } from "../lib/prompts";
+import { extractTextFromFile, MAX_RESUME_CHARS } from "../lib/fileText";
 import {
   MODEL_INTEGRITY_NOTE,
   canRetryDownload,
@@ -25,37 +37,25 @@ import {
 } from "../lib/parakeetModelFacts";
 import { describeParakeetPreloadCost } from "../lib/parakeetModelFacts";
 
-/**
- * Interview types split into two top-level groups. The existing types are never
- * removed: everything that is not a DSA type lives under "General", and the
- * existing DSA mode lives under "DSA".
+/*
+ * ── The question-category selector is GONE ──────────────────────────────────
+ *
+ * `INTERVIEW_TYPE_GROUPS` and `INTERVIEW_TYPES` used to live here, backing a
+ * dropdown that asked the candidate to classify their own interview before it
+ * started. There is nothing to select any more: Ghostly has one universal mode
+ * and the question itself decides the shape of the answer (see
+ * `buildUniversalPrompt`, which describes the shapes to the model rather than
+ * selecting one from a list).
+ *
+ * A real interview mixes a coding question, a project question and a
+ * system-design question in the same ten minutes, so a single pre-selected
+ * category was wrong for most of it.
+ *
+ * The answer style the old "General" mode carried is NOT lost — it moved to the
+ * one "Answer Instructions" field further down this panel, and a store written by
+ * the old build is migrated by `App.tsx`.
  */
-export const INTERVIEW_TYPE_GROUPS: readonly {
-  label: string;
-  types: readonly { id: string; label: string }[];
-}[] = [
-  {
-    label: "General",
-    types: [
-      { id: "general", label: "General" },
-      { id: "system_design", label: "System Design" },
-      { id: "frontend", label: "Frontend" },
-      { id: "sql", label: "SQL" },
-      { id: "behavioral", label: "Behavioral" },
-    ],
-  },
-  {
-    label: "DSA",
-    types: [
-      { id: "dsa", label: "DSA / Algorithms" },
-    ],
-  },
-];
 
-/** Flat, backwards-compatible list of every existing interview type. */
-export const INTERVIEW_TYPES: readonly { id: string; label: string }[] = [
-  ...INTERVIEW_TYPE_GROUPS.flatMap((g) => g.types),
-];
 
 const LANGUAGES = [
   { id: "python", label: "Python" },
@@ -92,11 +92,9 @@ const PROVIDERS = [
     label: "OpenRouter (primary gateway)",
     docsUrl: "https://openrouter.ai/keys",
   },
-  {
-    id: "nvidia" as ProviderName,
-    label: "NVIDIA (direct NIM)",
-    docsUrl: "https://build.nvidia.com",
-  },
+  // Local Qwen and NVIDIA are gone entirely — no provider entry, no model
+  // picker, no key field, no status. Parakeet ASR (Speech recognition below) is
+  // a completely separate system and was not touched.
 ];
 
 /**
@@ -136,7 +134,9 @@ const SHORTCUTS = [
   { label: "Next Question", keys: ["Ctrl", "N"] },
   { label: "Ask AI", keys: ["Ctrl", "↵"] },
   { label: "Start Over", keys: ["Ctrl", "G"] },
-  { label: "Screenshot", keys: ["Ctrl", "H"] },
+  // The ONE documented capture shortcut. It triggers the same Capture Screen
+  // path as the button (see `electron/hotkeys.ts`).
+  { label: "Capture Screen", keys: ["Ctrl", "Shift", "S"] },
   { label: "Show / Hide", keys: ["Ctrl", "B"] },
   { label: "Move Up", keys: ["Ctrl", "↑"] },
   { label: "Move Left", keys: ["Ctrl", "←"] },
@@ -153,7 +153,48 @@ interface SettingsPanelProps {
 
 export const SettingsPanel: React.FC<SettingsPanelProps> = ({ onClose }) => {
   const { settings, updateSettings, setApiKey } = useStore();
+  /**
+   * Live key-pool health for the Key Pool section below.
+   *
+   * The SAME hook the interview path uses (see Home.tsx), so the panel and the
+   * run read one source of truth for which slot is healthy / cooling / failed
+   * and can never disagree. Previously this call was missing while the section
+   * below still read `keyHealth`, which crashed the panel on render.
+   */
+  const keyHealth = useKeyHealth();
   const [showKey, setShowKey] = useState(false);
+
+  // ── Resume upload (moved here from the removed overlay box) ───────────
+  // The visible "Interview Context" panel is gone; its useful half — attaching
+  // a resume — lives here, using the SAME `extractTextFromFile` parser.
+  const resumeFileRef = useRef<HTMLInputElement>(null);
+  const [resumeReading, setResumeReading] = useState(false);
+  const [resumeNote, setResumeNote] = useState<string | null>(null);
+  const handleResumeFile = async (file: File) => {
+    setResumeReading(true);
+    setResumeNote(null);
+    try {
+      const text = (await extractTextFromFile(file)).trim();
+      if (!text) {
+        setResumeNote(
+          `No text found in ${file.name} (is it a scanned image?).`,
+        );
+        return;
+      }
+      updateSettings({ resumeText: text.slice(0, MAX_RESUME_CHARS) });
+      setResumeNote(
+        text.length > MAX_RESUME_CHARS
+          ? `Loaded ${file.name} (trimmed to ${MAX_RESUME_CHARS} characters).`
+          : `Loaded ${file.name}.`,
+      );
+    } catch (err) {
+      setResumeNote(
+        err instanceof Error ? err.message : `Could not read ${file.name}.`,
+      );
+    } finally {
+      setResumeReading(false);
+    }
+  };
 
   // Models for the active provider. Starts from the curated fallback list and
   // is upgraded to the provider's live list as soon as we have an API key.
@@ -173,19 +214,50 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({ onClose }) => {
     .map((p) => PROVIDERS.find((x) => x.id === p)?.label ?? p);
 
   // ── Interview answer chain (ordered, independently toggleable) ──────────
-  // OpenRouter is the primary gateway; Groq / NVIDIA / Gemini are independent
-  // secondaries that Ghostly calls directly. Toggle a provider off to drop it
-  // from the chain; drag order is not needed because OpenRouter is always
-  // first when it is enabled.
+  // The DEFAULT chain is Gemini → OpenRouter. Groq and NVIDIA are optional:
+  // fully integrated, shown here, but not enabled unless the user turns them on
+  // — because every member of the chain is waited on, so a broken member costs
+  // latency on every question.
+  //
+  // Ordering: adding the primary gateway back puts it immediately after the
+  // current primary, and any other provider is appended at the end, so a chain
+  // can never silently reorder itself out from under the user.
   const chainOrder = settings.providerOrder ?? [];
   const isInChain = (p: ProviderName) => chainOrder.includes(p);
-  const hasKey = (p: ProviderName) => Boolean((settings.apiKeys[p] ?? "").trim());
+  const hasKey = (p: ProviderName) =>
+    keyPool(settings.apiKeys, settings.apiKeyPool, p).some((k) => k.trim());
+  /**
+   * Write one slot of one provider's pool.
+   *
+   * Slot 0 is the long-standing `apiKeys` map; slots 1..n go to `apiKeyPool`.
+   * Splitting them keeps every existing reader of `apiKeys` correct without
+   * having to teach each one about pools, and `keyPool()` re-joins them in one
+   * place so the halves can never disagree.
+   *
+   * Editing a slot CLEARS its health record: the credential just changed, so any
+   * cooldown recorded against the old value no longer describes anything.
+   */
+  const setPoolKey = (p: ProviderName, index: number, value: string) => {
+    if (index === 0) {
+      setApiKey(p, value);
+    } else {
+      const current = settings.apiKeyPool?.[p] ?? [];
+      const next = [...current];
+      while (next.length < KEY_SLOTS_PER_PROVIDER - 1) next.push("");
+      next[index - 1] = value;
+      updateSettings({
+        apiKeyPool: { ...settings.apiKeyPool, [p]: next },
+      });
+    }
+    keyHealth.clear(p, index);
+  };
   const toggleInChain = (p: ProviderName) => {
     const without = chainOrder.filter((x) => x !== p);
     const withIt = isInChain(p)
       ? without
-      : p === "openrouter"
-        ? [p, ...without]
+      : INTERVIEW_PROVIDER_ORDER.includes(p)
+        ? // A default-chain provider always sits in the documented position.
+          [...INTERVIEW_PROVIDER_ORDER.filter((x) => without.includes(x)), p]
         : [...without, p];
     updateSettings({ providerOrder: withIt });
   };
@@ -220,7 +292,9 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({ onClose }) => {
 
   useEffect(() => {
     let cancelled = false;
-    for (const p of INTERVIEW_PROVIDER_ORDER) {
+    // Every provider the interview path can use, including the optional ones —
+// their model lists must stay fetchable or they could not be turned on.
+    for (const p of ALL_INTERVIEW_PROVIDERS) {
       const key = (settings.apiKeys[p] ?? "").trim();
       if (!key) continue;
       const provider = getProvider(p);
@@ -646,6 +720,98 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({ onClose }) => {
           </a>
         </Section>
 
+        {/*
+          ── Key pool (failover credentials) ──────────────────────────────
+          Three masked slots per provider for the providers that are actually
+          in the interview chain. A second key means one refused credential
+          costs a single immediate hop instead of a fallback to another
+          provider — which is the difference between an interview that keeps
+          answering and one that goes silent for a few seconds per question.
+
+          Two properties are enforced here rather than merely intended:
+          • every field is `type="password"` by default, and the reveal toggle
+            is per-section and off on mount;
+          • the status line next to each box is one of five fixed words, derived
+            from `describeKeyStatus`, which by construction cannot echo any part
+            of the key.
+        */}
+        <Section label="Key Pool (failover)">
+          <div className="space-y-2">
+            {INTERVIEW_PROVIDER_ORDER.map((p) => {
+              const keys = keyPool(
+                settings.apiKeys,
+                settings.apiKeyPool,
+                p,
+              );
+              const label =
+                PROVIDERS.find((x) => x.id === p)?.label ?? p;
+              const tally = summarizeKeys(
+                keyHealth.state,
+                p,
+                keys,
+                Date.now(),
+              );
+              return (
+                <div key={p} className="space-y-1">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-[10px] font-mono text-white/60">
+                      {label}
+                    </span>
+                    <span className="text-[9px] font-mono text-white/35">
+                      {tally.configured}/{tally.total} configured
+                      {tally.cooldown > 0 ? ` · ${tally.cooldown} cooling` : ""}
+                      {tally.failed > 0 ? ` · ${tally.failed} failed` : ""}
+                    </span>
+                  </div>
+                  {keys.map((key, index) => (
+                    <div
+                      key={index}
+                      className="flex items-center gap-2"
+                    >
+                      <span className="w-[52px] flex-none text-[9px] font-mono text-white/35">
+                        {describeKeySlot(index)}
+                      </span>
+                      <input
+                        type="password"
+                        value={key}
+                        onChange={(e) =>
+                          setPoolKey(p, index, e.target.value)
+                        }
+                        placeholder={
+                          index === 0
+                            ? `Enter ${label} key`
+                            : `${label} key ${index + 1} (optional)`
+                        }
+                        aria-label={`${label} ${describeKeySlot(index)}`}
+                        data-ghostly={`key-${p}-${index}`}
+                        className="settings-input flex-1"
+                      />
+                      <span
+                        data-ghostly={`key-status-${p}-${index}`}
+                        className={`w-[86px] flex-none text-right text-[9px] font-mono ${
+                          keyHealth.statusOf(p, index, key) === "healthy"
+                            ? "text-emerald-300/70"
+                            : keyHealth.statusOf(p, index, key) ===
+                                "not-configured"
+                              ? "text-white/25"
+                              : "text-amber-300/70"
+                        }`}
+                      >
+                        {keyHealth.statusOf(p, index, key)}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              );
+            })}
+          </div>
+          <p className="text-[9px] font-mono text-white/30 mt-1.5 leading-snug">
+            Extra keys are failover credentials you have authorized Ghostly to
+            use. A key that is refused is skipped for a short cooldown and the
+            next healthy one is used; a key that works is never rotated away.
+          </p>
+        </Section>
+
         {/* Model */}
         <Section label="Model">
           <select
@@ -675,7 +841,7 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({ onClose }) => {
             Live interview answers try:{" "}
             {failoverChain.length > 0
               ? failoverChain.join(" → ")
-              : "add an API key for OpenRouter"}
+              : `add an API key for ${PROVIDERS.find((x) => x.id === INTERVIEW_PROVIDER_ORDER[0])?.label ?? INTERVIEW_PROVIDER_ORDER[0]}`}
             . An error, timeout or empty reply falls back to the next one — but
             never once answer text is already on screen.
           </p>
@@ -684,10 +850,13 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({ onClose }) => {
         {/* Interview Answer Chain — which providers are eligible, in order */}
         <Section label="Interview Answer Chain">
           <div className="flex flex-col gap-1">
-            {INTERVIEW_PROVIDER_ORDER.map((p) => {
+            {/* Every provider is listed, INCLUDING the optional ones — they must remain
+              reachable, otherwise "optional" would mean "removed". */}
+            {ALL_INTERVIEW_PROVIDERS.map((p) => {
               const on = isInChain(p);
               const keyed = hasKey(p);
-              const isPrimary = p === "openrouter";
+              const isPrimary = p === INTERVIEW_PROVIDER_ORDER[0];
+              const isOptional = !INTERVIEW_PROVIDER_ORDER.includes(p);
               return (
                 <button
                   key={p}
@@ -715,6 +884,11 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({ onClose }) => {
                         primary
                       </span>
                     )}
+                    {isOptional && (
+                      <span className="text-[8px] text-white/30 flex-none">
+                        optional
+                      </span>
+                    )}
                   </span>
                   <span className="flex-none text-[9px] text-white/35">
                     {!keyed
@@ -734,9 +908,9 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({ onClose }) => {
               back to its curated defaults when there is no key or the request
               fails — no model name is ever hard-coded as if it were the only
               option. */}
-          {INTERVIEW_PROVIDER_ORDER.filter(hasKey).length > 0 && (
+          {ALL_INTERVIEW_PROVIDERS.filter(hasKey).length > 0 && (
             <div className="mt-2 space-y-1.5">
-              {INTERVIEW_PROVIDER_ORDER.filter((p) => hasKey(p)).map((p) => {
+              {ALL_INTERVIEW_PROVIDERS.filter((p) => hasKey(p)).map((p) => {
                 const live = chainModels[p];
                 const curated = getProvider(p)?.listModels() ?? [];
                 const options =
@@ -792,55 +966,92 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({ onClose }) => {
           </p>
         </Section>
 
-        {/* Interview Type — top-level General / DSA groups (existing types unchanged). */}
-        <Section label="Interview Type">
-          <select
-            value={settings.interviewType}
-            onChange={(e) =>
-              updateSettings({ interviewType: e.target.value as any })
-            }
-            className="settings-select"
-          >
-            {INTERVIEW_TYPE_GROUPS.map((group) => (
-              <optgroup key={group.label} label={group.label}>
-                {group.types.map((t) => (
-                  <option key={t.id} value={t.id}>
-                    {t.label}
-                  </option>
-                ))}
-              </optgroup>
-            ))}
-          </select>
-        </Section>
+        {/*
+          ── Answer Context ──────────────────────────────────────────
 
-        {/* Live Answering */}
-        <Section label="Live Answering">
-          <button
-            type="button"
-            role="switch"
-            aria-checked={!!settings.autoAnswer}
-            onClick={() => updateSettings({ autoAnswer: !settings.autoAnswer })}
-            className="w-full flex items-center justify-between gap-3 bg-white/[0.06] hover:bg-white/[0.12] border border-white/[0.12] rounded-lg px-3 py-2.5 text-[11px] font-mono text-white/80 outline-none cursor-pointer transition-colors"
-          >
-            <span className="truncate text-left">
-              Auto-answer when a question ends
-            </span>
-            <span
-              className={`flex-none w-8 h-4 rounded-full p-0.5 transition-colors ${
-                settings.autoAnswer ? "bg-accent/70" : "bg-white/[0.12]"
-              }`}
+          Everything here shapes an answer. The visible "Interview Context"
+          overlay box (and its context chip) were removed with the user's
+          cleanup — the settings themselves remain because the answer pipeline
+          still reads them: the resume and the answer instructions are prompt
+          inputs, not UI.
+        */}
+        <Section label="Answer Context">
+          <label className="text-[9px] text-white/40 block mb-0.5">Resume</label>
+          <div className="flex items-center gap-2 mb-1">
+            <button
+              type="button"
+              onClick={() => resumeFileRef.current?.click()}
+              disabled={resumeReading}
+              className="rounded-lg bg-white/[0.06] hover:bg-white/[0.12] border border-white/[0.1] px-2.5 py-1 text-[10px] text-white/70 hover:text-white/90 disabled:opacity-40 transition-colors"
             >
-              <span
-                className={`block w-3 h-3 rounded-full bg-white transition-transform ${
-                  settings.autoAnswer ? "translate-x-4" : "translate-x-0"
-                }`}
-              />
+              {resumeReading ? "Reading…" : "⬆ Upload"}
+            </button>
+            <span className="text-[9px] text-white/25 truncate">
+              PDF, DOCX, .txt, .md — or paste below
             </span>
-          </button>
-          <p className="text-[9px] text-white/30 mt-1">
-            Answers fire on their own the moment the interviewer stops talking on
-            a clear question. Incomplete or conversational speech is still
-            ignored (WAIT). Ctrl+Enter / Ask Copilot keep working either way.
+            <input
+              ref={resumeFileRef}
+              type="file"
+              accept=".txt,.md,.markdown,.rst,.json,.csv,.rtf,.tex,.yml,.yaml,.html,.pdf,.doc,.docx"
+              className="hidden"
+              onChange={(e) => {
+                const file = e.target.files?.[0];
+                if (file) void handleResumeFile(file);
+                // Reset so re-selecting the same file fires onChange again.
+                e.target.value = "";
+              }}
+            />
+          </div>
+          {resumeNote && (
+            <p className="text-[9px] text-white/35 mb-1">{resumeNote}</p>
+          )}
+          <textarea
+            value={settings.resumeText ?? ""}
+            onChange={(e) => updateSettings({ resumeText: e.target.value })}
+            placeholder="Paste your resume here…"
+            rows={3}
+            className="settings-input w-full resize-none"
+          />
+
+          <label className="text-[9px] text-white/40 block mt-2.5 mb-0.5">
+            Answer Instructions
+          </label>
+          <textarea
+            value={settings.answerInstructions ?? ""}
+            onChange={(e) =>
+              updateSettings({ answerInstructions: e.target.value })
+            }
+            placeholder="Tell the AI how you want interview answers written."
+            rows={4}
+            className="settings-input w-full resize-none"
+          />
+          <div className="flex items-center gap-2 mt-1">
+            <span className="text-[9px] text-white/30 flex-1">
+              Style and structure only. It can never override the app's
+              factuality, validation or artifact rules.
+            </span>
+            <button
+              type="button"
+              onClick={() =>
+                updateSettings({
+                  answerInstructions: DEFAULT_ANSWER_INSTRUCTIONS,
+                })
+              }
+              className="flex-none px-2 py-1 rounded bg-white/[0.06] hover:bg-white/[0.12] text-[9px] text-white/60"
+            >
+              Reset
+            </button>
+          </div>
+
+          <ToggleRow
+            label="Auto-answer when a question ends"
+            on={!!settings.autoAnswer}
+            onToggle={() => updateSettings({ autoAnswer: !settings.autoAnswer })}
+            hint="Answers fire on their own the moment the interviewer stops talking on a clear question. Incomplete or conversational speech is still ignored (WAIT). Ctrl+Enter / Ask Copilot keep working either way."
+          />
+
+          <p className="text-[9px] text-white/30 mt-2">
+            Stored on this machine only. Never logged.
           </p>
         </Section>
 
@@ -1388,6 +1599,46 @@ function ShortcutRow({ label, keys }: { label: string; keys: string[] }) {
           </kbd>
         ))}
       </div>
+    </div>
+  );
+}
+
+/** One labelled switch. Shared by the two Interview Context automations. */
+function ToggleRow({
+  label,
+  on,
+  onToggle,
+  hint,
+}: {
+  label: string;
+  on: boolean;
+  onToggle: () => void;
+  /** Shown under the row. States the trade-off, not just the behaviour. */
+  hint?: string;
+}) {
+  return (
+    <div className="mt-3">
+      <button
+        type="button"
+        role="switch"
+        aria-checked={on}
+        onClick={onToggle}
+        className="w-full flex items-center justify-between gap-3 bg-white/[0.06] hover:bg-white/[0.12] border border-white/[0.12] rounded-lg px-3 py-2.5 text-[11px] font-mono text-white/80 outline-none cursor-pointer transition-colors"
+      >
+        <span className="truncate text-left">{label}</span>
+        <span
+          className={`flex-none w-8 h-4 rounded-full p-0.5 transition-colors ${
+            on ? "bg-accent/70" : "bg-white/[0.12]"
+          }`}
+        >
+          <span
+            className={`block w-3 h-3 rounded-full bg-white transition-transform ${
+              on ? "translate-x-4" : "translate-x-0"
+            }`}
+          />
+        </span>
+      </button>
+      {hint && <p className="text-[9px] text-white/30 mt-1">{hint}</p>}
     </div>
   );
 }

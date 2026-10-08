@@ -287,6 +287,35 @@ const THREAD_CUE_GROUPS: Array<{ reason: string; re: RegExp }> = [
     reason: "refers back with a deictic pronoun",
     re: /\b(?:what|how|why)\s+about\s+(?:it|that|this|them)\b|\b(?:and|so|then)\s+(?:it|that|this|what|how|why)\b/i,
   },
+  {
+    // ── Drill-down on the artefact under discussion ──────────────────────────
+    //
+    // This group exists because of a measured gap, not a guess. The canonical
+    // coding interview runs like this:
+    //
+    //   Q1 "Write a function to reverse a string."
+    //   Q2 "Can you optimize the solution?"
+    //   Q3 "What is the time complexity?"
+    //   Q4 "What edge cases should I handle?"
+    //
+    // None of Q2–Q4 shares a content word with Q1 ("write function reverse
+    // string"), so the overlap fallback scored 0 and the thread was dropped —
+    // four consecutive questions about ONE problem answered as four unrelated
+    // ones. Q3 failed a second way: "What is the time complexity?" matches
+    // NEW_SUBJECT_CUES (it opens like "What is Docker?"), so it was read as a
+    // topic switch.
+    //
+    // It is listed as a CUE, not a change to NEW_SUBJECT_CUES, because cues are
+    // deliberately tested first (see the note on the flow/sequence group). That
+    // ordering is what keeps the distinction intact: "What is the TIME
+    // COMPLEXITY?" now matches this group and attaches, while "What is Docker?"
+    // matches nothing here and still opens a new subject.
+    //
+    // Like every other group it is technology-neutral: it matches on the
+    // grammar of drilling down, never on a named tool or language.
+    reason: "drills into the artefact under discussion",
+    re: /\boptimi[sz]e\b|\boptimi[sz]ed\b|\bmake\s+it\s+(?:faster|better|more\s+efficient)\b|\bbetter\s+(?:approach|way|solution|implementation)\b|\b(?:time|space)\s+complexity\b|\bcomplexity\b|\bedge\s+cases?\b|\bcorner\s+cases?\b|\bmore\s+(?:detail|details)\b|\bgo\s+deeper\b|\bwhat\s+am\s+i\s+missing\b/i,
+  },
 ];
 
 /** Attempts to introduce a NEW subject, which must not attach to the old one. */

@@ -77,7 +77,12 @@ export function geminiGenerationConfig(
 ) {
   const config: any = { maxOutputTokens: maxTokens, temperature: 0.3 };
 
-  if (/^gemini-(?:2\.5|3)/i.test(model)) {
+  // `flash-lite` models are EXCLUDED from the thinking config: measured
+  // against the live API (2026-10-06), `gemini-3.5-flash-lite` answers
+  // `thinkingConfig` with HTTP 400 INVALID_ARGUMENT and returns HTTP 200 +
+  // text when the field is omitted entirely. Omitting it asks for the API's
+  // own default, which is exactly what a lite (low-latency) model wants.
+  if (/^gemini-(?:2\.5|3)/i.test(model) && !/flash-lite/i.test(model)) {
     if (opts.thinkingBudget === "provider-default") {
       // Field omitted entirely: the provider applies its own default.
       return config;
@@ -99,15 +104,20 @@ export class GeminiProvider implements AIProvider {
   name = "gemini";
 
   listModels(): string[] {
-    // Curated fallback. `fetchModels()` below asks the API what this key can
-    // actually use, so preview/renamed ids never go stale here.
+    // Curated fallback, used only when live discovery is unavailable. Every id
+    // here was VERIFIED against the real API with this file's exact streaming
+    // path (SSE + systemInstruction + generationConfig): `gemini-2.5-flash`
+    // three times (first text 1.2–1.4s), `gemini-3.5-flash-lite` twice (1.1–
+    // 1.7s, thinking config omitted — see `geminiGenerationConfig`),
+    // `gemini-3.6-flash` once with text. RETIRED ids that returned HTTP 404 —
+    // `gemini-2.5-flash-lite`, `gemini-2.0-*`, `gemini-1.5-*` — are gone; the
+    // API's own 404 message for flash-lite says "no longer available to new
+    // users". `fetchModels()` below asks the API what this key can actually
+    // use, so the live list always supersedes this one.
     return [
       "gemini-2.5-flash",
-      "gemini-2.5-flash-lite",
-      "gemini-2.0-flash",
-      "gemini-2.0-flash-lite",
-      "gemini-1.5-pro",
-      "gemini-1.5-flash",
+      "gemini-3.5-flash-lite",
+      "gemini-3.6-flash",
     ];
   }
 
@@ -244,8 +254,11 @@ export class GeminiProvider implements AIProvider {
       buffer = lines.pop() || "";
 
       for (const line of lines) {
-        const text = consume(line);
-        if (text) yield text;
+        // Yielded even when empty: a frame with no answer text (a thought
+        // part, a keep-alive) is still evidence the provider is alive, and the
+        // orchestrator's first-token budget is built on exactly that signal.
+        // Thought parts are NEVER surfaced — only their absence as text.
+        yield consume(line);
       }
     }
 

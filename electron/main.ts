@@ -9,9 +9,20 @@ import {
 } from "electron";
 import path from "path";
 import { registerHotkeys, unregisterHotkeys, captureAndSendScreenshot } from "./hotkeys";
-import { registerIpcHandlers } from "./ipc";
-import { initLiveScreen } from "./liveScreen";
+import {
+  registerIpcHandlers,
+  readPersistedOverlayOpacity,
+  persistOverlayOpacity,
+} from "./ipc";
 import { applyStealthMode, removeStealthMode } from "./stealth";
+import { createSelfExcludingCaptureForWindow } from "./captureSelfExclusion";
+import {
+  createOverlayOpacityController,
+  formatOpacityLog,
+  opacityFromSliderValue,
+  opacityToPercent,
+  type OverlayOpacityController,
+} from "./overlayOpacity";
 import {
   createVisibilityController,
   STEALTH_REAPPLY_EVENTS,
@@ -21,6 +32,59 @@ import {
 
 let mainWindow: BrowserWindow | null = null;
 let tray: Tray | null = null;
+
+/**
+ * Ghostly's own window opacity.
+ *
+ * ── Why this replaces the old `setOpacity(0/1)` ─────────────────────────────
+ * Hide and show used to be expressed as window opacity: `0` meant hidden and `1`
+ * meant shown. That made the one knob the window had unavailable for the thing
+ * the user actually asked for — seeing the interview app THROUGH Ghostly — and
+ * it made "am I visible?" a question that had to be answered by reading the
+ * opacity back.
+ *
+ * The controller keeps the two concerns apart (see `overlayOpacity.ts`) and every
+ * caller below asks it instead of touching `setOpacity` directly.
+ */
+let opacityController: OverlayOpacityController;
+
+/** Whether Ghostly is on screen. Never inferred from the opacity any more. */
+function isOverlayVisible(): boolean {
+  return opacityController?.isVisible() ?? false;
+}
+
+/** Push the window's hide/show opacity onto the window, if it exists yet. */
+function setWindowOpacity(windowOpacity: number): void {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.setOpacity(windowOpacity);
+  }
+}
+
+/**
+ * Push the surface alpha into the renderer as `--ghostly-alpha`.
+ *
+ * Sent as a CSS custom property rather than as a number the components read,
+ * because a custom property is inherited: one write rescales every panel in the
+ * overlay, and a component added later is automatically correct instead of
+ * having to remember to consume a context value.
+ *
+ * The renderer ALSO reads the persisted value over IPC on mount. Both paths
+ * exist on purpose: this one wins if it arrives first (no first-frame flash at
+ * the wrong alpha after a restart), and the IPC read is what makes the value
+ * correct even if this push is lost to a reload.
+ */
+function setChromeAlpha(alpha: number): void {
+  const win = mainWindow;
+  if (!win || win.isDestroyed()) return;
+  const script = `document.documentElement.style.setProperty("--ghostly-alpha", ${JSON.stringify(alpha)})`;
+  if (win.webContents.isLoading()) {
+    win.webContents.once("did-finish-load", () => {
+      if (!win.isDestroyed()) void win.webContents.executeJavaScript(script);
+    });
+  } else {
+    void win.webContents.executeJavaScript(script).catch(() => undefined);
+  }
+}
 
 /**
  * Re-apply stealth mode. Called on every show event to ensure
@@ -126,10 +190,17 @@ function createMainWindow(): BrowserWindow {
 
   win.on("ready-to-show", () => {
     const bounds = win.getBounds();
-    const opacity = win.getOpacity();
-    console.log(`[Ghostly] Window ready — bounds: ${JSON.stringify(bounds)}, opacity: ${opacity}`);
+    // Assert the persisted opacity at the moment the window first appears, and
+    // re-assert the capture-exclusion mode. Both can be dropped by the window
+    // manager between construction and first paint.
+    opacityController?.reapply();
+    console.log(
+      `[Ghostly] Window ready — bounds: ${JSON.stringify(bounds)}, opacity: ${win.getOpacity()}`,
+    );
     win.show();
-    console.log(`[Ghostly] After show — visible: ${win.isVisible()}, opacity: ${win.getOpacity()}`);
+    console.log(
+      `[Ghostly] After show — visible: ${win.isVisible()}, opacity: ${win.getOpacity()}`,
+    );
     // Assert the current visibility mode (also re-applied via the show event).
     controllerFor(win).reapply();
   });
@@ -138,17 +209,13 @@ function createMainWindow(): BrowserWindow {
 }
 
 function toggleWindowVisibility() {
-  if (mainWindow) {
-    const isHidden = mainWindow.getOpacity() === 0;
-    if (isHidden) {
-      mainWindow.setOpacity(1);
-      mainWindow.setIgnoreMouseEvents(true, { forward: true });
-      mainWindow.focus();
-    } else {
-      mainWindow.setOpacity(0);
-      mainWindow.blur();
-      mainWindow.setIgnoreMouseEvents(true, { forward: false });
-    }
+  if (!mainWindow) return;
+  if (opacityController.toggleHidden()) {
+    mainWindow.blur();
+    mainWindow.setIgnoreMouseEvents(true, { forward: false });
+  } else {
+    mainWindow.setIgnoreMouseEvents(true, { forward: true });
+    mainWindow.focus();
   }
 }
 
@@ -192,39 +259,73 @@ function createTray(): Tray {
 }
 
 app.whenReady().then(() => {
-  registerIpcHandlers();
-  // Live Screen reports upward through the window. The controller itself holds
-  // no Electron reference, which keeps its capture-and-compare loop testable.
-  initLiveScreen({
-    onProblem: (update) =>
-      mainWindow?.webContents.send("ghostly:live-screen-problem", update),
-    onStatus: () =>
-      mainWindow?.webContents.send("ghostly:live-screen-status-changed"),
+  // Created BEFORE the window so the persisted opacity can be asserted on the
+  // very first paint. `applyOverlayOpacity` is a no-op until `mainWindow`
+  // exists, and `ready-to-show` re-asserts it afterwards.
+  opacityController = createOverlayOpacityController({
+    setWindowOpacity,
+    setChromeAlpha,
+    persist: persistOverlayOpacity,
+    initial: readPersistedOverlayOpacity(),
+    log: (line) => console.log(line),
   });
+  // The controller deliberately stays silent when a value does not CHANGE, which
+  // is right for the slider but leaves no record of what was restored at boot.
+  // That record matters: "Ghostly looks wrong and I don't know why" is answered
+  // by this one line.
+  console.log(
+    formatOpacityLog(opacityController.opacity(), opacityController.hidden()),
+  );
+  // ── The capture wrapper every capture route shares ──────────────────────
+  //
+  // `mainWindow` is read lazily inside the closures because it does not exist
+  // yet at this point: the window is created on the next line. The wrapper only
+  // touches it when a capture actually runs, by which time it does.
+  const selfExcludingCapture = createSelfExcludingCaptureForWindow(
+    opacityController,
+    {
+      blur: () => mainWindow?.blur(),
+      focus: () => mainWindow?.focus(),
+    },
+    // Re-asserting the exclusion is what makes a capture correct even when the
+    // dev-only visibility control has cleared the flag.
+    () => {
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        applyStealthMode(mainWindow);
+      }
+    },
+    (line) => console.log(line),
+  );
+  registerIpcHandlers(selfExcludingCapture);
+  // NOTE: the automatic screen watcher ("Auto-detect new question") and the
+  // local Qwen sidecar were removed entirely — there is no initLiveScreen /
+  // disposeLocalAi any more. Screenshots are MANUAL only (Capture Screen
+  // button / Ctrl+Shift+S), and no child process is spawned at startup.
   mainWindow = createMainWindow();
   tray = createTray();
-  registerHotkeys(mainWindow);
+  registerHotkeys(mainWindow, opacityController);
 
   // Mouse enable/disable for click-through
   ipcMain.on("ghostly:enable-mouse", () => {
-    // Only enable if window is actually "visible"
-    if (mainWindow && mainWindow.getOpacity() > 0) {
+    // Only enable if Ghostly is actually on screen. Asks the controller rather
+    // than reading the opacity back, so a 20%-opacity window — which is very
+    // much visible — is never mistaken for a hidden one.
+    if (mainWindow && isOverlayVisible()) {
       mainWindow.setIgnoreMouseEvents(false);
     }
   });
 
   ipcMain.on("ghostly:disable-mouse", () => {
-    // Only forward hover events if window is actually "visible"
+    // Only forward hover events if Ghostly is actually on screen.
     if (mainWindow) {
-      const isVisible = mainWindow.getOpacity() > 0;
-      mainWindow.setIgnoreMouseEvents(true, { forward: isVisible });
+      mainWindow.setIgnoreMouseEvents(true, { forward: isOverlayVisible() });
     }
   });
 
   // Window control
   ipcMain.on("ghostly:hide", () => {
     if (mainWindow) {
-      mainWindow.setOpacity(0);
+      opacityController.setHidden(true);
       mainWindow.blur();
       mainWindow.setIgnoreMouseEvents(true, { forward: false });
     }
@@ -232,10 +333,41 @@ app.whenReady().then(() => {
 
   ipcMain.on("ghostly:show", () => {
     if (mainWindow) {
-      mainWindow.setOpacity(1);
+      // Restores the CHOSEN opacity, not 1. Showing Ghostly used to silently
+      // discard the user's transparency setting; that is exactly the "my
+      // opacity reset itself" class of bug.
+      opacityController.setHidden(false);
       mainWindow.setIgnoreMouseEvents(true, { forward: true });
       mainWindow.focus();
     }
+  });
+
+  // ── Ghostly's own window opacity ────────────────────────────────────────
+  //
+  // Two channels only: read the current value, set a new one. There is
+  // deliberately no "set hidden" channel here — hide/show stay bound to Ctrl+B
+  // and the tray so that adjusting transparency can never be mistaken for
+  // hiding the app, or vice versa.
+  ipcMain.handle("ghostly:get-overlay-opacity", () => {
+    const state = opacityController.current();
+    return {
+      opacity: state.opacity,
+      percent: opacityToPercent(state.opacity),
+      hidden: state.hidden,
+    };
+  });
+
+  ipcMain.handle("ghostly:set-overlay-opacity", (_event, value: unknown) => {
+    // The channel speaks WHOLE PERCENT (what a range input produces), while the
+    // controller and the persisted setting speak a 0–1 fraction. Parsing with
+    // `opacityFromSliderValue` rather than the fraction normalizer is what stops
+    // "50%" from being read as 50 and clamped to fully opaque.
+    const applied = opacityController.setOpacity(opacityFromSliderValue(value));
+    return {
+      opacity: applied,
+      percent: opacityToPercent(applied),
+      hidden: opacityController.hidden(),
+    };
   });
 
   // ── Dev-only screen-visibility toggle ───────────────────────────────────
@@ -282,6 +414,8 @@ app.on("window-all-closed", () => {
 });
 
 app.on("before-quit", () => {
+  // Unregisters EVERY global shortcut, including Ctrl+Shift+S (Capture
+  // Screen), so a quitting Ghostly never leaves a bound accelerator behind.
   unregisterHotkeys();
 });
 

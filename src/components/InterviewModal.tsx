@@ -3,6 +3,7 @@ import { useInterviewAudio } from "../hooks/useInterviewAudio";
 import { formatLatencyReport } from "../lib/stageTiming";
 import { formatLoadBreakdown } from "../lib/parakeetHost";
 import { useStore } from "../store/useStore";
+import { gs } from "../lib/overlaySurfaces";
 import { getParakeetStatus, type ParakeetStatus } from "../lib/parakeetClient";
 import { PARAKEET_PADDING_MS } from "../lib/parakeetHost";
 import { serializeAsrComparisonExport } from "../lib/asrComparisonExport";
@@ -151,6 +152,23 @@ export const InterviewModal: React.FC<InterviewModalProps> = ({
     onSubmit(turn);
   };
 
+  /**
+ * The transcript writer, bound at the TOP of the component.
+ *
+ * ── Why this is not read inside the handler ────────────────────────────────
+ * It was: `const addInterviewMessage = useStore(...)` sat inside
+ * `handleManualSubmit`, which is an EVENT handler. A hook called from a
+ * callback is not "a hook called in the wrong order" — it is not a hook call at
+ * all as far as React is concerned, and the real one crashed the renderer with
+ * `Minified React error #321` the first time anyone typed a question into this
+ * box. The typed-question path was therefore unusable, and it is the only way to
+ * exercise the interview answer path without a live microphone.
+ *
+ * The fix is to bind the selector where every other selector in this file is
+ * bound, so the hook count no longer depends on which event fired.
+ */
+const addInterviewMessage = useStore((s) => s.addInterviewMessage);
+
   /** Submit a manually typed question as an explicit override. */
   const handleManualSubmit = () => {
     const question = manualText.trim();
@@ -161,7 +179,6 @@ export const InterviewModal: React.FC<InterviewModalProps> = ({
     // Preserve the submitted question in history (same store used by the voice
     // path), tagged as a MANUAL question so it renders like a detected question
     // without any audio capture involved.
-    const addInterviewMessage = useStore((s) => s.addInterviewMessage);
     addInterviewMessage({
       id: crypto.randomUUID(),
       source: "system",
@@ -198,10 +215,9 @@ export const InterviewModal: React.FC<InterviewModalProps> = ({
       <div
         className="pointer-events-auto rounded-2xl px-4 py-2 flex items-center justify-between gap-3 w-full"
         style={{
-          background: "rgba(20, 20, 23, 0.75)",
+          ...gs("20 20 23", 0.75),
           backdropFilter: "blur(24px)",
           WebkitBackdropFilter: "blur(24px)",
-          border: "1px solid rgba(255,255,255,0.08)",
         }}
         onMouseEnter={() => window.ghostly.enableMouse()}
         onMouseLeave={() => window.ghostly.disableMouse()}
@@ -238,10 +254,9 @@ export const InterviewModal: React.FC<InterviewModalProps> = ({
     <div
       className="pointer-events-auto rounded-2xl overflow-hidden flex flex-col transition-all duration-300 w-full"
       style={{
-        background: "rgba(20, 20, 23, 0.75)",
+        ...gs("20 20 23", 0.75),
         backdropFilter: "blur(24px)",
         WebkitBackdropFilter: "blur(24px)",
-        border: "1px solid rgba(255,255,255,0.08)",
         boxShadow: "0 10px 40px -10px rgba(0,0,0,0.5)",
       }}
       onMouseEnter={() => window.ghostly.enableMouse()}

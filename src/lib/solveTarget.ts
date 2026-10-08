@@ -17,6 +17,21 @@
  * So the rule is explicit and lives here: a screenshot is a question in its own
  * right, and Solve must answer it whenever there is no answerable spoken
  * question to answer instead.
+ *
+ * ── An explicit capture outranks the transcript ─────────────────────────────
+ * Capture Screen (or Ctrl+Shift+S) is a deliberate user action meaning "answer
+ * THIS", so it sets an ARM on the screenshot (see the store's
+ * `screenshotArmed`). While that arm is set, Solve answers the screenshot even
+ * though a live question exists, and a later, purely-spoken question is
+ * unaffected because the arm is consumed by the run that used it.
+ *
+ * The arm is NOT a timestamp comparison. ASR commits an utterance only after it
+ * has decoded, so the interviewer's last sentence routinely lands in the
+ * transcript AFTER the user pressed Capture. "Which input is newer" therefore
+ * hands Solve to a sentence that was already on screen when the capture
+ * happened — the exact "screenshot taken, audio won, no answer" failure this
+ * module exists to prevent. An explicit capture is a user ACTION, not a
+ * timestamp, and it is recorded as one.
  */
 
 /** A screenshot entry is only usable if it is a non-empty string. */
@@ -53,6 +68,7 @@ export interface SolveTargetDecision {
   /** Closed vocabulary, safe to log. Never question or answer text. */
   reason:
     | "interview question wins"
+    | "the screenshot was captured explicitly and is not yet solved"
     | "no live question — solving the screenshot"
     | "screenshot solve is not possible";
 }
@@ -64,21 +80,47 @@ export interface SolveTargetInput {
   gateSaysAnswer: boolean;
   /** How many screenshots are actually attachable. */
   usableScreenshots: number;
+  /**
+   * True when the user explicitly captured a screenshot that no Solve has
+   * consumed yet. This is the "answer what I just captured" signal, and it
+   * outranks a live question while it is set.
+   */
+  screenshotArmed?: boolean;
 }
 
 /**
  * Decide what a Solve press answers.
  *
- * The interview question always wins when there is one — that is the live path
- * and it must not change. The screenshot is the fallback, so a screenshot plus
- * Solve produces an answer with no audio submission, no Live Screen and no
- * ASR involved.
+ * ── The explicit-capture rule ──────────────────────────────────────────────
+ * Capture Screen → Solve must solve the SCREENSHOT, even when a live
+ * transcript exists whose gate still says "answer". The old rule — "an
+ * answerable interview question always wins" — is exactly the reported
+ * failure: screenshot exists → Solve → interview target wins → screenshot
+ * ignored → no answer.
+ *
+ * The arm, not a timestamp, decides it. The user pressed Capture, which is an
+ * explicit instruction, and it stands until a Solve run consumes it. If the
+ * interviewer happens to keep speaking (or ASR merely COMMITS their earlier
+ * sentence) after that press, the transcript is still not what the user asked
+ * to solve — see the module header for why comparing instants gets this wrong.
+ *
+ * With no arm set, the rule is unchanged: a live question wins; otherwise an
+ * existing screenshot is the fallback, and with neither there is nothing to
+ * solve.
  */
 export function decideSolveTarget(
   input: SolveTargetInput,
 ): SolveTargetDecision {
   const canSolveScreenshot = input.usableScreenshots > 0;
   const hasLiveQuestion = input.hasTurn && input.gateSaysAnswer;
+
+  // An explicit capture the user has not yet solved outranks the transcript.
+  if (canSolveScreenshot && input.screenshotArmed) {
+    return {
+      target: "screenshot",
+      reason: "the screenshot was captured explicitly and is not yet solved",
+    };
+  }
 
   if (hasLiveQuestion) {
     return { target: "interview", reason: "interview question wins" };

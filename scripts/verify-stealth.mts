@@ -408,15 +408,22 @@ console.log("\n── Dev-only / runtime-only ───────────�
 console.log("\n── No collateral damage ─────────────────────────────────────");
 
 {
-  // The four systems named as off-limits must not import the visibility policy
+  // The five systems named as off-limits must not import the visibility policy
   // or anything stealth-related.
+  //
+  // `electron/hotkeys.ts` is deliberately EXCLUDED from that list. It now calls
+  // `applyStealthMode` — and only that one function — because every capture route
+  // re-asserts capture exclusion while the pixels are read, which is what stops
+  // Ghostly's own interface reaching the local OCR (see
+  // `electron/captureSelfExclusion.ts`). It is asserted below that it touches the
+  // mechanism without touching the POLICY, which is the boundary that matters:
+  // a hotkey must not be able to decide that capture exclusion is off.
   const offLimits = [
     "src/lib/asr.worker.ts",
     "src/lib/vadWorklet.ts",
     "src/lib/audioStatus.ts",
     "src/lib/ai/orchestrator.ts",
     "src/hooks/useInterviewAudio.ts",
-    "electron/hotkeys.ts",
   ];
   for (const file of offLimits) {
     const source = fs.readFileSync(file, "utf8");
@@ -426,6 +433,22 @@ console.log("\n── No collateral damage ────────────�
       false,
     );
   }
+
+  const hotkeys = fs.readFileSync("electron/hotkeys.ts", "utf8");
+  check(
+    "hotkeys.ts never decides the capture-visibility mode",
+    /visibilityPolicy|resolveStealthAction|removeStealthMode|createVisibilityController/.test(
+      hotkeys,
+    ),
+    false,
+  );
+  checkTrue(
+    "hotkeys.ts re-asserts capture exclusion for every capture it takes",
+    /forceCaptureExclusion: \(\) => applyStealthMode\(win\)/.test(hotkeys) &&
+      // Exactly one binding, and it is the mechanism the policy itself may only
+      // ever choose between — not a second way of doing it.
+      (hotkeys.match(/applyStealthMode\(/g) ?? []).length === 1,
+  );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

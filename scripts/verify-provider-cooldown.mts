@@ -346,16 +346,45 @@ check("5e days", formatCooldown(T0 + 30 * HOUR, T0), "1d 6h");
 // 7. "Groq is not in your provider chain" is reachable
 // ═══════════════════════════════════════════════════════════════════════════
 {
+  // Gemini removed from the chain by the user: this is the CONFIG reason the
+  // panel has to be able to state ("not in the configured chain"), distinct from
+  // a missing key and from a provider that was never enabled by default.
   const chain = describeProviderChain({
     providerOrder: ["openrouter"],
-    models: { openrouter: "openrouter/free", groq: "llama-3.3-70b-versatile" },
-    apiKeys: { openrouter: "k", groq: "gk" },
+    models: { openrouter: "openrouter/free", gemini: "gemini-2.5-flash" },
+    apiKeys: { openrouter: "k", gemini: "gk" },
   });
-  const groq = chain.status.find((s) => s.provider === "groq");
-  check("7a Groq has a key but is out of the chain", groq?.availability, "not-in-chain");
+  const gemini = chain.status.find((s) => s.provider === "gemini");
+  check("7a Gemini has a key but was removed from the chain", gemini?.availability, "not-in-chain");
   checkTrue(
     "7b the reason is stated for the user",
-    /not in the configured chain/i.test(groq?.detail ?? ""),
+    /not in the configured chain/i.test(gemini?.detail ?? ""),
+  );
+
+  // Groq is OPTIONAL: out of the chain by policy, and the panel must be able to
+  // say so differently from "you turned it off".
+  const opt = describeProviderChain({
+    providerOrder: ["gemini", "openrouter"],
+    models: { groq: "llama-3.3-70b-versatile" },
+    apiKeys: { gemini: "k", openrouter: "k", groq: "gk" },
+  });
+  const groq = opt.status.find((s) => s.provider === "groq");
+  check("7c Groq out of chain by default reads as optional", groq?.availability, "optional");
+  // NVIDIA and Local Qwen were removed ENTIRELY (provider, model, IPC, UI), so a
+  // stronger statement than "optional" applies: they must not be reported at all.
+  check(
+    "7d NVIDIA and Local Qwen are gone from the report entirely",
+    opt.status.some((s) => s.provider === "nvidia" || s.provider === "local"),
+    false,
+  );
+  checkTrue(
+    "7e and the user is told how to enable it",
+    /add it in Settings/i.test(groq?.detail ?? ""),
+  );
+  check(
+    "7f the optional provider is NOT in the default chain",
+    opt.configured.includes("groq"),
+    false,
   );
 }
 

@@ -1,17 +1,19 @@
 /**
- * Verification harness for the 3 new features:
+ * Verification harness for the universal-interview behaviour:
  *
  *   1. Candidate repeated-word correction (transcript-level, pure)
  *   2. Manual text question input (exercised through the SAME downstream gate
  *      the voice path uses, by constructing an InterviewTurn)
- *   3. Interview type dropdown organisation (General / DSA) + settings
- *      backward-compatibility
+ *   3. The question-category selector is GONE, and what it used to carry
+ *      (answer style) survived as one "Answer Instructions" field
  *
  * Run: `npx tsx scripts/verify-features.ts`
  *
- * No audio, no network, no Electron. Pure functions only.
+ * No audio, no network, no Electron. Pure functions and source assertions only.
  */
 
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import {
   correctQuestionWithCandidate,
 } from "../src/lib/candidateCorrection";
@@ -22,10 +24,12 @@ import {
   turnSignature,
   type InterviewTurn,
 } from "../src/lib/interviewAgent";
-import {
-  INTERVIEW_TYPE_GROUPS,
-  INTERVIEW_TYPES,
-} from "../src/components/SettingsPanel";
+
+const read = (p: string): string =>
+  readFileSync(resolve(process.cwd(), p), "utf8") as string;
+/** Remove comments so a mention in prose is never mistaken for live code. */
+const stripComments = (src: string): string =>
+  src.replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|[^:])\/\/.*$/gm, "$1");
 
 let pass = 0;
 let fail = 0;
@@ -45,6 +49,14 @@ function check(name: string, actual: unknown, expected: unknown) {
 
 function section(title: string) {
   console.log(`\n=== ${title} ===`);
+}
+
+function checkTrue(name: string, ok: unknown) {
+  if (ok) pass++;
+  else {
+    fail++;
+    failures.push(name);
+  }
 }
 
 function report() {
@@ -265,65 +277,75 @@ section("Part 2: manual text input flow");
 report();
 
 // ─────────────────────────────────────────────────────────────────────────────
-// PART 3 — INTERVIEW TYPE DROPDOWN (spec INTERVIEW TYPE TESTS)
+// PART 3 — THE INTERVIEW TYPE DROPDOWN IS GONE (spec: UNIVERSAL MODE)
 // ─────────────────────────────────────────────────────────────────────────────
 //
-// Existing types are never removed: General holds every non-DSA mode, DSA holds
-// the existing DSA mode, and the stored value stays a single flat string so
-// saved settings remain compatible.
+// This part used to assert that all six original categories still existed and
+// were grouped and selectable. That contract is deliberately reversed: there is
+// no category any more. A real interview mixes a coding question, a project
+// question and a system-design question in the same ten minutes, so asking the
+// candidate to pre-classify it was wrong for most of it.
+//
+// What is asserted now is the INVERSE — the selector cannot come back by
+// accident, and the one thing it used to carry (answer style) still exists.
 
-section("Part 3: interview type dropdown");
-
-const ORIGINAL_TYPES = [
-  "dsa",
-  "system_design",
-  "frontend",
-  "sql",
-  "behavioral",
-  "general",
-];
-const flatIds = INTERVIEW_TYPES.map((t) => t.id);
+// ── The selector's data structures are gone from the panel ──────────────────
+const panelSrc = stripComments(read("src/components/SettingsPanel.tsx"));
 
 check(
-  "TYPE: every original type still exists",
-  ORIGINAL_TYPES.filter((t) => !flatIds.includes(t)),
-  [],
+  "TYPE: the panel no longer exports a category list",
+  /INTERVIEW_TYPES|INTERVIEW_TYPE_GROUPS/.test(panelSrc),
+  false,
 );
 check(
-  "TYPE: no duplicate ids introduced by grouping",
-  flatIds.length === new Set(flatIds).size,
-  true,
-);
-
-const general = INTERVIEW_TYPE_GROUPS.find((g) => g.label === "General");
-const dsa = INTERVIEW_TYPE_GROUPS.find((g) => g.label === "DSA");
-
-check("TYPE: General group exists", general !== undefined, true);
-check("TYPE: DSA group exists", dsa !== undefined, true);
-check("TYPE: exactly two top-level groups", INTERVIEW_TYPE_GROUPS.length, 2);
-
-const generalIds = (general?.types ?? []).map((t) => t.id);
-const dsaIds = (dsa?.types ?? []).map((t) => t.id);
-
-// General must contain ALL non-DSA modes, none removed.
-check(
-  "TYPE: General holds every non-DSA mode",
-  ORIGINAL_TYPES.filter((t) => t !== "dsa").every((t) => generalIds.includes(t)),
-  true,
-);
-check("TYPE: DSA holds only the existing dsa mode", dsaIds, ["dsa"]);
-check(
-  "TYPE: DSA is not duplicated into General",
-  generalIds.includes("dsa"),
+  "TYPE: and no category is offered in a control anywhere in the panel",
+  /updateSettings\(\{\s*interviewType/.test(panelSrc),
   false,
 );
 
-// Flat list preserves grouping order and stays backward compatible.
-check("TYPE: flat list equals grouped order", flatIds, [...generalIds, ...dsaIds]);
+// ── No category can reach the answer path ───────────────────────────────────
+const homeSrc = stripComments(read("src/pages/Home.tsx"));
+check(
+  "TYPE: the per-category prompt builder is unreachable from the app",
+  /buildPrompt\(/.test(homeSrc),
+  false,
+);
+check(
+  "TYPE: the screenshot path uses the one universal prompt",
+  /buildUniversalPrompt\(/.test(homeSrc),
+  true,
+);
 
-// Both top-level selections are directly selectable (value written to settings).
-check("TYPE: general is selectable", generalIds.includes("general"), true);
-check("TYPE: dsa is selectable", dsaIds.includes("dsa"), true);
+// ── What the selector used to carry still exists ────────────────────────────
+// The old "General" mode had its own instruction box. That must have become the
+// single "Answer Instructions" field, not been dropped in the move.
+check(
+  "TYPE: one Answer Instructions field replaces the old per-mode box",
+  /answerInstructions/.test(panelSrc) && /Answer Instructions/.test(panelSrc),
+  true,
+);
+check(
+  "TYPE: and the legacy box is migrated rather than kept in parallel",
+  /delete \(rest as \{ customInstructions\?: unknown \}\)\.customInstructions/.test(
+    stripComments(read("src/App.tsx")),
+  ),
+  true,
+);
+
+// ── The hotkeys that set a category must not silently still work ────────────
+// They may stay registered for backwards compatibility, but nothing may consume
+// them — a dead binding is harmless, a live one would fight the universal mode.
+const hotkeyChannels = [
+  ...read("electron/hotkeys.ts").matchAll(/interview-type-/g),
+].length;
+const consumers = [
+  ...read("src/pages/Home.tsx").matchAll(/onInterviewType\(/g),
+].length;
+check("TYPE: no renderer code subscribes to a category hotkey", consumers, 0);
+checkTrue(
+  "TYPE: the category hotkey binding carries no consumer (informational)",
+  hotkeyChannels >= 0,
+);
 
 report();
 
